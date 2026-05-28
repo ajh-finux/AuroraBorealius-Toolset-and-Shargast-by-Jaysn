@@ -227,7 +227,9 @@ pub fn build_object_models(area: &Area, model_cache: &mut ModelCache) -> Instanc
                                      group_map: &mut HashMap<(String, usize), usize>| {
         let meshes = match model_cache.get_or_load(model_name) {
             Some(ms) if !ms.is_empty() => ms,
-            _ => return,
+            _other => {
+                return;
+            }
         };
         let all_empty = meshes.iter().all(|m| m.indices.is_empty());
         if all_empty { return; }
@@ -418,9 +420,6 @@ pub fn build_object_markers(area: &Area, filter: VisibilityFilter) -> MarkersRes
     let mut indices = Vec::new();
     let mut markers = Vec::new();
 
-    eprintln!("DEBUG: Building markers for area '{}' — {} creatures, {} doors, {} placeables, {} triggers, {} waypoints, {} encounters",
-        area.resref, area.creatures.len(), area.doors.len(), area.placeables.len(), area.triggers.len(), area.waypoints.len(), area.encounters.len());
-
     if filter.show_creatures {
         for (i, c) in area.creatures.iter().enumerate() {
             if c.model_name.is_some() { continue; }
@@ -468,8 +467,6 @@ pub fn build_object_markers(area: &Area, filter: VisibilityFilter) -> MarkersRes
             add_sound_emitter_marker(&mut vertices, &mut indices, s.x, s.y, s.z, [0.2, 0.8, 1.0, 0.8]);
         }
     }
-
-    eprintln!("DEBUG: Built {} marker meshes with {} vertices, {} indices", markers.len(), vertices.len(), indices.len());
 
     MarkersResult { mesh: MeshData { vertices, indices }, markers }
 }

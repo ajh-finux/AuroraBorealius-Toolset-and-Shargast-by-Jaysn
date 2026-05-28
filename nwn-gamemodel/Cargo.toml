@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+nwnrs-types = { version = "0.0.1", default-features = false, features = ["set"] }
 nwn-lib-rs = { version = "0.4", default-features = false }
 nwn-gff = { path = "../nwn-gff" }
 nwn-erf = { path = "../nwn-erf" }

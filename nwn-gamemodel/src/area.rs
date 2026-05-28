@@ -441,7 +441,10 @@ fn gff_int(s: &nwn_gff::Struct, label: &str, default: i32) -> i32 {
     s.find(label)
         .and_then(|v| match v {
             nwn_gff::FieldValue::Int(i) => Some(*i),
+            nwn_gff::FieldValue::DWord(d) => Some(*d as i32),
             nwn_gff::FieldValue::Byte(b) => Some(*b as i32),
+            nwn_gff::FieldValue::Short(s) => Some(*s as i32),
+            nwn_gff::FieldValue::Word(w) => Some(*w as i32),
             _ => None,
         })
         .unwrap_or(default)

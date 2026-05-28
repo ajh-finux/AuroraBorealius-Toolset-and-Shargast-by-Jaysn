@@ -1,3 +1,4 @@
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use egui_wgpu::{CallbackTrait, CallbackResources, ScreenDescriptor};
@@ -94,14 +95,29 @@ pub struct ViewportState {
     diffuse_color: [f32; 3],
 }
 
-fn load_texture(name: &str) -> Option<(u32, u32, Vec<u8>)> {
+fn load_texture(name: &str, module_erf: Option<&nwn_erf::ErfFile>, hak_index: Option<&nwn_tileset::HakIndex>, mod_path: Option<&Path>, _hak_names: &[String]) -> Option<(u32, u32, Vec<u8>)> {
+    // Try module ERF first
+    if let Some(erf) = module_erf {
+        if let Some(data) = nwn_tileset::load_texture_data_from_sources(name, &[erf]).ok().flatten() {
+            return Some((data.width, data.height, data.rgba));
+        }
+    }
+    // Try specific hak via HakIndex (fast, no full file reads)
+    if let (Some(idx), Some(dir)) = (hak_index, mod_path) {
+        for &restype in &[8u16, 3u16, 1u16] {
+            if let Some(data) = idx.get_resource_from_path(name, restype, dir) {
+                if let Some(tex) = nwn_tileset::decode_texture_data(restype, &data) {
+                    return Some((tex.width, tex.height, tex.rgba));
+                }
+            }
+        }
+    }
+    // Fall back to game data
     match nwn_tileset::load_texture_data(name) {
         Ok(Some(data)) => {
-            eprintln!("DEBUG: Loaded texture '{name}' ({}x{})", data.width, data.height);
             Some((data.width, data.height, data.rgba))
         }
         Ok(None) => {
-            eprintln!("WARN: Texture '{name}' not found in game data");
             None
         }
         Err(e) => {
@@ -119,11 +135,23 @@ impl ViewportState {
         area_version: u64,
         visibility_filter: tile_renderer::VisibilityFilter,
         existing_camera: Option<OrbitCamera>,
+        module_erf: Option<&nwn_erf::ErfFile>,
+        mod_path: Option<&std::path::Path>,
+        hak_names: &[String],
     ) -> Self {
 
         let camera = existing_camera.unwrap_or_else(|| OrbitCamera::new(area.width as f32, area.height as f32));
         let show_tiles = visibility_filter.show_tiles;
         let show_walkmesh = false;
+
+        // Build HakIndex for efficient texture search (only opens the relevant hak, not all haks)
+        let hak_index = mod_path.and_then(|p| {
+            if !hak_names.is_empty() {
+                Some(nwn_tileset::HakIndex::new(p, hak_names))
+            } else {
+                None
+            }
+        });
 
         // Collect unique model names from area for parallel loading
         let unique_models: Vec<String> = {
@@ -170,7 +198,35 @@ impl ViewportState {
             use rayon::prelude::*;
             let results: Vec<_> = unique_models.par_iter()
                 .map(|name| {
-                    let loaded = nwn_tileset::load_model_meshes(name).ok().flatten();
+                    // Try game data first
+                    let mut loaded = nwn_tileset::load_model_meshes(name).ok().flatten();
+                    // Fall back to module ERF
+                    if loaded.is_none() {
+                        if let Some(erf) = module_erf {
+                            // Try MDL (2002) then MDB (2001)
+                            for restype in &[2002u16, 2001] {
+                                if let Some(data) = erf.get(name, *restype) {
+                                    if let Ok(meshes) = nwn_tileset::load_model_meshes_from_data(name, &data) {
+                                        loaded = meshes;
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    // Fall back to haks (one at a time to avoid OOM)
+                    if loaded.is_none() {
+                        if let (Some(dir), hak_list) = (mod_path, hak_names) {
+                            if !hak_list.is_empty() {
+                                loaded = nwn_tileset::load_model_meshes_from_haks(name, dir, hak_list);
+                            }
+                        }
+                    }
+                    if loaded.is_some() {
+                        eprintln!("  DEBUG model '{}' loaded OK", name);
+                    } else {
+                        eprintln!("  DEBUG model '{}' NOT FOUND", name);
+                    }
                     (name.clone(), loaded)
                 })
                 .collect();
@@ -203,11 +259,10 @@ impl ViewportState {
             }
         }
 
-        // Load all textures in parallel
+        // Load all textures sequentially (hak fallback can't handle parallel opens of multi-GB files)
         let tex_data: Vec<(String, Option<(u32, u32, Vec<u8>)>)> = {
-            use rayon::prelude::*;
-            tex_names.par_iter()
-                .map(|name| (name.clone(), load_texture(name)))
+            tex_names.iter()
+                .map(|name| (name.clone(), load_texture(name, module_erf, hak_index.as_ref(), mod_path, hak_names)))
                 .collect()
         };
 
@@ -1006,6 +1061,9 @@ pub struct WgpuViewport {
     pub inner: Arc<Mutex<Option<ViewportState>>>,
     pending: Arc<Mutex<Option<PendingArea>>>,
     visibility_filter: Arc<Mutex<tile_renderer::VisibilityFilter>>,
+    module_erf_bytes: Arc<Mutex<Option<Arc<Vec<u8>>>>>,
+    mod_path: Arc<Mutex<Option<std::path::PathBuf>>>,
+    hak_names: Arc<Mutex<Vec<String>>>,
 }
 
 impl WgpuViewport {
@@ -1014,6 +1072,9 @@ impl WgpuViewport {
             inner: Arc::new(Mutex::new(None)),
             pending: Arc::new(Mutex::new(None)),
             visibility_filter: Arc::new(Mutex::new(Default::default())),
+            module_erf_bytes: Arc::new(Mutex::new(None)),
+            mod_path: Arc::new(Mutex::new(None)),
+            hak_names: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -1022,6 +1083,24 @@ impl WgpuViewport {
             inner: Arc::clone(&self.inner),
             pending: Arc::clone(&self.pending),
             visibility_filter: Arc::clone(&self.visibility_filter),
+            module_erf_bytes: Arc::clone(&self.module_erf_bytes),
+            mod_path: Arc::clone(&self.mod_path),
+            hak_names: Arc::clone(&self.hak_names),
+        }
+    }
+
+    pub fn set_module_erf(&self, data: Option<Vec<u8>>) {
+        if let Ok(mut guard) = self.module_erf_bytes.lock() {
+            *guard = data.map(Arc::new);
+        }
+    }
+
+    pub fn set_hak_info(&self, path: Option<std::path::PathBuf>, haks: Vec<String>) {
+        if let Ok(mut guard) = self.mod_path.lock() {
+            *guard = path;
+        }
+        if let Ok(mut guard) = self.hak_names.lock() {
+            *guard = haks;
         }
     }
 
@@ -1251,7 +1330,14 @@ impl CallbackTrait for WgpuViewport {
                 };
                 let existing_camera = self.inner.lock().ok().and_then(|g| g.as_ref().map(|s| s.camera.clone()));
                 let vf = self.visibility_filter.lock().map(|g| g.clone()).unwrap_or_default();
-                let mut state = ViewportState::new(device, &config, &pending.area, pending.version, vf, existing_camera);
+                let erf = self.module_erf_bytes.lock().ok()
+                    .and_then(|g| g.clone())
+                    .and_then(|bytes| nwn_erf::ErfFile::from_bytes(&bytes).ok());
+                let mut state = ViewportState::new(device, &config, &pending.area, pending.version, vf, existing_camera,
+                    erf.as_ref(),
+                    self.mod_path.lock().ok().and_then(|g| g.clone()).as_deref(),
+                    &self.hak_names.lock().map(|g| g.clone()).unwrap_or_default(),
+                );
                 let area_ref = &*pending.area;
                 let paint_data = tile_renderer::build_paint_overlay_ex(area_ref, 0, false, [40, 80, 200, 160]);
                 let paint_vertex_buf = if !paint_data.vertices.is_empty() {

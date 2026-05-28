@@ -413,20 +413,179 @@ impl Module {
             }
         }
 
-        // Resolve model names for placeables, doors, and creatures
+        // Build hak index (reads only ERF headers, not full file data)
+        let mod_dir = self.path.parent();
+        let mod_dir_path = mod_dir.unwrap_or(Path::new("."));
+        let hak_index = nwn_tileset::HakIndex::new(mod_dir_path, &self.haks);
+        eprintln!("  DEBUG haks: {:?}", self.haks);
+
         for p in &mut area.placeables {
-            if p.appearance >= 0 {
-                p.model_name = nwn_tileset::lookup_placeable_model(p.appearance);
+            p.model_name = if p.appearance >= 0 {
+                let mut name = nwn_tileset::lookup_placeable_model(p.appearance, &[erf]);
+                if name.is_none() {
+                    if let Some(data) = hak_index.get_resource_from_path("placeables", 2017, mod_dir_path) {
+                        if let Ok(text) = std::str::from_utf8(&data) {
+                            name = nwn_tileset::parse_2da_value(text, p.appearance, "ModelName");
+                        }
+                    }
+                }
+                name
+            } else { None };
+            // Fall back to .utp template ModelName (ERF → haks → game data)
+            if p.model_name.is_none() || p.model_name.as_deref() == Some("USER") {
+                let utp_data = erf.get(&p.resref, resource_types::UTP)
+                    .or_else(|| hak_index.get_resource_from_path(&p.resref, resource_types::UTP, mod_dir_path));
+                if let Some(data) = utp_data {
+                    if let Ok(gff) = nwn_gff::GffFile::from_bytes(&data) {
+                        let utp_model = gff.get_string("ModelName").ok();
+                        if utp_model.is_some() && utp_model.as_deref() != Some("USER") {
+                            p.model_name = utp_model;
+                            eprintln!("  DEBUG placeable '{}' model from .utp -> '{}'", p.resref, p.model_name.as_ref().unwrap());
+                        }
+                    }
+                }
             }
         }
         for d in &mut area.doors {
-            if d.appearance >= 0 {
-                d.model_name = nwn_tileset::lookup_door_model(d.appearance);
+            // Search for .utd: module ERF → haks
+            let generic_type = {
+                let mut gt = erf.get(&d.resref, resource_types::UTD).and_then(|data| {
+                    nwn_gff::GffFile::from_bytes(&data).ok()
+                        .and_then(|gff| gff.get_int("GenericType").ok())
+                });
+                if gt.is_none() {
+                    // Try haks
+                    if let Some(data) = hak_index.get_resource_from_path(&d.resref, resource_types::UTD, mod_dir_path) {
+                        if let Ok(gff) = nwn_gff::GffFile::from_bytes(&data) {
+                            gt = gff.get_int("GenericType").ok();
+                        }
+                    }
+                }
+                gt.or(Some(0))
+            };
+            d.model_name = nwn_tileset::lookup_door_model(d.appearance, generic_type, &[erf]);
+            if d.model_name.is_none() {
+                if d.appearance > 0 {
+                    if let Some(data) = hak_index.get_resource_from_path("doortypes", 2017, mod_dir_path) {
+                        if let Ok(text) = std::str::from_utf8(&data) {
+                            d.model_name = nwn_tileset::parse_2da_value(text, d.appearance, "ModelName");
+                        }
+                    }
+                } else if d.appearance == 0 {
+                    if let Some(data) = hak_index.get_resource_from_path("genericdoors", 2017, mod_dir_path) {
+                        if let Ok(text) = std::str::from_utf8(&data) {
+                            d.model_name = nwn_tileset::parse_2da_value(text, generic_type.unwrap_or(0), "ModelName");
+                        }
+                    }
+                }
+            }
+            // Final fallback: .utd template ModelName
+            if d.model_name.is_none() {
+                if let Some(data) = erf.get(&d.resref, resource_types::UTD) {
+                    if let Ok(gff) = nwn_gff::GffFile::from_bytes(&data) {
+                        d.model_name = gff.get_string("ModelName").ok();
+                    }
+                }
             }
         }
         for c in &mut area.creatures {
-            if c.appearance >= 0 {
-                c.model_name = nwn_tileset::lookup_creature_model(c.appearance);
+            let mut creature_appearance = c.appearance;
+            if creature_appearance < 0 {
+                // Try .utc from module ERF → haks → game data
+                let utc_data = erf.get(&c.resref, resource_types::UTC)
+                    .or_else(|| hak_index.get_resource_from_path(&c.resref, resource_types::UTC, mod_dir_path))
+                    .or_else(|| {
+                        let dir = nwn_tileset::game_data_dir()?;
+                        let r = nwnrs_types::resman::ResRef::new(
+                            c.resref.to_lowercase(),
+                            nwnrs_types::resman::ResType(resource_types::UTC),
+                        ).ok()?;
+                        nwn_tileset::load_resource_from_key(&r, &dir).ok().flatten()
+                    });
+                if let Some(data) = utc_data {
+                    if let Ok(gff) = nwn_gff::GffFile::from_bytes(&data) {
+                        creature_appearance = gff.get_int("Appearance").unwrap_or(-1);
+                        // If still no appearance, try ModelName directly from .utc
+                        if creature_appearance < 0 {
+                            if let Ok(m) = gff.get_string("ModelName") {
+                                eprintln!("  DEBUG creature '{}' model from .utc.ModelName -> '{}'", c.resref, m);
+                                c.model_name = Some(m);
+                            }
+                        }
+                    }
+                }
+            }
+            if c.model_name.is_none() {
+                c.model_name = if creature_appearance >= 0 {
+                    let mut name = nwn_tileset::lookup_creature_model(creature_appearance, &[erf]);
+                    if name.is_none() {
+                        if let Some(data) = hak_index.get_resource_from_path("appearance", 2017, mod_dir_path) {
+                            if let Ok(text) = std::str::from_utf8(&data) {
+                                name = nwn_tileset::lookup_creature_model_from_text(text, creature_appearance);
+                            }
+                        }
+                    }
+                    name
+                } else { None };
+            }
+        }
+
+        // Debug: show resolved model names
+        {
+            let p_count = area.placeables.iter().filter(|p| p.model_name.is_some()).count();
+            let d_count = area.doors.iter().filter(|d| d.model_name.is_some()).count();
+            let c_count = area.creatures.iter().filter(|c| c.model_name.is_some()).count();
+            eprintln!(
+                "DEBUG area '{}': {} placeables ({} have model), {} doors ({} have model), {} creatures ({} have model)",
+                name, area.placeables.len(), p_count, area.doors.len(), d_count, area.creatures.len(), c_count
+            );
+            // Check if HakIndex found the key 2DAs
+            let hak_has_placeables = hak_index.find_hak("placeables", 2017).is_some();
+            let hak_has_doortypes = hak_index.find_hak("doortypes", 2017).is_some();
+            let hak_has_genericdoors = hak_index.find_hak("genericdoors", 2017).is_some();
+            let hak_has_appearance = hak_index.find_hak("appearance", 2017).is_some();
+            eprintln!("  DEBUG HakIndex: placeables={} doortypes={} genericdoors={} appearance={}",
+                hak_has_placeables, hak_has_doortypes, hak_has_genericdoors, hak_has_appearance);
+            // Try all caps too
+            eprintln!("  DEBUG HakIndex allcaps: placeables={} doortypes={} genericdoors={} appearance={}",
+                hak_index.find_hak("PLACEABLES", 2017).is_some(),
+                hak_index.find_hak("DOORTYPES", 2017).is_some(),
+                hak_index.find_hak("GENERICDOORS", 2017).is_some(),
+                hak_index.find_hak("APPEARANCE", 2017).is_some());
+            // Also check if module ERF has them
+            let erf_has_placeables = erf.get("placeables", 2017).is_some();
+            let erf_has_doortypes = erf.get("doortypes", 2017).is_some();
+            let erf_has_genericdoors = erf.get("genericdoors", 2017).is_some();
+            let erf_has_appearance = erf.get("appearance", 2017).is_some();
+            eprintln!("  DEBUG ERF: placeables={} doortypes={} genericdoors={} appearance={}",
+                erf_has_placeables, erf_has_doortypes, erf_has_genericdoors, erf_has_appearance);
+            for p in &area.placeables {
+                if let Some(ref m) = p.model_name {
+                    eprintln!("  DEBUG placeable '{}' appearance={} -> model='{}'", p.resref, p.appearance, m);
+                }
+            }
+            for d in &area.doors {
+                if let Some(ref m) = d.model_name {
+                    eprintln!("  DEBUG door '{}' appearance={} -> model='{}'", d.resref, d.appearance, m);
+                } else {
+                    // Check GenericType from .utd
+                    let gt = erf.get(&d.resref, resource_types::UTD).and_then(|data| {
+                        nwn_gff::GffFile::from_bytes(&data).ok()
+                            .and_then(|gff| gff.get_int("GenericType").ok())
+                    });
+                    eprintln!("  DEBUG door '{}' appearance={} generic_type={:?} NO MODEL", d.resref, d.appearance, gt);
+                }
+            }
+            for c in &area.creatures {
+                if let Some(ref m) = c.model_name {
+                    eprintln!("  DEBUG creature '{}' appearance={} -> model='{}'", c.resref, c.appearance, m);
+                } else {
+                    let utc_app = erf.get(&c.resref, resource_types::UTC).and_then(|data| {
+                        nwn_gff::GffFile::from_bytes(&data).ok()
+                            .and_then(|gff| gff.get_int("Appearance").ok())
+                    });
+                    eprintln!("  DEBUG creature '{}' appearance={} utc_appearance={:?} NO MODEL", c.resref, c.appearance, utc_app);
+                }
             }
         }
 

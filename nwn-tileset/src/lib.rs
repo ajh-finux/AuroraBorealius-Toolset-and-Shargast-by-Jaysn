@@ -2,9 +2,11 @@
 #![feature(generic_const_exprs)]
 
 use std::collections::HashMap;
-use std::io::Cursor;
+use std::io::{Cursor, Read, Seek, SeekFrom};
 use std::path::Path;
-use nwnrs_types::resman::ResContainer;
+use std::sync::Mutex;
+use nwn_erf::ErfFile;
+use nwnrs_types::resman::{ResContainer, ResRef};
 
 pub type Result<T> = std::result::Result<T, TilesetError>;
 
@@ -60,14 +62,46 @@ impl Tileset {
     }
 }
 
-fn game_data_dir() -> Option<std::path::PathBuf> {
+pub fn game_data_dir() -> Option<std::path::PathBuf> {
     let home = std::env::var("HOME").ok()?;
     let data_dir = Path::new(&home)
         .join(".local/share/Steam/steamapps/common/Neverwinter Nights/data");
     if data_dir.is_dir() { Some(data_dir) } else { None }
 }
 
+/// Global cache for game data (KEY/BIF) resources — avoids re-reading on disk misses.
+/// Key is format `"{resref_lower}:{restype}"`, caches the raw bytes once loaded.
+static GAME_DATA_CACHE: std::sync::OnceLock<Mutex<HashMap<String, Option<Vec<u8>>>>> =
+    std::sync::OnceLock::new();
+
+fn game_data_cache() -> &'static Mutex<HashMap<String, Option<Vec<u8>>>> {
+    GAME_DATA_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn cache_key(resref: &ResRef) -> String {
+    format!("{}:{}", resref.res_ref().to_lowercase(), resref.res_type().0)
+}
+
 pub fn load_resource_from_key(resref: &nwnrs_types::resman::ResRef, data_dir: &Path) -> Result<Option<Vec<u8>>> {
+    let ck = cache_key(resref);
+    // Check cache first
+    {
+        let cache = game_data_cache().lock().unwrap();
+        if let Some(cached) = cache.get(&ck) {
+            return Ok(cached.clone());
+        }
+    }
+    // Load from disk (may block on I/O)
+    let result = load_resource_from_key_uncached(resref, data_dir);
+    // Cache result (even None to avoid repeated misses)
+    if let Ok(ref data) = result {
+        let mut cache = game_data_cache().lock().unwrap();
+        cache.insert(ck, data.clone());
+    }
+    result
+}
+
+fn load_resource_from_key_uncached(resref: &nwnrs_types::resman::ResRef, data_dir: &Path) -> Result<Option<Vec<u8>>> {
     let key_names = &["nwn_base.key", "nwn_retail.key", "nwn_expn.key", "nwn_x1.key", "nwn_x2.key", "nwnx1.key", "nwnx2.key"];
     for key_name in key_names {
         let key_path = data_dir.join(key_name);
@@ -154,20 +188,74 @@ pub fn load_model_meshes(model_name: &str) -> Result<Option<Vec<ModelMesh>>> {
     };
 
     let name_lower = model_name.to_lowercase();
-    let mdl_resref = match nwnrs_types::resman::ResRef::new(
-        name_lower.clone(),
-        nwnrs_types::resman::ResType(2002),
-    ) {
-        Ok(rr) => rr,
-        Err(_) => return Ok(None),
+
+    let data = {
+        let mut result = None;
+        for restype in &[2002, 2001] {
+            if let Ok(rr) = nwnrs_types::resman::ResRef::new(
+                name_lower.clone(),
+                nwnrs_types::resman::ResType(*restype),
+            ) {
+                if let Some(d) = load_resource_from_key(&rr, &data_dir)? {
+                    result = Some(d);
+                    break;
+                }
+            }
+        }
+        match result {
+            Some(d) => d,
+            None => return Ok(None),
+        }
     };
 
-    let data = match load_resource_from_key(&mdl_resref, &data_dir)? {
-        Some(d) => d,
-        None => return Ok(None),
-    };
+    load_model_meshes_from_data(model_name, &data)
+}
 
-    let scene = match nwnrs_types::mdl::parse_scene_model_auto(&data) {
+/// Search hak files (one at a time) for a model mesh. Opens only one hak at a time.
+pub fn load_model_meshes_from_haks(
+    model_name: &str,
+    mod_dir: &Path,
+    hak_names: &[String],
+) -> Option<Vec<ModelMesh>> {
+    let name_lower = model_name.to_lowercase();
+    let home = std::env::var("HOME").ok();
+    for hak_name in hak_names {
+        let paths = [
+            mod_dir.join(format!("{}.hak", hak_name)),
+            mod_dir.join("hak").join(format!("{}.hak", hak_name)),
+        ];
+        for p in &paths {
+            if let Ok(erf) = ErfFile::open(p) {
+                for &restype in &[2002u16, 2001u16] {
+                    if let Some(data) = erf.get(&name_lower, restype) {
+                        if let Ok(Some(meshes)) = load_model_meshes_from_data(model_name, &data) {
+                            return Some(meshes);
+                        }
+                    }
+                }
+                break;
+            }
+        }
+        if let Some(ref home) = home {
+            let p = Path::new(home).join("Documents/Neverwinter Nights/hak").join(format!("{}.hak", hak_name));
+            if p.exists() {
+                if let Ok(erf) = ErfFile::open(&p) {
+                    for &restype in &[2002u16, 2001u16] {
+                        if let Some(data) = erf.get(&name_lower, restype) {
+                            if let Ok(Some(meshes)) = load_model_meshes_from_data(model_name, &data) {
+                                return Some(meshes);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+pub fn load_model_meshes_from_data(model_name: &str, data: &[u8]) -> Result<Option<Vec<ModelMesh>>> {
+    let scene = match nwnrs_types::mdl::parse_scene_model_auto(data) {
         Ok(s) => s,
         Err(e) => return Err(TilesetError::Parse(format!("Scene parse error for '{model_name}': {e}"))),
     };
@@ -424,7 +512,7 @@ fn decode_bmp_rgba(data: &[u8]) -> Option<TextureData> {
 }
 
 /// Decode raw texture bytes for a given resource type into RGBA.
-fn decode_texture_data(res_type: u16, data: &[u8]) -> Option<TextureData> {
+pub fn decode_texture_data(res_type: u16, data: &[u8]) -> Option<TextureData> {
     match res_type {
         8 => {
             if let Ok(dds) = nwnrs_types::dds::DdsTexture::read_from_texture_bytes(data) {
@@ -533,6 +621,39 @@ fn load_texture_from_erf(texture_name: &str, erf: &nwn_erf::ErfFile) -> Option<T
         }
     }
     None
+}
+
+/// Search haks one at a time for texture data.
+pub fn load_texture_data_from_haks(texture_name: &str, mod_dir: &Path, hak_names: &[String]) -> Result<Option<TextureData>> {
+    let name = texture_name.to_lowercase()
+        .replace(".dds", "").replace(".tga", "").replace(".bmp", "")
+        .replace(" ", "_").replace("-", "_");
+    let home = std::env::var("HOME").ok();
+    for hak_name in hak_names {
+        let paths = [
+            mod_dir.join(format!("{}.hak", hak_name)),
+            mod_dir.join("hak").join(format!("{}.hak", hak_name)),
+        ];
+        for p in &paths {
+            if let Ok(erf) = ErfFile::open(p) {
+                if let Some(tex) = load_texture_from_erf(&name, &erf) {
+                    return Ok(Some(tex));
+                }
+                break;
+            }
+        }
+        if let Some(ref home) = home {
+            let p = Path::new(home).join("Documents/Neverwinter Nights/hak").join(format!("{}.hak", hak_name));
+            if p.exists() {
+                if let Ok(erf) = ErfFile::open(&p) {
+                    if let Some(tex) = load_texture_from_erf(&name, &erf) {
+                        return Ok(Some(tex));
+                    }
+                }
+            }
+        }
+    }
+    Ok(None)
 }
 
 pub fn find_and_load_tileset(name: &str, module_path: &Path, haks: &[String]) -> Result<Option<Tileset>> {
@@ -673,30 +794,25 @@ fn mat4_is_identity(m: &[[f32; 4]; 4]) -> bool {
 /// Load a 2DA file from game data (KEY/BIF) and look up the model name
 /// for a given row index. For `placeables.2da` and `door.2da`, the column
 /// is `ModelName`. For `appearance.2da`, the column is the 3rd column (index 2).
-pub fn lookup_model_name_from_2da(two_da_name: &str, row: i32, column_label: &str) -> Option<String> {
-    let data_dir = game_data_dir()?;
-    let resref = nwnrs_types::resman::ResRef::new(
-        two_da_name.to_lowercase(),
-        nwnrs_types::resman::ResType(2017), // Twoda
-    ).ok()?;
-    let data = load_resource_from_key(&resref, &data_dir).ok()??;
-    let text = std::str::from_utf8(&data).ok()?;
-
-    // Parse 2DA: find column index by label, find row by number, extract value
+pub fn parse_2da_value(text: &str, row: i32, column_label: &str) -> Option<String> {
     let mut lines = text.lines();
-    // Skip header line (2DA V2.0)
     let _header = lines.next();
-    // Find column headers
     let mut headers: Vec<&str> = Vec::new();
+    // First non-empty non-comment line after header: could be column names or directly data
+    let mut first_meta = None;
     for line in &mut lines {
         let trimmed = line.trim();
         if trimmed.is_empty() || trimmed.starts_with('#') { continue; }
         headers = trimmed.split(|c| c == '\t' || c == ' ').filter(|s| !s.is_empty()).collect();
+        first_meta = Some(trimmed);
         break;
     }
     let col_idx = headers.iter().position(|h| h.eq_ignore_ascii_case(column_label))?;
 
-    // Find the row with matching index
+    // Determine if the "header" line is actually a data row (starts with a digit).
+    // If so, there are no column headers and data rows don't have a leading row-number column.
+    let is_data_line = first_meta.map_or(false, |l| l.starts_with(|c: char| c.is_ascii_digit()));
+
     let target = format!("{}", row);
     for line in lines {
         let trimmed = line.trim();
@@ -704,28 +820,236 @@ pub fn lookup_model_name_from_2da(two_da_name: &str, row: i32, column_label: &st
         let parts: Vec<&str> = trimmed.split(|c| c == '\t' || c == ' ').filter(|s| !s.is_empty()).collect();
         if parts.is_empty() { continue; }
         if parts[0] == target {
-            return parts.get(col_idx).filter(|s| !s.is_empty() && **s != "****").map(|s| s.to_string());
+            // If the "header" was actually a data row, parts already include the row-number column,
+            // so col_idx is the correct index. Otherwise, data rows have one extra leading column.
+            let idx = if is_data_line { col_idx } else { col_idx + 1 };
+            let val = parts.get(idx).filter(|s| !s.is_empty() && **s != "****");
+            return val.map(|s| s.to_string());
         }
     }
     None
 }
 
-/// Look up the model name for a placeable given its appearance ID.
-/// Uses `placeables.2da` which has a `ModelName` column.
-pub fn lookup_placeable_model(appearance: i32) -> Option<String> {
-    lookup_model_name_from_2da("placeables", appearance, "ModelName")
+/// Lightweight hak resource index — reads only ERF header + key list (not full file data).
+pub struct HakIndex {
+    /// Maps resource key (resref_lower, restype) → hak_name
+    lookup: HashMap<(String, u16), String>,
+    /// Known search paths for finding hak files
+    paths: Vec<std::path::PathBuf>,
 }
 
-/// Look up the model name for a door given its appearance ID.
-/// Uses `door.2da` which has a `ModelName` column.
-pub fn lookup_door_model(appearance: i32) -> Option<String> {
-    lookup_model_name_from_2da("door", appearance, "ModelName")
+impl HakIndex {
+    pub fn new(mod_dir: &Path, hak_names: &[String]) -> Self {
+        let home = std::env::var("HOME").ok();
+        // Build list of possible hak paths, mod dir first (highest priority)
+        let mut paths = Vec::new();
+        paths.push(mod_dir.to_path_buf());
+        paths.push(mod_dir.join("hak"));
+        if let Some(ref home) = home {
+            paths.push(Path::new(home).join("Documents/Neverwinter Nights/hak"));
+        }
+        let mod_hak_dir = mod_dir.join("hak");
+
+        let mut lookup = HashMap::new();
+        for hak_name in hak_names {
+            // Search mod dir first (highest priority)
+            let search_paths = [
+                mod_dir.join(format!("{}.hak", hak_name)),
+                mod_hak_dir.join(format!("{}.hak", hak_name)),
+            ];
+            for p in &search_paths {
+                if Self::index_hak(p, hak_name, &mut lookup) {
+                    break;
+                }
+            }
+            // Fall back to home dir (don't overwrite mod dir entries)
+            if !lookup.iter().any(|((_, _), v)| v == hak_name) {
+                if let Some(ref base) = paths.last() {
+                    let home_path = base.join(format!("{}.hak", hak_name));
+                    Self::index_hak(&home_path, hak_name, &mut lookup);
+                }
+            }
+        }
+        Self { lookup, paths }
+    }
+
+    /// Read only the header + key list of a hak file to build the resource index.
+    fn index_hak(path: &Path, hak_name: &str, lookup: &mut HashMap<(String, u16), String>) -> bool {
+        let Ok(mut file) = std::fs::File::open(path) else { return false };
+        let Ok(len) = file.metadata().map(|m| m.len()) else { return false };
+        if len < 160 { return false; }
+
+        // Read the full 160-byte ERF header
+        let mut header = [0u8; 160];
+        if file.read_exact(&mut header).is_err() { return false; }
+
+        // Parse header according to nwn-lib-rs format:
+        //   0-3: FileType
+        //   4-7: FileVersion
+        //  8-11: localizedstrings_count
+        // 12-15: localizedstrings_size
+        // 16-19: keys_count
+        // 20-23: localizedstrings_offset
+        // 24-27: keys_offset
+        // 28-31: resources_offset
+        // 32-35: build_year
+        // 36-39: build_day
+        // 40-43: description_strref
+        // 44-159: padding
+        let version_bytes = &header[4..8];
+        let version = std::str::from_utf8(version_bytes).unwrap_or("V0.0");
+        let has_long = version >= "V1.1";
+
+        let keys_count = u32::from_le_bytes(header[16..20].try_into().unwrap());
+        let keys_offset = u32::from_le_bytes(header[24..28].try_into().unwrap()) as u64;
+
+        if keys_offset > len || keys_count == 0 { return false; }
+
+        // Key entries: V1.0 = 24 bytes, V1.1+ = 40 bytes
+        let key_entry_size: u64 = if has_long { 40 } else { 24 };
+        let max_key_bytes = (keys_count as u64).saturating_mul(key_entry_size).min(10_000_000);
+        if file.seek(SeekFrom::Start(keys_offset)).is_err() { return false; }
+        let mut key_buf = vec![0u8; max_key_bytes as usize];
+        if file.read_exact(&mut key_buf).is_err() { return false; }
+
+        for i in 0..keys_count as usize {
+            let off = (i as u64) * key_entry_size;
+            if off as usize + key_entry_size as usize > key_buf.len() { break; }
+            let off = off as usize;
+            // ResRef is 16 bytes (V1.0) or 32 bytes (V1.1), null-padded
+            let name_len: usize = if has_long { 32 } else { 16 };
+            let name_bytes = &key_buf[off..off + name_len];
+            let name_end = name_bytes.iter().position(|&b| b == 0).unwrap_or(name_len);
+            let name = std::str::from_utf8(&name_bytes[..name_end]).unwrap_or("").to_lowercase();
+            if name.is_empty() { continue; }
+            // Resource type is at offset 16+4=20 for V1.0 or 32+4=36 for V1.1
+            let restype_off = off + name_len + 4;
+            let restype = u16::from_le_bytes(key_buf[restype_off..restype_off+2].try_into().unwrap());
+            lookup.entry((name, restype)).or_insert_with(|| hak_name.to_string());
+        }
+        true
+    }
+
+    /// Returns the hak name that contains the given resource, if any.
+    pub fn find_hak(&self, resref: &str, restype: u16) -> Option<&str> {
+        self.lookup.get(&(resref.to_lowercase(), restype)).map(|s| s.as_str())
+    }
+
+    /// Get a resource from the known hak paths. Only opens the hak containing the resource.
+    pub fn get_resource(&self, resref: &str, restype: u16) -> Option<Vec<u8>> {
+        let hak_name = self.find_hak(resref, restype)?;
+        // Try module dir and hak dir
+        for base in &self.paths {
+            let p = base.join(format!("{}.hak", hak_name));
+            if let Ok(erf) = ErfFile::open(&p) {
+                if let Some(data) = erf.get(resref, restype) {
+                    return Some(data);
+                }
+            }
+        }
+        None
+    }
+
+    pub fn get_resource_from_path(&self, resref: &str, restype: u16, mod_dir: &Path) -> Option<Vec<u8>> {
+        let hak_name = self.find_hak(resref, restype)?;
+        let paths = [
+            mod_dir.join(format!("{}.hak", hak_name)),
+            mod_dir.join("hak").join(format!("{}.hak", hak_name)),
+        ];
+        for p in &paths {
+            if let Ok(erf) = ErfFile::open(p) {
+                if let Some(data) = erf.get(resref, restype) {
+                    return Some(data);
+                }
+            }
+        }
+        // Also try home dir
+        for base in &self.paths {
+            let p = base.join(format!("{}.hak", hak_name));
+            if let Ok(erf) = ErfFile::open(&p) {
+                if let Some(data) = erf.get(resref, restype) {
+                    return Some(data);
+                }
+            }
+        }
+        None
+    }
 }
 
-/// Look up the model name for a creature given its appearance ID.
-/// Uses `appearance.2da` where the 3rd column is the model name.
-pub fn lookup_creature_model(appearance: i32) -> Option<String> {
-    lookup_model_name_from_2da("appearance", appearance, "model")
+pub fn lookup_model_name_from_2da(
+    two_da_name: &str,
+    row: i32,
+    column_label: &str,
+    erfs: &[&ErfFile],
+) -> Option<String> {
+    for erf in erfs {
+        if let Some(data) = erf.get(&two_da_name.to_lowercase(), 2017) {
+            if let Ok(text) = std::str::from_utf8(&data) {
+                if let Some(name) = parse_2da_value(text, row, column_label) {
+                    return Some(name);
+                }
+            }
+        }
+    }
+    let data_dir = game_data_dir()?;
+    let resref = nwnrs_types::resman::ResRef::new(
+        two_da_name.to_lowercase(),
+        nwnrs_types::resman::ResType(2017),
+    ).ok()?;
+    let data = load_resource_from_key(&resref, &data_dir).ok()??;
+    let text = std::str::from_utf8(&data).ok()?;
+    parse_2da_value(text, row, column_label)
+}
+
+pub fn lookup_placeable_model(appearance: i32, erfs: &[&ErfFile]) -> Option<String> {
+    lookup_model_name_from_2da("placeables", appearance, "ModelName", erfs)
+}
+
+pub fn lookup_door_model(
+    appearance: i32,
+    generic_type: Option<i32>,
+    erfs: &[&ErfFile],
+) -> Option<String> {
+    if appearance > 0 {
+        lookup_model_name_from_2da("doortypes", appearance, "ModelName", erfs)
+    } else if appearance == 0 {
+        lookup_model_name_from_2da("genericdoors", generic_type?, "ModelName", erfs)
+    } else {
+        None
+    }
+}
+
+pub fn lookup_creature_model(appearance: i32, erfs: &[&ErfFile]) -> Option<String> {
+    for col in &["ModelName", "model", "MODELTYPE", "BODY_MODEL", "BodyModel", "Model"] {
+        if let Some(name) = lookup_model_name_from_2da("appearance", appearance, col, erfs) {
+            return Some(name);
+        }
+    }
+    let race = lookup_model_name_from_2da("appearance", appearance, "RACE", erfs)?;
+    let modeltype = lookup_model_name_from_2da("appearance", appearance, "MODELTYPE", erfs)?;
+    let prefix = match race.as_str() {
+        "0" | "1" | "2" | "3" => "NWH",
+        "4" | "5" | "6" => "NWL",
+        _ => "NWH",
+    };
+    Some(format!("{}_{}", prefix, modeltype))
+}
+
+/// Like `lookup_creature_model` but parses from raw 2DA text instead of ERF/game data.
+pub fn lookup_creature_model_from_text(text: &str, row: i32) -> Option<String> {
+    for col in &["ModelName", "model", "MODELTYPE", "BODY_MODEL", "BodyModel", "Model"] {
+        if let Some(name) = parse_2da_value(text, row, col) {
+            return Some(name);
+        }
+    }
+    let race = parse_2da_value(text, row, "RACE")?;
+    let modeltype = parse_2da_value(text, row, "MODELTYPE")?;
+    let prefix = match race.as_str() {
+        "0" | "1" | "2" | "3" => "NWH",
+        "4" | "5" | "6" => "NWL",
+        _ => "NWH",
+    };
+    Some(format!("{}_{}", prefix, modeltype))
 }
 
 #[cfg(test)]

@@ -1,3 +1,5 @@
+#![allow(incomplete_features)]
+#![feature(generic_const_exprs)]
 pub mod camera;
 pub mod pipeline;
 pub mod tile_renderer;

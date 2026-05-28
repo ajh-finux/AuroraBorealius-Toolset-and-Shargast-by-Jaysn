@@ -13,3 +13,4 @@ nwn-tileset = { path = "../nwn-tileset" }
 bytemuck = { version = "1", features = ["derive"] }
 rayon = "1"
 nwnrs-types = { version = "0.0.1", default-features = false, features = ["set", "key", "mdl", "dds", "tga", "checksums", "compressedbuf"] }
+nwn-erf = { path = "../nwn-erf" }

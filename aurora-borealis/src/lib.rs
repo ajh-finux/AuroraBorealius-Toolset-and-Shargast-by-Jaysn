@@ -137,6 +137,7 @@ struct AuroraBorealisApp {
     selection_list: Vec<(String, usize)>,
 
     module: Option<nwn_gamemodel::Module>,
+    module_data: Option<Vec<u8>>,
     module_name_edit: String,
     module_tag_edit: String,
     module_entry_edit: String,
@@ -738,6 +739,7 @@ impl AuroraBorealisApp {
             selection_list: Vec::new(),
 
             module: None,
+            module_data: None,
             module_name_edit: String::new(),
             module_tag_edit: String::new(),
             module_entry_edit: String::new(),
@@ -4262,6 +4264,15 @@ impl AuroraBorealisApp {
                 Ok(module) => {
                     let area_count = module.num_areas();
                     let module_name = module.name.clone();
+                    // Store module data for model loading
+                    self.module_data = std::fs::read(path).ok();
+                    if let Some(ref data) = self.module_data {
+                        self.viewport.set_module_erf(Some(data.clone()));
+                    }
+                    self.viewport.set_hak_info(
+                        Some(std::path::Path::new(path).parent().unwrap_or(std::path::Path::new(".")).to_path_buf()),
+                        module.haks.clone(),
+                    );
                     self.module = Some(module);
                     self.current_area = None;
                     self.open_areas.clear();
@@ -4292,12 +4303,16 @@ impl AuroraBorealisApp {
             Ok(module) => {
                 let area_count = module.num_areas();
                 let module_name = module.name.clone();
+                self.module_data = Some(data.to_vec());
+                self.viewport.set_module_erf(Some(data.to_vec()));
                 self.module = Some(module);
                 self.current_area = None;
                 self.open_areas.clear();
                 self.active_area_idx = 0;
                 self.selected_object = None;
                 self.selected_obj_info = None;
+                self.undo_stack.clear();
+                self.redo_stack.clear();
                 self.status = format!("Loaded module '{}' with {} areas.", module_name, area_count);
             }
             Err(nwn_gamemodel::ModelError::MissingHaks(haks)) => {
