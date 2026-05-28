@@ -910,32 +910,38 @@ impl eframe::App for AuroraBorealisApp {
         // Compute render target format once for reuse
         let target_format = _frame.wgpu_render_state().map(|rs| rs.target_format).unwrap_or(wgpu::TextureFormat::Bgra8Unorm);
 
-        // ===================== TOP MENU BAR =====================
-        egui::TopBottomPanel::top("menu").show(ctx, |ui| {
-            egui::menu::bar(ui, |ui| {
-                // ---- File menu ----
-                ui.menu_button("File", |ui| {
-                    if ui.button("Open Module...").clicked() {
+        // ===================== TOP TOOLBARS =====================
+        const S: f32 = 12.0;
+        let has_mod = self.module.is_some();
+        let has_area = self.current_area.is_some();
+        let mut filter_changed = false;
+
+        // ---- FILE BAR ----
+        egui::TopBottomPanel::top("menu_file").min_height(22.0).show(ctx, |ui| {
+            ui.style_mut().spacing.item_spacing = egui::vec2(1.0, 0.0);
+            egui::ScrollArea::horizontal().id_salt("toolbar_file").show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    if self.icons.label_button(ui, "Open", "open-folder", S).clicked() {
                         if let Some(path) = pick_open_module() {
                             self.load_module_at_path(&path);
                             add_recent_file(&mut self.recent_files, &path);
                         }
-                        ui.close_menu();
                     }
-                    ui.menu_button("Open Recent", |ui| {
-                        for f in self.recent_files.clone() {
-                            if ui.button(&f).clicked() {
-                                self.load_module_at_path(&f);
-                                add_recent_file(&mut self.recent_files, &f);
-                                ui.close_menu();
+                    if !self.recent_files.is_empty() {
+                        egui::menu::menu_button(ui, "Recent", |ui| {
+                            for f in self.recent_files.clone() {
+                                if ui.button(&f).clicked() {
+                                    self.load_module_at_path(&f);
+                                    add_recent_file(&mut self.recent_files, &f);
+                                    ui.close_menu();
+                                }
                             }
-                        }
-                        if self.recent_files.is_empty() {
-                            ui.label("No recent files");
-                        }
-                    });
-                    ui.separator();
-                    if ui.button("Module Properties").clicked() {
+                        });
+                    }
+                    if has_mod && self.icons.label_button(ui, "Save", "save", S).clicked() {
+                        self.save_module();
+                    }
+                    if has_mod && self.icons.label_button(ui, "Props", "cog", S).clicked() {
                         if let Some(ref module) = self.module {
                             self.module_name_edit = module.name.clone();
                             self.module_tag_edit = module.tag.clone();
@@ -943,30 +949,8 @@ impl eframe::App for AuroraBorealisApp {
                             self.module_description_edit = module.description.clone();
                             self.module_props_popup = true;
                         }
-                        ui.close_menu();
                     }
-                    ui.separator();
-                    if ui.button("Save Module").clicked() {
-                        self.save_module();
-                        ui.close_menu();
-                    }
-                    if let Some(ref module) = self.module {
-                        if ui.button("Save As...").clicked() {
-                            if let Some(path) = pick_save_path(&module.name) {
-                                self.save_module_as(&path);
-                                self.status = format!("Module saved to {}", path);
-                            }
-                            ui.close_menu();
-                        }
-                    }
-                    if self.module.is_some() {
-                        if ui.button("Launch in NWN:EE").clicked() {
-                            self.launch_nwn();
-                            ui.close_menu();
-                        }
-                    }
-                    ui.separator();
-                    if ui.button("Export Minimap PNG...").clicked() {
+                    if has_area && self.icons.label_button(ui, "Minimap", "square", S).clicked() {
                         if let Some(ref area) = self.current_area {
                             if let Some(path) = pick_save_path_filtered(
                                 &format!("{}_minimap.png", area.resref), "PNG", &["png"]
@@ -977,379 +961,289 @@ impl eframe::App for AuroraBorealisApp {
                                 }
                             }
                         }
-                        ui.close_menu();
                     }
-                    #[cfg(not(target_arch = "wasm32"))]
-                    {
-                        ui.separator();
-                        if ui.button("Quit").clicked() {
-                            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                        }
+                    if has_mod && self.icons.label_button(ui, "Launch", "play-button", S).clicked() {
+                        self.launch_nwn();
                     }
-                });
-                // ---- View menu ----
-                ui.menu_button("View", |ui| {
-                    let mut rv = self.show_resource_viewer;
-                    ui.checkbox(&mut rv, "Resource Viewer");
-                    if rv != self.show_resource_viewer {
-                        self.show_resource_viewer = rv;
-                        ui.close_menu();
-                    }
-                    let mut bp = self.show_blueprint_palette;
-                    ui.checkbox(&mut bp, "Blueprint Palette");
-                    if bp != self.show_blueprint_palette {
-                        self.show_blueprint_palette = bp;
-                        ui.close_menu();
-                    }
-                    let mut ib = self.item_browser_open;
-                    ui.checkbox(&mut ib, "Item Browser");
-                    if ib != self.item_browser_open {
-                        self.item_browser_open = ib;
-                        ui.close_menu();
-                    }
-                    let mut us = self.universal_search_open;
-                    ui.checkbox(&mut us, "Universal Search");
-                    if us != self.universal_search_open {
-                        self.universal_search_open = us;
-                        ui.close_menu();
-                    }
-                    ui.checkbox(&mut self.show_sky_override, "Sky Color Override");
-                    ui.checkbox(&mut self.show_navigator, "Navigator Panel");
-                    ui.checkbox(&mut self.show_minimap, "Minimap Overlay");
-                    ui.checkbox(&mut self.graph_view_open, "Graph Area View");
-                    ui.checkbox(&mut self.height_map_open, "Height Map View");
-                    ui.checkbox(&mut self.module_tree_open, "Module Tree View");
-                    ui.checkbox(&mut self.show_contents_panel, "Contents Panel");
-                    ui.separator();
-                    ui.checkbox(&mut self.tile_palette_open, "Tile Palette");
-                    ui.separator();
-                    let mut st = self.show_tiles;
-                    ui.checkbox(&mut st, "Show Tiles");
-                    if st != self.show_tiles { self.show_tiles = st; self.viewport.set_show_tiles(st); }
-                    let mut sg = self.show_grid;
-                    ui.checkbox(&mut sg, "Show Grid");
-                    if sg != self.show_grid { self.show_grid = sg; self.viewport.set_show_grid(sg); }
-                    let mut le = self.lighting_enabled;
-                    ui.checkbox(&mut le, "Enable Lighting");
-                    if le != self.lighting_enabled { self.lighting_enabled = le; self.viewport.set_lighting_enabled(le); }
-                    let mut ff = self.show_fog;
-                    ui.checkbox(&mut ff, "Show Fog");
-                    if ff != self.show_fog { self.show_fog = ff; self.viewport.set_show_fog(ff); }
-                    ui.add(egui::Slider::new(&mut self.max_texture_mem_mb, 128..=4096).text("Max Texture Memory (MB)"));
-                    self.viewport.set_texture_mem_limit(self.max_texture_mem_mb as u64 * 1024 * 1024);
-                    ui.separator();
-                    let mut sg = self.snap_to_grid_enabled;
-                    ui.checkbox(&mut sg, "Snap to Grid");
-                    if sg != self.snap_to_grid_enabled { self.snap_to_grid_enabled = sg; }
-                    if self.snap_to_grid_enabled {
-                        let mut sv = self.snap_to_grid_value;
-                        ui.add(egui::Slider::new(&mut sv, 0.5..=50.0).text("Grid Size"));
-                        if sv != self.snap_to_grid_value { self.snap_to_grid_value = sv; }
-                    }
-                    ui.separator();
-                    let mut wm = self.show_walkmesh;
-                    ui.checkbox(&mut wm, "Show Walkmesh");
-                    if wm != self.show_walkmesh { self.show_walkmesh = wm; self.viewport.set_show_walkmesh(wm); }
-                    let mut we = self.show_walkmesh_edges;
-                    ui.checkbox(&mut we, "Walkmesh Edges");
-                    if we != self.show_walkmesh_edges { self.show_walkmesh_edges = we; self.viewport.set_show_walkmesh_edges(we); }
-                    let gen_threshold = self.walkmesh_gen_threshold;
-                    let has_area = self.current_area.is_some();
-                    if ui.button("Generate Walls").clicked() && has_area {
-                        self.push_undo();
-                        if let Some(ref mut area) = self.current_area {
-                            let area_mut = Arc::make_mut(area);
-                            let resref = area_mut.resref.clone();
-                            let count = generate_walkmesh_walls(area_mut, gen_threshold);
-                            if let Some(ref mut module) = self.module {
-                                module.update_area_are(&resref, area_mut);
+                    self.icons.label_button(ui, "Quit", "cross-mark", S).clicked().then(|| {
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                    });
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if let Some(ref module) = self.module {
+                            if module.modified {
+                                ui.colored_label(egui::Color32::YELLOW, "● Modified");
                             }
-                            self.area_version = self.area_version.wrapping_add(1);
-                            self.viewport.set_area(area.clone(), self.area_version, target_format);
-                            self.status = format!("Generated {} walkmesh walls (threshold={})", count, gen_threshold);
                         }
+                    });
+                });
+            });
+        });
+
+        // ---- VIEW BAR ----
+        egui::TopBottomPanel::top("menu_view").min_height(22.0).show(ctx, |ui| {
+            ui.style_mut().spacing.item_spacing = egui::vec2(1.0, 0.0);
+            egui::ScrollArea::horizontal().id_salt("toolbar_view").show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    if self.icons.label_toggle(ui, "Res", "box", self.show_resource_viewer, S).clicked() {
+                        self.show_resource_viewer = !self.show_resource_viewer;
                     }
-                    ui.add(egui::Slider::new(&mut self.walkmesh_gen_threshold, 1..=10).text("Wall Threshold"));
-                    let mut pt = self.show_paint;
-                    ui.checkbox(&mut pt, "Show Paint Overlay");
-                    if pt != self.show_paint { self.show_paint = pt; self.viewport.set_show_paint(pt); }
-                    let mut ss = self.show_sprites;
-                    ui.checkbox(&mut ss, "Show Sprites");
-                    if ss != self.show_sprites { self.show_sprites = ss; self.viewport.set_show_sprites(ss); }
-                    let mut filter_changed = false;
-                    ui.menu_button("Show Object Markers", |ui| {
+                    if self.icons.label_toggle(ui, "BP", "cube", self.show_blueprint_palette, S).clicked() {
+                        self.show_blueprint_palette = !self.show_blueprint_palette;
+                    }
+                    if self.icons.label_toggle(ui, "Items", "chest", self.item_browser_open, S).clicked() {
+                        self.item_browser_open = !self.item_browser_open;
+                    }
+                    if self.icons.label_toggle(ui, "Search", "magnifying-glass", self.universal_search_open, S).clicked() {
+                        self.universal_search_open = !self.universal_search_open;
+                    }
+                    if self.icons.label_toggle(ui, "Tree", "expand", self.module_tree_open, S).clicked() {
+                        self.module_tree_open = !self.module_tree_open;
+                    }
+                    if self.icons.label_toggle(ui, "Con", "door", self.show_contents_panel, S).clicked() {
+                        self.show_contents_panel = !self.show_contents_panel;
+                    }
+                    if self.icons.label_toggle(ui, "Palette", "gate", self.tile_palette_open, S).clicked() {
+                        self.tile_palette_open = !self.tile_palette_open;
+                    }
+                    if self.icons.label_toggle(ui, "Graph", "new-shoot", self.graph_view_open, S).clicked() {
+                        self.graph_view_open = !self.graph_view_open;
+                    }
+                    if self.icons.label_toggle(ui, "Height", "sun", self.height_map_open, S).clicked() {
+                        self.height_map_open = !self.height_map_open;
+                    }
+                    if self.icons.label_toggle(ui, "Nav", "star-flag", self.show_navigator, S).clicked() {
+                        self.show_navigator = !self.show_navigator;
+                    }
+                    if self.icons.label_toggle(ui, "Mini", "square", self.show_minimap, S).clicked() {
+                        self.show_minimap = !self.show_minimap;
+                    }
+                    if self.icons.label_toggle(ui, "Sky", "sun", self.show_sky_override, S).clicked() {
+                        self.show_sky_override = !self.show_sky_override;
+                    }
+                    ui.separator();
+                    if self.icons.label_toggle(ui, "Tiles", "square", self.show_tiles, S).clicked() {
+                        self.show_tiles = !self.show_tiles; self.viewport.set_show_tiles(self.show_tiles);
+                    }
+                    if self.icons.label_toggle(ui, "Grid", "", self.show_grid, S).clicked() {
+                        self.show_grid = !self.show_grid; self.viewport.set_show_grid(self.show_grid);
+                    }
+                    if self.icons.label_toggle(ui, "Light", "light-bulb", self.lighting_enabled, S).clicked() {
+                        self.lighting_enabled = !self.lighting_enabled; self.viewport.set_lighting_enabled(self.lighting_enabled);
+                    }
+                    if self.icons.label_toggle(ui, "Fog", "moon", self.show_fog, S).clicked() {
+                        self.show_fog = !self.show_fog; self.viewport.set_show_fog(self.show_fog);
+                    }
+                    if self.icons.label_toggle(ui, "Walk", "rock", self.show_walkmesh, S).clicked() {
+                        self.show_walkmesh = !self.show_walkmesh; self.viewport.set_show_walkmesh(self.show_walkmesh);
+                    }
+                    if self.icons.label_toggle(ui, "WEdges", "", self.show_walkmesh_edges, S).clicked() {
+                        self.show_walkmesh_edges = !self.show_walkmesh_edges; self.viewport.set_show_walkmesh_edges(self.show_walkmesh_edges);
+                    }
+                    if self.icons.label_toggle(ui, "Paint", "pencil", self.show_paint, S).clicked() {
+                        self.show_paint = !self.show_paint; self.viewport.set_show_paint(self.show_paint);
+                    }
+                    if self.icons.label_toggle(ui, "Sprite", "", self.show_sprites, S).clicked() {
+                        self.show_sprites = !self.show_sprites; self.viewport.set_show_sprites(self.show_sprites);
+                    }
+                    if self.icons.label_toggle(ui, "Water", "", self.show_water, S).clicked() {
+                        self.show_water = !self.show_water;
+                        if self.show_water { self.viewport.set_water(self.water_level, true, [40, 80, 200, 160]); } else { self.viewport.set_water(0, false, [0;4]); }
+                    }
+                    if self.icons.label_toggle(ui, "Snap", "", self.snap_to_grid_enabled, S).clicked() {
+                        self.snap_to_grid_enabled = !self.snap_to_grid_enabled;
+                    }
+                    ui.separator();
+                    egui::menu::menu_button(ui, "Marks", |ui| {
                         let mut sc = self.show_creatures;
-                        ui.checkbox(&mut sc, "Creatures");
-                        if sc != self.show_creatures { self.show_creatures = sc; filter_changed = true; }
+                        ui.checkbox(&mut sc, "Creatures"); if sc != self.show_creatures { self.show_creatures = sc; filter_changed = true; }
                         let mut sd = self.show_doors;
-                        ui.checkbox(&mut sd, "Doors");
-                        if sd != self.show_doors { self.show_doors = sd; filter_changed = true; }
+                        ui.checkbox(&mut sd, "Doors"); if sd != self.show_doors { self.show_doors = sd; filter_changed = true; }
                         let mut sp = self.show_placeables;
-                        ui.checkbox(&mut sp, "Placeables");
-                        if sp != self.show_placeables { self.show_placeables = sp; filter_changed = true; }
-                        let mut st = self.show_triggers;
-                        ui.checkbox(&mut st, "Triggers");
-                        if st != self.show_triggers { self.show_triggers = st; filter_changed = true; }
+                        ui.checkbox(&mut sp, "Placeables"); if sp != self.show_placeables { self.show_placeables = sp; filter_changed = true; }
+                        let mut st2 = self.show_triggers;
+                        ui.checkbox(&mut st2, "Triggers"); if st2 != self.show_triggers { self.show_triggers = st2; filter_changed = true; }
                         let mut swp = self.show_waypoints;
-                        ui.checkbox(&mut swp, "Waypoints");
-                        if swp != self.show_waypoints { self.show_waypoints = swp; filter_changed = true; }
+                        ui.checkbox(&mut swp, "Waypoints"); if swp != self.show_waypoints { self.show_waypoints = swp; filter_changed = true; }
                         let mut se = self.show_encounters;
-                        ui.checkbox(&mut se, "Encounters");
-                        if se != self.show_encounters { self.show_encounters = se; filter_changed = true; }
+                        ui.checkbox(&mut se, "Encounters"); if se != self.show_encounters { self.show_encounters = se; filter_changed = true; }
                         let mut sse = self.show_sound_emitters;
-                        ui.checkbox(&mut sse, "Sound Emitters");
-                        if sse != self.show_sound_emitters { self.show_sound_emitters = sse; filter_changed = true; }
+                        ui.checkbox(&mut sse, "Sound Emitters"); if sse != self.show_sound_emitters { self.show_sound_emitters = sse; filter_changed = true; }
                         let mut sl = self.show_lights;
-                        ui.checkbox(&mut sl, "Lights");
-                        if sl != self.show_lights { self.show_lights = sl; filter_changed = true; }
+                        ui.checkbox(&mut sl, "Lights"); if sl != self.show_lights { self.show_lights = sl; filter_changed = true; }
                     });
-                    if filter_changed {
-                        self.update_visibility_filter(target_format);
-                        ui.close_menu();
-                    }
-                    let mut sw = self.show_water;
-                    ui.checkbox(&mut sw, "Show Water");
-                    if sw != self.show_water { self.show_water = sw; if sw { self.viewport.set_water(self.water_level, true, [40, 80, 200, 160]); } else { self.viewport.set_water(0, false, [0;4]); } }
-                    if self.show_water {
-                        let mut wl = self.water_level;
-                        ui.add(egui::Slider::new(&mut wl, -10..=50).text("Water Level"));
-                        if wl != self.water_level { self.water_level = wl; self.viewport.set_water(wl, true, [40, 80, 200, 160]); }
-                    }
-                });
-                // ---- Edit menu ----
-                ui.menu_button("Edit", |ui| {
-                    if ui.button("Undo\tCtrl+Z").clicked() {
-                        self.undo(target_format);
-                        ui.close_menu();
-                    }
-                    if ui.button("Redo\tCtrl+Shift+Z").clicked() {
-                        self.redo(target_format);
-                        ui.close_menu();
-                    }
-                });
-                // ---- Object menu ----
-                if self.current_area.is_some() {
-                    ui.menu_button("Object", |ui| {
-                        if ui.button("New...\tCtrl+N").clicked() {
-                            self.new_object_open = true;
-                            self.new_object_type = "creature".to_string();
-                            self.new_object_resref.clear();
-                            self.new_object_tag.clear();
-                            self.new_object_x = 0.0;
-                            self.new_object_y = 0.0;
-                            self.new_object_z = 0.0;
-                            self.new_object_bearing = 0.0;
-                            ui.close_menu();
-                        }
-                        if ui.button("Copy\tCtrl+C").clicked() {
-                            self.copy_selected_object();
-                            ui.close_menu();
-                        }
-                        if ui.button("Paste\tCtrl+V").clicked() {
-                            self.paste_object();
-                            ui.close_menu();
-                        }
-                        if ui.button("Delete\tDel").clicked() {
-                            self.delete_selected_object();
-                            ui.close_menu();
-                        }
-                        ui.separator();
-                        if ui.button("Select All\tCtrl+A").clicked() {
-                            // Select all not implemented yet
-                            self.status = "Select All not implemented.".to_string();
-                            ui.close_menu();
-                        }
-                    });
-                }
-                // ---- Tools menu ----
-                ui.menu_button("Tools", |ui| {
-                    if self.current_area.is_some() {
-                        if ui.button("Environment Settings...").clicked() {
-                            if let Some(ref area) = self.current_area {
-                                self.env_sun_fog_amount = area.sun_fog_amount;
-                                self.env_sun_fog_color = area.sun_fog_color;
-                                self.env_moon_fog_amount = area.moon_fog_amount;
-                                self.env_moon_fog_color = area.moon_fog_color;
-                                self.env_fog_clip_dist = area.fog_clip_dist;
-                                self.env_sun_ambient_color = area.sun_ambient_color;
+                    if filter_changed { self.update_visibility_filter(target_format); }
+                    egui::menu::menu_button(ui, "...", |ui| {
+                        if has_area {
+                            if ui.button("Generate Walls").clicked() {
+                                self.push_undo();
+                                if let Some(ref mut area) = self.current_area {
+                                    let area_mut = Arc::make_mut(area);
+                                    let resref = area_mut.resref.clone();
+                                    let count = generate_walkmesh_walls(area_mut, self.walkmesh_gen_threshold);
+                                    if let Some(ref mut module) = self.module {
+                                        module.update_area_are(&resref, area_mut);
+                                    }
+                                    self.area_version = self.area_version.wrapping_add(1);
+                                    self.viewport.set_area(area.clone(), self.area_version, target_format);
+                                    self.status = format!("Generated {} walkmesh walls (threshold={})", count, self.walkmesh_gen_threshold);
+                                }
                             }
-                            self.env_settings_open = true;
-                            ui.close_menu();
+                            ui.add(egui::Slider::new(&mut self.walkmesh_gen_threshold, 1..=10).text("Wall Threshold"));
                         }
-                    }
-                    if ui.button("Faction Editor").clicked() {
-                        self.faction_editor_open = true;
-                        ui.close_menu();
-                    }
-                    if ui.button("Journal Editor").clicked() {
-                        self.journal_editor_open = true;
-                        ui.close_menu();
-                    }
-                    if ui.button("Encounter Editor").clicked() {
-                        self.encounter_editor_open = true;
-                        ui.close_menu();
-                    }
-                    if ui.button("Texture Browser").clicked() {
-                        self.texture_browser.open = true;
-                        ui.close_menu();
-                    }
-                    if self.module.is_some() {
-                        if ui.button("Sound Browser").clicked() {
-                            self.sound_browser_open = true;
-                            ui.close_menu();
+                        if self.show_water {
+                            let mut wl = self.water_level;
+                            ui.add(egui::Slider::new(&mut wl, -10..=50).text("Water Level"));
+                            if wl != self.water_level { self.water_level = wl; self.viewport.set_water(wl, true, [40, 80, 200, 160]); }
                         }
-                    }
-                    if self.module.is_some() {
-                        if ui.button("Store Editor").clicked() {
-                            self.store_editor_open = true;
-                            ui.close_menu();
+                        if self.snap_to_grid_enabled {
+                            let mut sv = self.snap_to_grid_value;
+                            ui.add(egui::Slider::new(&mut sv, 0.5..=50.0).text("Grid Size"));
+                            if sv != self.snap_to_grid_value { self.snap_to_grid_value = sv; }
                         }
-                    }
-                    if self.module.is_some() {
-                        if ui.button("ID Whois Utility").clicked() {
-                            self.id_whois_open = true;
-                            ui.close_menu();
+                        ui.add(egui::Slider::new(&mut self.max_texture_mem_mb, 128..=4096).text("Max Texture Memory (MB)"));
+                        self.viewport.set_texture_mem_limit(self.max_texture_mem_mb as u64 * 1024 * 1024);
+                    });
+                });
+            });
+        });
+
+        // ---- TOOLS BAR ----
+        egui::TopBottomPanel::top("menu_tools").min_height(22.0).show(ctx, |ui| {
+            ui.style_mut().spacing.item_spacing = egui::vec2(1.0, 0.0);
+            egui::ScrollArea::horizontal().id_salt("toolbar_tools").show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    if has_area && self.icons.label_toggle(ui, "Env", "moon", self.env_settings_open, S).clicked() {
+                        if let Some(ref area) = self.current_area {
+                            self.env_sun_fog_amount = area.sun_fog_amount;
+                            self.env_sun_fog_color = area.sun_fog_color;
+                            self.env_moon_fog_amount = area.moon_fog_amount;
+                            self.env_moon_fog_color = area.moon_fog_color;
+                            self.env_fog_clip_dist = area.fog_clip_dist;
+                            self.env_sun_ambient_color = area.sun_ambient_color;
                         }
+                        self.env_settings_open = !self.env_settings_open;
                     }
-                    if self.current_area.is_some() {
-                        if ui.button("Area Geometry Editor").clicked() {
-                            self.geometry_editor.open = true;
-                            ui.close_menu();
-                        }
+                    if self.icons.label_toggle(ui, "Factions", "person", self.faction_editor_open, S).clicked() {
+                        self.faction_editor_open = !self.faction_editor_open;
                     }
-                    if ui.button("Find/Replace in Scripts...").clicked() {
-                        self.find_replace_open = true;
-                        ui.close_menu();
+                    if self.icons.label_toggle(ui, "Journal", "pencil", self.journal_editor_open, S).clicked() {
+                        self.journal_editor_open = !self.journal_editor_open;
                     }
-                    if self.module.is_some() {
-                        if ui.button("Area Transition Editor...").clicked() {
-                            self.transition_editor_open = true;
-                            self.status = "Scanned transitions. Open the Transition Editor window.".to_string();
-                            ui.close_menu();
-                        }
+                    if self.icons.label_toggle(ui, "Enc", "star-flag", self.encounter_editor_open, S).clicked() {
+                        self.encounter_editor_open = !self.encounter_editor_open;
+                    }
+                    if self.icons.label_toggle(ui, "Tex", "cube", self.texture_browser.open, S).clicked() {
+                        self.texture_browser.open = !self.texture_browser.open;
+                    }
+                    if has_mod && self.icons.label_toggle(ui, "Sound", "musical-notes", self.sound_browser_open, S).clicked() {
+                        self.sound_browser_open = !self.sound_browser_open;
+                    }
+                    if has_mod && self.icons.label_toggle(ui, "Store", "chest", self.store_editor_open, S).clicked() {
+                        self.store_editor_open = !self.store_editor_open;
+                    }
+                    if has_mod && self.icons.label_toggle(ui, "Whois", "help", self.id_whois_open, S).clicked() {
+                        self.id_whois_open = !self.id_whois_open;
+                    }
+                    if has_area && self.icons.label_toggle(ui, "Geom", "move", self.geometry_editor.open, S).clicked() {
+                        self.geometry_editor.open = !self.geometry_editor.open;
+                    }
+                    if self.icons.label_toggle(ui, "Find", "magnifying-glass", self.find_replace_open, S).clicked() {
+                        self.find_replace_open = !self.find_replace_open;
+                    }
+                    if has_mod && self.icons.label_toggle(ui, "Trans", "door", self.transition_editor_open, S).clicked() {
+                        self.transition_editor_open = !self.transition_editor_open;
+                        if self.transition_editor_open { self.status = "Scanning transitions.".to_string(); }
                     }
                     ui.separator();
-                    // ---- NWSync Export ----
-                    if self.module.is_some() {
-                        let module_path = self.module.as_ref().map(|m| m.path.clone());
-                        let module_name = self.module.as_ref().map(|m| m.name.clone());
-                        if let Some(ref mod_path) = module_path {
-                            let nwsync_path = self.nwsync_output_path.clone();
-                            if ui.button("Select NWSync Export Folder...").clicked() {
-                                if let Some(folder) = rfd::FileDialog::new().pick_folder() {
-                                    self.nwsync_output_path = Some(folder);
+                    if self.icons.label_button(ui, "Undo", "return-arrow", S).clicked() {
+                        self.undo(target_format);
+                    }
+                    if self.icons.label_button(ui, "Redo", "forward-field", S).clicked() {
+                        self.redo(target_format);
+                    }
+                    // Right side: bookmarks + NWSync
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if has_area {
+                            if self.icons.icon_button(ui, "bookmark", "Add Camera Bookmark", 16.0).clicked() {
+                                let idx = self.camera_bookmarks.len() + 1;
+                                if let Some(cam) = self.viewport.camera_state() {
+                                    self.camera_bookmarks.push(CameraBookmark {
+                                        name: format!("Bookmark {}", idx),
+                                        target: cam.target, yaw: cam.theta, pitch: cam.phi, distance: cam.radius,
+                                    });
+                                    self.status = format!("Camera bookmark '{}' added.", idx);
                                 }
-                                ui.close_menu();
+                            }
+                            if !self.camera_bookmarks.is_empty() {
+                                egui::menu::menu_button(ui, "BMs", |ui| {
+                                    let mut to_remove = None;
+                                    for (i, bm) in self.camera_bookmarks.iter().enumerate() {
+                                        if ui.button(&bm.name).clicked() {
+                                            self.viewport.set_camera(&nwn_3d::OrbitCamera {
+                                                target: bm.target, theta: bm.yaw, phi: bm.pitch, radius: bm.distance, aspect: 1.0,
+                                            });
+                                            ui.close_menu();
+                                        }
+                                        if ui.button(format!("Del {}", bm.name)).clicked() { to_remove = Some(i); }
+                                    }
+                                    if let Some(i) = to_remove { self.camera_bookmarks.remove(i); }
+                                });
+                            }
+                        }
+                        if has_mod {
+                            let nwsync_path = self.nwsync_output_path.clone();
+                            if self.icons.icon_button(ui, "recycle", "NWSync Export", 16.0).clicked() {
+                                if let Some(folder) = rfd::FileDialog::new().pick_folder() { self.nwsync_output_path = Some(folder); }
                             }
                             if let Some(ref out_dir) = nwsync_path {
-                                ui.label(format!("Output: {}", out_dir.display()));
+                                ui.label(format!("{}", out_dir.display()));
                                 let busy = self.nwsync_busy;
-                                if ui.add_enabled(!busy, egui::Button::new("Write NWSync")).clicked() {
+                                if ui.add_enabled(!busy, egui::Button::new("Write")).clicked() {
                                     self.nwsync_busy = true;
                                     self.status = "Writing NWSync...".to_string();
-                                    let mod_path = mod_path.clone();
-                                    let hak_dir = std::path::PathBuf::from(
-                                        std::env::var("HOME").unwrap_or_else(|_| ".".to_string())
-                                    ).join(".local/share/Neverwinter Nights/hak");
+                                    let mod_path = self.module.as_ref().map(|m| m.path.clone()).unwrap_or_default();
                                     let out = out_dir.clone();
-                                    let lbl = module_name.clone().unwrap_or_default();
+                                    let lbl = self.module.as_ref().map(|m| m.name.clone()).unwrap_or_default();
                                     let result = self.nwsync_result.clone();
+                                    let hak_dir = std::path::PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".to_string())).join(".local/share/Neverwinter Nights/hak");
                                     std::thread::spawn(move || {
                                         let msg = match nwsync_gen::gen_nwsync(&mod_path, &hak_dir, &out, &lbl) {
                                             Ok(()) => format!("NWSync write OK for {}", lbl),
                                             Err(e) => format!("NWSync write FAILED for {}: {}", lbl, e),
                                         };
-                                        if let Ok(mut r) = result.lock() {
-                                            *r = Some(msg);
-                                        }
+                                        if let Ok(mut r) = result.lock() { *r = Some(msg); }
                                     });
-                                    ui.close_menu();
                                 }
-                            } else {
-                                ui.label("No export folder selected");
                             }
                         }
-                    }
+                    });
                 });
-                // ---- Camera bookmarks ----
-                if self.current_area.is_some() {
-                    ui.separator();
-                    if self.icons.icon_button(ui, "bookmark", "Add Camera Bookmark", 20.0).clicked() {
-                        let idx = self.camera_bookmarks.len() + 1;
-                        if let Some(cam) = self.viewport.camera_state() {
-                            self.camera_bookmarks.push(CameraBookmark {
-                                name: format!("Bookmark {}", idx),
-                                target: cam.target,
-                                yaw: cam.theta,
-                                pitch: cam.phi,
-                                distance: cam.radius,
-                            });
-                            self.status = format!("Camera bookmark '{}' added.", idx);
-                        } else {
-                            self.status = "Could not capture camera state.".to_string();
-                        }
+            });
+        });
+
+        // ---- EDIT BAR ----
+        egui::TopBottomPanel::top("menu_edit").min_height(22.0).show(ctx, |ui| {
+            ui.style_mut().spacing.item_spacing = egui::vec2(1.0, 0.0);
+            egui::ScrollArea::horizontal().id_salt("toolbar_edit").show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    if has_area && self.icons.label_button(ui, "New", "new-shoot", S).clicked() {
+                        self.new_object_open = true;
+                        self.new_object_type = "creature".to_string();
+                        self.new_object_resref.clear();
+                        self.new_object_tag.clear();
+                        self.new_object_x = 0.0;
+                        self.new_object_y = 0.0;
+                        self.new_object_z = 0.0;
+                        self.new_object_bearing = 0.0;
                     }
-                    if !self.camera_bookmarks.is_empty() {
-                        ui.menu_button("Bookmarks", |ui| {
-                            let mut to_remove = None;
-                            for (i, bm) in self.camera_bookmarks.iter().enumerate() {
-                                if ui.button(&bm.name).clicked() {
-                                    let cam = nwn_3d::OrbitCamera {
-                                        target: bm.target,
-                                        theta: bm.yaw,
-                                        phi: bm.pitch,
-                                        radius: bm.distance,
-                                        aspect: 1.0,
-                                    };
-                                    self.viewport.set_camera(&cam);
-                                    self.status = format!("Jumped to '{}'.", bm.name);
-                                    ui.close_menu();
-                                }
-                                if ui.button(format!("Del {}", bm.name)).clicked() {
-                                    to_remove = Some(i);
-                                }
-                            }
-                            if let Some(i) = to_remove {
-                                self.camera_bookmarks.remove(i);
-                                self.status = "Bookmark removed.".to_string();
-                            }
-                        });
+                    if has_area && self.icons.label_button(ui, "Copy", "select", S).clicked() {
+                        self.copy_selected_object();
                     }
-                }
-                // ---- Right side: Undo/Redo ----
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if self.icons.icon_button(ui, "forward-field", "Redo", 20.0).clicked() {
-                        if let Some(snapshot) = self.redo_stack.pop() {
-                            if let Some(ref current) = self.current_area {
-                                self.undo_stack.push(current.clone());
-                            }
-                            self.current_area = Some(snapshot.clone());
-                            self.area_version = self.area_version.wrapping_add(1);
-                            self.viewport.set_area(snapshot, self.area_version, target_format);
-                            self.selected_object = None;
-                            self.selected_obj_info = None;
-                            self.selection_list.clear();
-                            self.status = "Redo".to_string();
-                        }
+                    if has_area && self.icons.label_button(ui, "Paste", "hand", S).clicked() {
+                        self.paste_object();
                     }
-                    if self.icons.icon_button(ui, "return-arrow", "Undo", 20.0).clicked() {
-                        if let Some(snapshot) = self.undo_stack.pop() {
-                            if let Some(ref current) = self.current_area {
-                                self.redo_stack.push(current.clone());
-                            }
-                            self.current_area = Some(snapshot.clone());
-                            self.area_version = self.area_version.wrapping_add(1);
-                            self.viewport.set_area(snapshot, self.area_version, target_format);
-                            self.selected_object = None;
-                            self.selected_obj_info = None;
-                            self.selection_list.clear();
-                            self.status = "Undo".to_string();
-                        }
-                    }
-                    if let Some(ref module) = self.module {
-                        if module.modified {
-                            ui.colored_label(egui::Color32::YELLOW, "● Modified");
-                        }
+                    if has_area && self.icons.label_button(ui, "Del", "trash-can", S).clicked() {
+                        self.delete_selected_object();
                     }
                 });
             });
