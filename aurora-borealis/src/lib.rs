@@ -178,6 +178,7 @@ struct AuroraBorealisApp {
     local_var_editor: Option<LocalVarEditorState>,
     appearance_picker: Option<AppearancePickerState>,
     object_comment_edit: Option<(String, usize, String)>,
+    inventory_editor: Option<InventoryEditorState>,
     placement_state: PlacementState,
     manip_mode: ManipMode,
     manip_nudge_speed: f32,
@@ -219,6 +220,16 @@ struct AuroraBorealisApp {
     new_object_y: f32,
     new_object_z: f32,
     new_object_bearing: f32,
+}
+
+#[derive(Debug, Clone)]
+struct InventoryEditorState {
+    obj_type: String,
+    obj_idx: usize,
+    items: Vec<PropertyBag>,
+    editing_item: Option<usize>,
+    add_blueprint_filter: String,
+    add_blueprint_results: Vec<(String, u16)>,
 }
 
 #[derive(Debug, Clone)]
@@ -503,6 +514,85 @@ fn set_object_appearance(module: &mut nwn_gamemodel::Module, area_resref: &str, 
     module.modified = true;
 }
 
+fn load_item_list(module: Option<&nwn_gamemodel::Module>, area_resref: &str, obj_type: &str, obj_idx: usize) -> Vec<PropertyBag> {
+    let module = match module { Some(m) => m, None => return vec![] };
+    let git_key = area_resref.trim().to_lowercase();
+    let git_data = module.raw_git.get(&git_key);
+    let git_gff = git_data.and_then(|d| nwn_gff::GffFile::from_bytes(d).ok());
+    let fv_list_name = git_list_name(obj_type);
+    git_gff.as_ref().and_then(|gff| {
+        let list_fv = gff.root().find(fv_list_name)?;
+        let list = match list_fv {
+            nwn_gff::FieldValue::List(l) => l,
+            _ => return None,
+        };
+        let obj_struct = list.get(obj_idx)?;
+        let item_list_fv = obj_struct.find("ItemList")?;
+        let item_list = match item_list_fv {
+            nwn_gff::FieldValue::List(l) => l,
+            _ => return None,
+        };
+        let items: Vec<PropertyBag> = item_list.iter().map(|s| PropertyBag::from_gff_struct(s)).collect();
+        Some(items)
+    }).unwrap_or_default()
+}
+
+fn save_item_list(module: Option<&mut nwn_gamemodel::Module>, area_resref: &str, obj_type: &str, obj_idx: usize, items: &[PropertyBag]) {
+    let module = match module { Some(m) => m, None => return };
+    let git_key = area_resref.trim().to_lowercase();
+    let data = match module.raw_git.get(&git_key) {
+        Some(d) => d.clone(),
+        None => return,
+    };
+    let mut gff = match nwn_gff::GffFile::from_bytes(&data) {
+        Ok(g) => g,
+        Err(_) => return,
+    };
+    let fv_list_name = git_list_name(obj_type);
+    let struct_id = git_struct_id(obj_type);
+    let bag = {
+        let gff_bytes = gff.to_bytes();
+        let gff_copy = match nwn_gff::GffFile::from_bytes(&gff_bytes) {
+            Ok(g) => g,
+            Err(_) => return,
+        };
+        let list_fv = match gff_copy.root().find(fv_list_name) {
+            Some(l) => l,
+            None => return,
+        };
+        let list = match list_fv {
+            nwn_gff::FieldValue::List(l) => l,
+            _ => return,
+        };
+        let obj_struct = match list.get(obj_idx) {
+            Some(s) => s,
+            None => return,
+        };
+        let mut bag = PropertyBag::from_gff_struct(obj_struct);
+        bag.properties.retain(|p| p.label != "ItemList");
+        let item_bags: Vec<Box<PropertyBag>> = items.iter().map(|i| Box::new(i.clone())).collect();
+        bag.properties.push(nwn_gamemodel::Property {
+            label: "ItemList".into(),
+            value: nwn_gamemodel::PropertyValue::List(item_bags),
+            field_type: 15,
+            category: String::new(),
+            description: String::new(),
+        });
+        bag
+    };
+    let new_struct = bag.to_gff_struct(struct_id);
+    match gff.root_mut().find_mut(fv_list_name) {
+        Some(nwn_gff::FieldValue::List(list)) => {
+            if obj_idx < list.len() {
+                list[obj_idx] = new_struct;
+            }
+        }
+        _ => return,
+    }
+    module.raw_git.insert(git_key, gff.to_bytes());
+    module.modified = true;
+}
+
 impl AuroraBorealisApp {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
         let _ = cc; // adapter/surface created by wgpu render state
@@ -573,6 +663,7 @@ impl AuroraBorealisApp {
             local_var_editor: None,
             appearance_picker: None,
             object_comment_edit: None,
+            inventory_editor: None,
             placement_state: PlacementState::Inactive,
             manip_mode: ManipMode::None,
             manip_nudge_speed: 0.5,
@@ -1227,6 +1318,126 @@ impl eframe::App for AuroraBorealisApp {
                 });
             if close {
                 self.object_comment_edit = None;
+            }
+        }
+
+        // Inventory editor
+        if let Some(ref mut inv) = self.inventory_editor {
+            let mut close = false;
+            egui::Window::new(format!("Inventory - {} #{}", inv.obj_type, inv.obj_idx))
+                .default_size([500.0, 400.0])
+                .show(ctx, |ui| {
+                    if let Some(edit_idx) = inv.editing_item {
+                        if let Some(item) = inv.items.get_mut(edit_idx) {
+                            ui.heading(format!("Item #{}", edit_idx));
+                            ui.separator();
+                            let modified = show_bag_editor(ui, item);
+                            if modified {
+                                let resref = self.current_area.as_ref().map(|a| a.resref.clone()).unwrap_or_default();
+                                save_item_list(self.module.as_mut(), &resref, &inv.obj_type, inv.obj_idx, &inv.items);
+                            }
+                            if ui.button("← Back to List").clicked() {
+                                inv.editing_item = None;
+                            }
+                        } else {
+                            inv.editing_item = None;
+                        }
+                    } else {
+                        ui.horizontal(|ui| {
+                            ui.heading("Items");
+                            if ui.button("+ Add from Blueprint").clicked() {
+                                let mut results = Vec::new();
+                                if let Some(ref module) = self.module {
+                                    if let Some(ref erf) = module.erf {
+                                        for r in erf.resources() {
+                                            if r.restype == nwn_gamemodel::resource_types::UTI {
+                                                results.push((r.resref.clone(), r.restype));
+                                            }
+                                        }
+                                    }
+                                }
+                                inv.add_blueprint_filter = String::new();
+                                inv.add_blueprint_results = results;
+                            }
+                        });
+                        ui.separator();
+                        egui::ScrollArea::vertical().show(ui, |ui| {
+                            let mut remove_idx: Option<usize> = None;
+                            for (i, item) in inv.items.iter().enumerate() {
+                                let res = item.properties.iter().find(|p| p.label == "InventoryRes")
+                                    .map(|p| match &p.value { nwn_gamemodel::PropertyValue::ResRef(s) => s.clone(), nwn_gamemodel::PropertyValue::CExoString(s) => s.clone(), _ => format!("{:?}", p.value) })
+                                    .unwrap_or_else(|| format!("Item #{}", i));
+                                let extra = item.properties.iter().find(|p| p.label == "StackSize")
+                                    .and_then(|p| match &p.value { nwn_gamemodel::PropertyValue::Int(v) => Some(*v), _ => None })
+                                    .map(|s| format!(" (x{})", s))
+                                    .unwrap_or_default();
+                                ui.horizontal(|ui| {
+                                    if ui.button("✏").clicked() {
+                                        inv.editing_item = Some(i);
+                                    }
+                                    ui.label(format!("{}{}", res, extra));
+                                    if ui.button("🗑").clicked() {
+                                        remove_idx = Some(i);
+                                    }
+                                });
+                            }
+                            if let Some(idx) = remove_idx {
+                                inv.items.remove(idx);
+                                let resref = self.current_area.as_ref().map(|a| a.resref.clone()).unwrap_or_default();
+                                save_item_list(self.module.as_mut(), &resref, &inv.obj_type, inv.obj_idx, &inv.items);
+                            }
+                        });
+                        if !inv.add_blueprint_filter.is_empty() || !inv.add_blueprint_results.is_empty() {
+                            ui.separator();
+                            ui.label("Search blueprints:");
+                            ui.text_edit_singleline(&mut inv.add_blueprint_filter);
+                            let mut selected: Option<String> = None;
+                            egui::ScrollArea::vertical().max_height(200.0).show(ui, |ui| {
+                                let filter = inv.add_blueprint_filter.clone();
+                                for (name, _rt) in &inv.add_blueprint_results {
+                                    if !filter.is_empty() && !name.to_lowercase().contains(&filter.to_lowercase()) {
+                                        continue;
+                                    }
+                                    if ui.selectable_label(false, name).clicked() {
+                                        selected = Some(name.clone());
+                                    }
+                                }
+                            });
+                            if let Some(ref blueprint_name) = selected {
+                                let mut item = PropertyBag::new();
+                                item.properties.push(nwn_gamemodel::Property {
+                                    label: "InventoryRes".into(),
+                                    value: nwn_gamemodel::PropertyValue::ResRef(blueprint_name.clone()),
+                                    field_type: 11,
+                                    category: String::new(),
+                                    description: String::new(),
+                                });
+                                item.properties.push(nwn_gamemodel::Property {
+                                    label: "StackSize".into(),
+                                    value: nwn_gamemodel::PropertyValue::Int(1),
+                                    field_type: 5,
+                                    category: String::new(),
+                                    description: String::new(),
+                                });
+                                inv.items.push(item);
+                                let resref = self.current_area.as_ref().map(|a| a.resref.clone()).unwrap_or_default();
+                                save_item_list(self.module.as_mut(), &resref, &inv.obj_type, inv.obj_idx, &inv.items);
+                                inv.add_blueprint_results.clear();
+                                inv.add_blueprint_filter.clear();
+                            }
+                            if ui.button("Close Blueprint Picker").clicked() {
+                                inv.add_blueprint_results.clear();
+                                inv.add_blueprint_filter.clear();
+                            }
+                        }
+                        ui.separator();
+                        if ui.button("Close Inventory").clicked() {
+                            close = true;
+                        }
+                    }
+                });
+            if close {
+                self.inventory_editor = None;
             }
         }
 
@@ -2718,6 +2929,20 @@ impl eframe::App for AuroraBorealisApp {
                                 let resref = self.current_area.as_ref().map(|a| a.resref.clone()).unwrap_or_default();
                                 let comment = self.module.as_ref().map(|m| load_object_comment(m, &resref, obj_type, obj_idx)).unwrap_or_default();
                                 self.object_comment_edit = Some((obj_type.clone(), obj_idx, comment));
+                            }
+                            if obj_type == "creature" || obj_type == "placeable" {
+                                if ui.button("📦 Inventory").clicked() {
+                                    let resref = self.current_area.as_ref().map(|a| a.resref.clone()).unwrap_or_default();
+                                    let items = load_item_list(self.module.as_ref(), &resref, obj_type, obj_idx);
+                                    self.inventory_editor = Some(InventoryEditorState {
+                                        obj_type: obj_type.clone(),
+                                        obj_idx,
+                                        items,
+                                        editing_item: None,
+                                        add_blueprint_filter: String::new(),
+                                        add_blueprint_results: Vec::new(),
+                                    });
+                                }
                             }
                         }
                         ui.separator();
