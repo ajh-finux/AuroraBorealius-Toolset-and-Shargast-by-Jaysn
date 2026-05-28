@@ -830,10 +830,45 @@ pub fn parse_2da_value(text: &str, row: i32, column_label: &str) -> Option<Strin
     None
 }
 
+/// Parse all rows from a 2DA text and collect values from a given column.
+/// Deduplicates by row number to prefer earlier rows (from higher-priority haks).
+fn parse_2da_all_rows(text: &str, column_label: &str, results: &mut Vec<(String, String)>, seen: &mut std::collections::HashSet<String>) {
+    let mut lines = text.lines();
+    let _header = lines.next();
+    let mut headers: Vec<&str> = Vec::new();
+    let mut first_meta = None;
+    for line in &mut lines {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') { continue; }
+        headers = trimmed.split(|c| c == '\t' || c == ' ').filter(|s| !s.is_empty()).collect();
+        first_meta = Some(trimmed);
+        break;
+    }
+    let col_idx = match headers.iter().position(|h| h.eq_ignore_ascii_case(column_label)) {
+        Some(i) => i,
+        None => return,
+    };
+    let is_data_line = first_meta.map_or(false, |l| l.starts_with(|c: char| c.is_ascii_digit()));
+
+    for line in lines {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') { continue; }
+        let parts: Vec<&str> = trimmed.split(|c| c == '\t' || c == ' ').filter(|s| !s.is_empty()).collect();
+        if parts.is_empty() { continue; }
+        let row_label = parts[0];
+        // Skip duplicate row numbers (first one wins = highest priority)
+        if !seen.insert(row_label.to_string()) { continue; }
+        let idx = if is_data_line { col_idx } else { col_idx + 1 };
+        if let Some(val) = parts.get(idx).filter(|s| !s.is_empty() && **s != "****") {
+            results.push((row_label.to_string(), val.to_string()));
+        }
+    }
+}
+
 /// Lightweight hak resource index — reads only ERF header + key list (not full file data).
 pub struct HakIndex {
-    /// Maps resource key (resref_lower, restype) → hak_name
-    lookup: HashMap<(String, u16), String>,
+    /// Maps resource key (resref_lower, restype) → ordered list of hak names (first = highest priority)
+    lookup: HashMap<(String, u16), Vec<String>>,
     /// Known search paths for finding hak files
     paths: Vec<std::path::PathBuf>,
 }
@@ -862,8 +897,8 @@ impl HakIndex {
                     break;
                 }
             }
-            // Fall back to home dir (don't overwrite mod dir entries)
-            if !lookup.iter().any(|((_, _), v)| v == hak_name) {
+            // Fall back to home dir
+            if !lookup.iter().any(|((_, _), v)| v.iter().any(|n| n == hak_name)) {
                 if let Some(ref base) = paths.last() {
                     let home_path = base.join(format!("{}.hak", hak_name));
                     Self::index_hak(&home_path, hak_name, &mut lookup);
@@ -874,7 +909,7 @@ impl HakIndex {
     }
 
     /// Read only the header + key list of a hak file to build the resource index.
-    fn index_hak(path: &Path, hak_name: &str, lookup: &mut HashMap<(String, u16), String>) -> bool {
+    fn index_hak(path: &Path, hak_name: &str, lookup: &mut HashMap<(String, u16), Vec<String>>) -> bool {
         let Ok(mut file) = std::fs::File::open(path) else { return false };
         let Ok(len) = file.metadata().map(|m| m.len()) else { return false };
         if len < 160 { return false; }
@@ -925,33 +960,18 @@ impl HakIndex {
             // Resource type is at offset 16+4=20 for V1.0 or 32+4=36 for V1.1
             let restype_off = off + name_len + 4;
             let restype = u16::from_le_bytes(key_buf[restype_off..restype_off+2].try_into().unwrap());
-            lookup.entry((name, restype)).or_insert_with(|| hak_name.to_string());
+            lookup.entry((name, restype)).or_insert_with(Vec::new).push(hak_name.to_string());
         }
         true
     }
 
-    /// Returns the hak name that contains the given resource, if any.
-    pub fn find_hak(&self, resref: &str, restype: u16) -> Option<&str> {
-        self.lookup.get(&(resref.to_lowercase(), restype)).map(|s| s.as_str())
+    /// Returns all hak names that contain the given resource, in priority order.
+    pub fn find_haks(&self, resref: &str, restype: u16) -> Option<&[String]> {
+        self.lookup.get(&(resref.to_lowercase(), restype)).map(|v| v.as_slice())
     }
 
-    /// Get a resource from the known hak paths. Only opens the hak containing the resource.
-    pub fn get_resource(&self, resref: &str, restype: u16) -> Option<Vec<u8>> {
-        let hak_name = self.find_hak(resref, restype)?;
-        // Try module dir and hak dir
-        for base in &self.paths {
-            let p = base.join(format!("{}.hak", hak_name));
-            if let Ok(erf) = ErfFile::open(&p) {
-                if let Some(data) = erf.get(resref, restype) {
-                    return Some(data);
-                }
-            }
-        }
-        None
-    }
-
-    pub fn get_resource_from_path(&self, resref: &str, restype: u16, mod_dir: &Path) -> Option<Vec<u8>> {
-        let hak_name = self.find_hak(resref, restype)?;
+    /// Try to load a resource from a specific hak file, searching all known paths.
+    pub fn load_from_hak(&self, hak_name: &str, resref: &str, restype: u16, mod_dir: &Path) -> Option<Vec<u8>> {
         let paths = [
             mod_dir.join(format!("{}.hak", hak_name)),
             mod_dir.join("hak").join(format!("{}.hak", hak_name)),
@@ -963,12 +983,76 @@ impl HakIndex {
                 }
             }
         }
-        // Also try home dir
         for base in &self.paths {
             let p = base.join(format!("{}.hak", hak_name));
             if let Ok(erf) = ErfFile::open(&p) {
                 if let Some(data) = erf.get(resref, restype) {
                     return Some(data);
+                }
+            }
+        }
+        None
+    }
+
+    /// Get a resource from the known hak paths. Tries all haks with the resource (highest priority first).
+    pub fn get_resource(&self, resref: &str, restype: u16, mod_dir: &Path) -> Option<Vec<u8>> {
+        let hak_names = self.find_haks(resref, restype)?;
+        for hak_name in hak_names {
+            if let Some(data) = self.load_from_hak(hak_name, resref, restype, mod_dir) {
+                return Some(data);
+            }
+        }
+        None
+    }
+
+    pub fn get_resource_from_path(&self, resref: &str, restype: u16, mod_dir: &Path) -> Option<Vec<u8>> {
+        self.get_resource(resref, restype, mod_dir)
+    }
+
+    /// Search all haks for a 2DA value. Tries each hak's 2DA data in priority order,
+    /// returning the first match. Useful when multiple haks have the same 2DA with different rows.
+    pub fn parse_2da_across_haks(&self, two_da_name: &str, row: i32, column: &str, mod_dir: &Path) -> Option<String> {
+        let hak_names = self.find_haks(two_da_name, 2017)?;
+        for hak_name in hak_names {
+            if let Some(data) = self.load_from_hak(hak_name, two_da_name, 2017, mod_dir) {
+                if let Ok(text) = std::str::from_utf8(&data) {
+                    if let Some(val) = parse_2da_value(text, row, column) {
+                        return Some(val);
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Parse a column from a 2DA across all haks, returning all (row_label, column_value) pairs.
+    /// Merges data from all haks (later haks don't overwrite earlier).
+    pub fn list_2da_column(&self, two_da_name: &str, column: &str, mod_dir: &Path) -> Vec<(String, String)> {
+        let mut results = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        let hak_names = match self.find_haks(two_da_name, 2017) {
+            Some(n) => n,
+            None => return results,
+        };
+        for hak_name in hak_names {
+            if let Some(data) = self.load_from_hak(hak_name, two_da_name, 2017, mod_dir) {
+                if let Ok(text) = std::str::from_utf8(&data) {
+                    parse_2da_all_rows(text, column, &mut results, &mut seen);
+                }
+            }
+        }
+        results
+    }
+
+    /// Search all haks for a creature model name via the complex multi-column lookup.
+    pub fn find_creature_across_haks(&self, row: i32, mod_dir: &Path) -> Option<String> {
+        let hak_names = self.find_haks("appearance", 2017)?;
+        for hak_name in hak_names {
+            if let Some(data) = self.load_from_hak(hak_name, "appearance", 2017, mod_dir) {
+                if let Ok(text) = std::str::from_utf8(&data) {
+                    if let Some(name) = lookup_creature_model_from_text(text, row) {
+                        return Some(name);
+                    }
                 }
             }
         }

@@ -32,6 +32,7 @@ pub struct Module {
     pub erf: Option<nwn_erf::ErfFile>,
     pub resource_manager: ResourceManager,
     pub modified: bool,
+    pub hak_index: std::sync::OnceLock<nwn_tileset::HakIndex>,
 }
 
 struct AreaCache {
@@ -121,6 +122,7 @@ impl Module {
             erf: None,
             resource_manager: crate::ResourceManager::new(),
             modified: false,
+            hak_index: std::sync::OnceLock::new(),
         }
     }
 
@@ -269,6 +271,7 @@ impl Module {
             erf: Some(erf),
             resource_manager,
             modified: false,
+            hak_index: std::sync::OnceLock::new(),
         })
     }
 
@@ -423,11 +426,7 @@ impl Module {
             p.model_name = if p.appearance >= 0 {
                 let mut name = nwn_tileset::lookup_placeable_model(p.appearance, &[erf]);
                 if name.is_none() {
-                    if let Some(data) = hak_index.get_resource_from_path("placeables", 2017, mod_dir_path) {
-                        if let Ok(text) = std::str::from_utf8(&data) {
-                            name = nwn_tileset::parse_2da_value(text, p.appearance, "ModelName");
-                        }
-                    }
+                    name = hak_index.parse_2da_across_haks("placeables", p.appearance, "ModelName", mod_dir_path);
                 }
                 name
             } else { None };
@@ -466,17 +465,9 @@ impl Module {
             d.model_name = nwn_tileset::lookup_door_model(d.appearance, generic_type, &[erf]);
             if d.model_name.is_none() {
                 if d.appearance > 0 {
-                    if let Some(data) = hak_index.get_resource_from_path("doortypes", 2017, mod_dir_path) {
-                        if let Ok(text) = std::str::from_utf8(&data) {
-                            d.model_name = nwn_tileset::parse_2da_value(text, d.appearance, "ModelName");
-                        }
-                    }
+                    d.model_name = hak_index.parse_2da_across_haks("doortypes", d.appearance, "ModelName", mod_dir_path);
                 } else if d.appearance == 0 {
-                    if let Some(data) = hak_index.get_resource_from_path("genericdoors", 2017, mod_dir_path) {
-                        if let Ok(text) = std::str::from_utf8(&data) {
-                            d.model_name = nwn_tileset::parse_2da_value(text, generic_type.unwrap_or(0), "ModelName");
-                        }
-                    }
+                    d.model_name = hak_index.parse_2da_across_haks("genericdoors", generic_type.unwrap_or(0), "ModelName", mod_dir_path);
                 }
             }
             // Final fallback: .utd template ModelName
@@ -519,10 +510,10 @@ impl Module {
                 c.model_name = if creature_appearance >= 0 {
                     let mut name = nwn_tileset::lookup_creature_model(creature_appearance, &[erf]);
                     if name.is_none() {
-                        if let Some(data) = hak_index.get_resource_from_path("appearance", 2017, mod_dir_path) {
-                            if let Ok(text) = std::str::from_utf8(&data) {
-                                name = nwn_tileset::lookup_creature_model_from_text(text, creature_appearance);
-                            }
+                        // Try simple ModelName column first, fall back to complex multi-column lookup
+                        name = hak_index.parse_2da_across_haks("appearance", creature_appearance, "ModelName", mod_dir_path);
+                        if name.is_none() {
+                            name = hak_index.find_creature_across_haks(creature_appearance, mod_dir_path);
                         }
                     }
                     name
@@ -540,18 +531,17 @@ impl Module {
                 name, area.placeables.len(), p_count, area.doors.len(), d_count, area.creatures.len(), c_count
             );
             // Check if HakIndex found the key 2DAs
-            let hak_has_placeables = hak_index.find_hak("placeables", 2017).is_some();
-            let hak_has_doortypes = hak_index.find_hak("doortypes", 2017).is_some();
-            let hak_has_genericdoors = hak_index.find_hak("genericdoors", 2017).is_some();
-            let hak_has_appearance = hak_index.find_hak("appearance", 2017).is_some();
+            let hak_has_placeables = hak_index.find_haks("placeables", 2017).is_some();
+            let hak_has_doortypes = hak_index.find_haks("doortypes", 2017).is_some();
+            let hak_has_genericdoors = hak_index.find_haks("genericdoors", 2017).is_some();
+            let hak_has_appearance = hak_index.find_haks("appearance", 2017).is_some();
             eprintln!("  DEBUG HakIndex: placeables={} doortypes={} genericdoors={} appearance={}",
                 hak_has_placeables, hak_has_doortypes, hak_has_genericdoors, hak_has_appearance);
-            // Try all caps too
             eprintln!("  DEBUG HakIndex allcaps: placeables={} doortypes={} genericdoors={} appearance={}",
-                hak_index.find_hak("PLACEABLES", 2017).is_some(),
-                hak_index.find_hak("DOORTYPES", 2017).is_some(),
-                hak_index.find_hak("GENERICDOORS", 2017).is_some(),
-                hak_index.find_hak("APPEARANCE", 2017).is_some());
+                hak_index.find_haks("PLACEABLES", 2017).is_some(),
+                hak_index.find_haks("DOORTYPES", 2017).is_some(),
+                hak_index.find_haks("GENERICDOORS", 2017).is_some(),
+                hak_index.find_haks("APPEARANCE", 2017).is_some());
             // Also check if module ERF has them
             let erf_has_placeables = erf.get("placeables", 2017).is_some();
             let erf_has_doortypes = erf.get("doortypes", 2017).is_some();
@@ -835,6 +825,20 @@ impl Module {
                     .or_else(|| erf_fallback(&name))
             }
         }
+    }
+
+    /// Get or create the hak index (lazily initialized).
+    pub fn get_hak_index(&self) -> &nwn_tileset::HakIndex {
+        self.hak_index.get_or_init(|| {
+            let mod_dir = self.path.parent().unwrap_or(Path::new("."));
+            nwn_tileset::HakIndex::new(mod_dir, &self.haks)
+        })
+    }
+
+    /// List available blueprint resrefs for a given 2DA table (e.g. "placeables", "creatures").
+    pub fn blueprint_resrefs(&self, two_da_name: &str) -> Vec<(String, String)> {
+        let mod_dir = self.path.parent().unwrap_or(Path::new("."));
+        self.get_hak_index().list_2da_column(two_da_name, "Label", mod_dir)
     }
 
     pub fn save(&mut self) -> Result<()> {

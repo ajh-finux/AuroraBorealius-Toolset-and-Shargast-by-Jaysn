@@ -10,6 +10,15 @@ use nwn_tlk::TlkFile;
 use nwn_3d::{ObjectType, VisibilityFilter};
 use nwn_gamemodel::PropertyBag;
 use crate::inspector::{SelectedObject, show_inspector, show_bag_editor};
+
+fn module_resref_names(module: &nwn_gamemodel::Module) -> Vec<String> {
+    let mut names: Vec<String> = module.resource_list().iter()
+        .map(|(r, _)| r.clone())
+        .collect();
+    names.sort();
+    names.dedup();
+    names
+}
 use nwn_gamemodel::resource_types;
 use nwn_gamemodel::resource_types::type_to_ext;
 use crate::script_editor::show_script_editor;
@@ -239,6 +248,8 @@ struct AuroraBorealisApp {
     new_area_tileset: String,
     new_area_width: i32,
     new_area_height: i32,
+    new_area_resref_filter: String,
+    new_area_tileset_filter: String,
     show_tiles: bool,
     show_grid: bool,
     lighting_enabled: bool,
@@ -250,6 +261,8 @@ struct AuroraBorealisApp {
     new_object_type: String,
     new_object_resref: String,
     new_object_tag: String,
+    new_object_filter: String,
+    new_object_blueprints: Vec<(String, String)>,
     new_object_x: f32,
     new_object_y: f32,
     new_object_z: f32,
@@ -836,6 +849,8 @@ impl AuroraBorealisApp {
             new_area_tileset: String::new(),
             new_area_width: 16,
             new_area_height: 16,
+            new_area_resref_filter: String::new(),
+            new_area_tileset_filter: String::new(),
             show_tiles: true,
             selected_tile: None,
             tile_palette_open: false,
@@ -846,6 +861,8 @@ impl AuroraBorealisApp {
             new_object_type: "creature".to_string(),
             new_object_resref: String::new(),
             new_object_tag: String::new(),
+            new_object_filter: String::new(),
+            new_object_blueprints: Vec::new(),
             new_object_x: 0.0,
             new_object_y: 0.0,
             new_object_z: 0.0,
@@ -1515,7 +1532,8 @@ impl eframe::App for AuroraBorealisApp {
                         if let Some(item) = inv.items.get_mut(edit_idx) {
                             ui.heading(format!("Item #{}", edit_idx));
                             ui.separator();
-                            let modified = show_bag_editor(ui, item);
+                            let resrefs = self.module.as_ref().map(module_resref_names).unwrap_or_default();
+                            let modified = show_bag_editor(ui, item, &resrefs);
                             if modified {
                                 let resref = self.current_area.as_ref().map(|a| a.resref.clone()).unwrap_or_default();
                                 save_item_list(self.module.as_mut(), &resref, &inv.obj_type, inv.obj_idx, &inv.items);
@@ -2866,7 +2884,8 @@ impl eframe::App for AuroraBorealisApp {
                 .show(ctx, |ui| {
                     ui.label(format!("ResRef: {}  Type: {}", resref_clone, ext));
                     ui.separator();
-                    show_bag_editor(ui, bag);
+                    let resrefs = self.module.as_ref().map(module_resref_names).unwrap_or_default();
+                    show_bag_editor(ui, bag, &resrefs);
                     ui.separator();
                     if ui.button("Save to Module").clicked() {
                         if let Some(ref mut module) = self.module {
@@ -3749,17 +3768,53 @@ impl eframe::App for AuroraBorealisApp {
         // ===================== NEW AREA DIALOG =====================
         if self.new_area_open {
             let mut new_area_open = true;
+            // Collect existing area names and tilesets
+            let area_names: Vec<String> = self.module.as_ref().map(|m| m.area_names().to_vec()).unwrap_or_default();
+            let mut tilesets: Vec<String> = Vec::new();
+            if let Some(ref module) = self.module {
+                let mut seen = std::collections::HashSet::new();
+                for an in &area_names {
+                    if let Some(area) = module.get_area(an) {
+                        if seen.insert(area.tileset.clone()) {
+                            tilesets.push(area.tileset.clone());
+                        }
+                    }
+                }
+                tilesets.sort();
+            }
             egui::Window::new("New Area")
-                .default_size([350.0, 250.0])
+                .default_size([400.0, 350.0])
                 .open(&mut new_area_open)
                 .show(ctx, |ui| {
                     ui.horizontal(|ui| {
                         ui.label("Resref:");
-                        ui.text_edit_singleline(&mut self.new_area_resref);
+                        ui.text_edit_singleline(&mut self.new_area_resref_filter);
+                        egui::ScrollArea::vertical().max_height(100.0).show(ui, |ui| {
+                            let filter = self.new_area_resref_filter.to_lowercase();
+                            for name in &area_names {
+                                if !filter.is_empty() && !name.to_lowercase().contains(&filter) {
+                                    continue;
+                                }
+                                if ui.selectable_label(self.new_area_resref == *name, name).clicked() {
+                                    self.new_area_resref = name.clone();
+                                }
+                            }
+                        });
                     });
                     ui.horizontal(|ui| {
                         ui.label("Tileset:");
-                        ui.text_edit_singleline(&mut self.new_area_tileset);
+                        ui.text_edit_singleline(&mut self.new_area_tileset_filter);
+                        egui::ScrollArea::vertical().max_height(100.0).show(ui, |ui| {
+                            let filter = self.new_area_tileset_filter.to_lowercase();
+                            for name in &tilesets {
+                                if !filter.is_empty() && !name.to_lowercase().contains(&filter) {
+                                    continue;
+                                }
+                                if ui.selectable_label(self.new_area_tileset == *name, name).clicked() {
+                                    self.new_area_tileset = name.clone();
+                                }
+                            }
+                        });
                     });
                     ui.horizontal(|ui| {
                         ui.label("Width:");
@@ -3888,10 +3943,27 @@ impl eframe::App for AuroraBorealisApp {
         if self.new_object_open {
             let mut still_open = true;
             let mut created = false;
+            // Map object type to 2DA table name for blueprint listing
+            let two_da_name: &str = match self.new_object_type.as_str() {
+                "creature" => "creatures",
+                "door" => "doortypes",
+                "placeable" => "placeables",
+                "trigger" => "triggers",
+                "waypoint" => "waypoints",
+                "encounter" => "encounters",
+                _ => "",
+            };
+            // Refresh blueprint list when type changes
+            if self.new_object_blueprints.is_empty() && !two_da_name.is_empty() {
+                if let Some(ref module) = self.module {
+                    self.new_object_blueprints = module.blueprint_resrefs(two_da_name);
+                }
+            }
             egui::Window::new("New Object")
-                .default_size([350.0, 300.0])
+                .default_size([400.0, 400.0])
                 .open(&mut still_open)
                 .show(ctx, |ui| {
+                    let prev_type = self.new_object_type.clone();
                     ui.horizontal(|ui| {
                         ui.label("Type:");
                         egui::ComboBox::from_id_salt("new_obj_type")
@@ -3902,9 +3974,35 @@ impl eframe::App for AuroraBorealisApp {
                                 }
                             });
                     });
+                    // Refresh blueprint list when type changes
+                    if self.new_object_type != prev_type {
+                        self.new_object_blueprints.clear();
+                        self.new_object_filter.clear();
+                        if !two_da_name.is_empty() {
+                            if let Some(ref module) = self.module {
+                                self.new_object_blueprints = module.blueprint_resrefs(two_da_name);
+                            }
+                        }
+                    }
                     ui.horizontal(|ui| {
                         ui.label("ResRef:");
-                        ui.text_edit_singleline(&mut self.new_object_resref);
+                        if !two_da_name.is_empty() && !self.new_object_blueprints.is_empty() {
+                            ui.text_edit_singleline(&mut self.new_object_filter);
+                            egui::ScrollArea::vertical().max_height(150.0).show(ui, |ui| {
+                                let filter = self.new_object_filter.to_lowercase();
+                                for (row_label, name) in &self.new_object_blueprints {
+                                    if !filter.is_empty() && !row_label.to_lowercase().contains(&filter) && !name.to_lowercase().contains(&filter) {
+                                        continue;
+                                    }
+                                    let display = format!("{} ({})", name, row_label);
+                                    if ui.selectable_label(self.new_object_resref == *row_label, &display).clicked() {
+                                        self.new_object_resref = row_label.clone();
+                                    }
+                                }
+                            });
+                        } else {
+                            ui.text_edit_singleline(&mut self.new_object_resref);
+                        }
                     });
                     ui.horizontal(|ui| {
                         ui.label("Tag:");
@@ -4204,7 +4302,8 @@ impl eframe::App for AuroraBorealisApp {
                         }
                         ui.separator();
                     }
-                    inspector_modified = show_inspector(ui, obj);
+                    let resrefs = self.module.as_ref().map(module_resref_names).unwrap_or_default();
+                    inspector_modified = show_inspector(ui, obj, &resrefs);
                 } else if matches!(self.placement_state, PlacementState::Pending(..)) {
                     ui.colored_label(egui::Color32::YELLOW, "Placement mode active");
                     ui.label("Click in the viewport to place the object.");
