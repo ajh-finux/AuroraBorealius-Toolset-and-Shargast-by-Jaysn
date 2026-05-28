@@ -30,6 +30,7 @@ pub struct ViewportState {
     pub area_version: u64,
     pub markers: Vec<MarkerInfo>,
     pub tile_count: usize,
+    color_format: wgpu::TextureFormat,
     marker_idx_count: u32,
     pub draw_calls: usize,
     pub group_count: usize,
@@ -471,6 +472,7 @@ impl ViewportState {
             area_version,
             markers: markers_result.markers,
             tile_count,
+            color_format: config.format,
             marker_idx_count,
             draw_calls,
             group_count,
@@ -558,7 +560,7 @@ impl ViewportState {
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba8UnormSrgb,
+            format: self.color_format,
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
             view_formats: &[],
         };
@@ -599,31 +601,39 @@ impl ViewportState {
             self.blit_bind_group[i] = Some(bg);
         }
 
-        // Recreate the 3D pipeline with depth
+        // Recreate all pipelines with the offscreen color format
         self.pipeline = pipeline::create_pipeline_with_depth(
             device,
+            self.color_format,
             &self.uniform_bind_group_layout,
             &self.texture_bind_group_layout,
             Some(wgpu::TextureFormat::Depth32Float),
         );
         self.marker_pipeline = pipeline::create_marker_pipeline(
             device,
-            wgpu::TextureFormat::Rgba8UnormSrgb,
+            self.color_format,
             &self.uniform_bind_group_layout,
             &self.texture_bind_group_layout,
             Some(wgpu::TextureFormat::Depth32Float),
         );
         self.walkmesh_pipeline = pipeline::create_walkmesh_pipeline(
             device,
-            wgpu::TextureFormat::Rgba8UnormSrgb,
+            self.color_format,
             &self.uniform_bind_group_layout,
             &self.texture_bind_group_layout,
             Some(wgpu::TextureFormat::Depth32Float),
         );
         self.highlight_pipeline = pipeline::create_highlight_pipeline(
             device,
-            wgpu::TextureFormat::Rgba8UnormSrgb,
+            self.color_format,
             &self.uniform_bind_group_layout,
+        );
+        self.floor_pipeline = pipeline::create_floor_pipeline(
+            device,
+            self.color_format,
+            &self.uniform_bind_group_layout,
+            &self.texture_bind_group_layout,
+            Some(wgpu::TextureFormat::Depth32Float),
         );
     }
 

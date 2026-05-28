@@ -116,11 +116,12 @@ pub fn create_pipeline(
 
 pub fn create_pipeline_with_depth(
     device: &wgpu::Device,
+    color_format: wgpu::TextureFormat,
     uniform_bind_group_layout: &wgpu::BindGroupLayout,
     texture_bind_group_layout: &wgpu::BindGroupLayout,
     depth_format: Option<wgpu::TextureFormat>,
 ) -> wgpu::RenderPipeline {
-    _create_pipeline(device, wgpu::TextureFormat::Rgba8UnormSrgb, uniform_bind_group_layout, texture_bind_group_layout, depth_format)
+    _create_pipeline(device, color_format, uniform_bind_group_layout, texture_bind_group_layout, depth_format)
 }
 
 fn create_overlay_pipeline_impl(
