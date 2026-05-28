@@ -352,10 +352,18 @@ impl Module {
             return None;
         };
 
-        // Apply modified GIT data if available
-        let name_lower = name.to_lowercase();
-        if let Some(git_bytes) = self.raw_git.get(&name_lower) {
-            if let Ok(git_gff) = nwn_gff::GffFile::from_bytes(git_bytes) {
+        // Load GIT data (first check modified cache, then ERF)
+        let name_trim = name.trim();
+        let name_lower = name_trim.to_lowercase();
+        let git_bytes = self.raw_git.get(&name_lower).cloned()
+            .or_else(|| {
+                self.erf.as_ref().and_then(|erf| {
+                    erf.get(name_trim, resource_types::GIT)
+                        .or_else(|| erf.get(&name_trim.to_uppercase(), resource_types::GIT))
+                })
+            });
+        if let Some(ref data) = git_bytes {
+            if let Ok(git_gff) = nwn_gff::GffFile::from_bytes(data) {
                 reload_from_git(&mut area, &git_gff);
             }
         }
