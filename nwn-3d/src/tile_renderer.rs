@@ -358,7 +358,7 @@ pub fn build_object_markers(area: &Area, filter: VisibilityFilter) -> MarkersRes
         for (i, p) in area.placeables.iter().enumerate() {
             let oz = p.z + 0.3;
             markers.push(MarkerInfo { obj_type: ObjectType::Placeable, index: i, x: p.x, y: p.y, z: oz });
-            add_placeable_marker(&mut vertices, &mut indices, p.x, p.y, oz, [0.2, 0.4, 1.0, 1.0]);
+            add_placeable_marker(&mut vertices, &mut indices, p.x, p.y, oz, p.bearing, [0.2, 0.4, 1.0, 1.0]);
         }
     }
     if filter.show_triggers {
@@ -733,19 +733,12 @@ fn add_box_marker(vertices: &mut Vec<Vertex>, indices: &mut Vec<u32>,
 {
     if !cx.is_finite() || !cy.is_finite() || !cz.is_finite() { return; }
     let (rx, ry, rz) = transform(cx, cy, cz);
-    // 6 faces, each 4 verts, each face has its own normal
     let faces: [([f32; 3], [f32; 3], [f32; 3], [f32; 3], [f32; 3]); 6] = [
-        // front (+Z)
         ([-sx, -sy,  sz], [ sx, -sy,  sz], [ sx,  sy,  sz], [-sx,  sy,  sz], [ 0.0,  0.0,  1.0]),
-        // back (-Z)
         ([ sx, -sy, -sz], [-sx, -sy, -sz], [-sx,  sy, -sz], [ sx,  sy, -sz], [ 0.0,  0.0, -1.0]),
-        // right (+X)
         ([ sx, -sy,  sz], [ sx, -sy, -sz], [ sx,  sy, -sz], [ sx,  sy,  sz], [ 1.0,  0.0,  0.0]),
-        // left (-X)
         ([-sx, -sy, -sz], [-sx, -sy,  sz], [-sx,  sy,  sz], [-sx,  sy, -sz], [-1.0,  0.0,  0.0]),
-        // top (+Y)
         ([-sx,  sy,  sz], [ sx,  sy,  sz], [ sx,  sy, -sz], [-sx,  sy, -sz], [ 0.0,  1.0,  0.0]),
-        // bottom (-Y)
         ([-sx, -sy, -sz], [ sx, -sy, -sz], [ sx, -sy,  sz], [-sx, -sy,  sz], [ 0.0, -1.0,  0.0]),
     ];
     for (a, b, c, d, n) in &faces {
@@ -762,30 +755,70 @@ fn add_box_marker(vertices: &mut Vec<Vertex>, indices: &mut Vec<u32>,
     }
 }
 
+/// Rotated box around renderer Y (NWN Z) by bearing. Uses same face definitions
+/// as add_box_marker, but each corner + normal is rotated by bearing around Y axis.
+fn add_rotated_box(vertices: &mut Vec<Vertex>, indices: &mut Vec<u32>,
+    nwn_cx: f32, nwn_cy: f32, nwn_cz: f32,
+    sx: f32, sy: f32, sz: f32,
+    bearing: f32, color: [f32; 4])
+{
+    if !nwn_cx.is_finite() || !nwn_cy.is_finite() || !nwn_cz.is_finite() { return; }
+    let (rx, ry, rz) = nwn_to_renderer(nwn_cx, nwn_cy, nwn_cz);
+    let (sin_b, cos_b) = bearing.sin_cos();
+    let faces: [([f32; 3], [f32; 3], [f32; 3], [f32; 3], [f32; 3]); 6] = [
+        ([-sx, -sy,  sz], [ sx, -sy,  sz], [ sx,  sy,  sz], [-sx,  sy,  sz], [ 0.0,  0.0,  1.0]),
+        ([ sx, -sy, -sz], [-sx, -sy, -sz], [-sx,  sy, -sz], [ sx,  sy, -sz], [ 0.0,  0.0, -1.0]),
+        ([ sx, -sy,  sz], [ sx, -sy, -sz], [ sx,  sy, -sz], [ sx,  sy,  sz], [ 1.0,  0.0,  0.0]),
+        ([-sx, -sy, -sz], [-sx, -sy,  sz], [-sx,  sy,  sz], [-sx,  sy, -sz], [-1.0,  0.0,  0.0]),
+        ([-sx,  sy,  sz], [ sx,  sy,  sz], [ sx,  sy, -sz], [-sx,  sy, -sz], [ 0.0,  1.0,  0.0]),
+        ([-sx, -sy, -sz], [ sx, -sy, -sz], [ sx, -sy,  sz], [-sx, -sy,  sz], [ 0.0, -1.0,  0.0]),
+    ];
+    for (a, b, d0, d1, n) in &faces {
+        let vi = vertices.len() as u32;
+        for pt in [a, b, d0, d1] {
+            let lx = pt[0] * cos_b + pt[2] * sin_b;
+            let ly = pt[1];
+            let lz = -pt[0] * sin_b + pt[2] * cos_b;
+            vertices.push(Vertex {
+                position: [rx + lx, ry + ly, rz + lz],
+                normal: [n[0] * cos_b + n[2] * sin_b, n[1], -n[0] * sin_b + n[2] * cos_b],
+                uv: [0.0, 0.0],
+                color,
+            });
+        }
+        indices.extend_from_slice(&[vi, vi + 1, vi + 2, vi, vi + 2, vi + 3]);
+    }
+}
+
 fn nwn_to_renderer(x: f32, y: f32, z: f32) -> (f32, f32, f32) {
     (x, z, -y)
 }
 
 fn add_creature_marker(vertices: &mut Vec<Vertex>, indices: &mut Vec<u32>,
-    x: f32, y: f32, z: f32, _bearing: f32, color: [f32; 4])
+    x: f32, y: f32, z: f32, bearing: f32, color: [f32; 4])
 {
-    add_box_marker(vertices, indices, x, y, z, 0.35, 0.6, 0.3, color, nwn_to_renderer);
-    add_box_marker(vertices, indices, x, y, z + 0.45, 0.2, 0.2, 0.2, color, nwn_to_renderer);
-    add_box_marker(vertices, indices, x, y, z, 0.45, 0.06, 0.45, color, nwn_to_renderer);
+    add_rotated_box(vertices, indices, x, y, z, 0.35, 0.6, 0.3, bearing, color);
+    add_rotated_box(vertices, indices, x, y, z + 0.45, 0.2, 0.2, 0.2, bearing, color);
+    add_rotated_box(vertices, indices, x, y, z, 0.45, 0.06, 0.45, bearing, color);
 }
 
 fn add_door_marker(vertices: &mut Vec<Vertex>, indices: &mut Vec<u32>,
-    x: f32, y: f32, z: f32, _bearing: f32, color: [f32; 4])
+    x: f32, y: f32, z: f32, bearing: f32, color: [f32; 4])
 {
-    add_box_marker(vertices, indices, x, y, z, 0.4, 1.0, 0.08, color, nwn_to_renderer);
-    add_box_marker(vertices, indices, x - 0.45, y, z, 0.06, 1.1, 0.10, color, nwn_to_renderer);
-    add_box_marker(vertices, indices, x + 0.45, y, z, 0.06, 1.1, 0.10, color, nwn_to_renderer);
+    let (s, c) = bearing.sin_cos();
+    add_rotated_box(vertices, indices, x, y, z, 0.4, 1.0, 0.08, bearing, color);
+    let lx = x - 0.45 * c;
+    let ly = y - 0.45 * s;
+    add_rotated_box(vertices, indices, lx, ly, z, 0.06, 1.1, 0.10, bearing, color);
+    let rx = x + 0.45 * c;
+    let ry = y + 0.45 * s;
+    add_rotated_box(vertices, indices, rx, ry, z, 0.06, 1.1, 0.10, bearing, color);
 }
 
 fn add_placeable_marker(vertices: &mut Vec<Vertex>, indices: &mut Vec<u32>,
-    x: f32, y: f32, z: f32, color: [f32; 4])
+    x: f32, y: f32, z: f32, bearing: f32, color: [f32; 4])
 {
-    add_box_marker(vertices, indices, x, y, z, 0.35, 0.35, 0.35, color, nwn_to_renderer);
+    add_rotated_box(vertices, indices, x, y, z, 0.3, 0.35, 0.25, bearing, color);
 }
 
 fn add_trigger_marker(vertices: &mut Vec<Vertex>, indices: &mut Vec<u32>,

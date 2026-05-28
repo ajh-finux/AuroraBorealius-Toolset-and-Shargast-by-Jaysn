@@ -434,19 +434,31 @@ pub(crate) fn float_field(label: &str, value: f32) -> nwn_gff::Field {
 pub(crate) fn gff_float(s: &nwn_gff::Struct, primary: &str, fallback: &str) -> f32 {
     s.find(primary)
         .or_else(|| s.find(fallback))
-        .and_then(|v| if let nwn_gff::FieldValue::Float(f) = v { Some(*f) } else { None })
+        .and_then(|v| match v {
+            nwn_gff::FieldValue::Float(f) => Some(*f),
+            nwn_gff::FieldValue::Double(f) => Some(*f as f32),
+            _ => None,
+        })
         .unwrap_or(0.0)
 }
 
 fn gff_float_or(s: &nwn_gff::Struct, primary: &str) -> f32 {
     s.find(primary)
-        .and_then(|v| if let nwn_gff::FieldValue::Float(f) = v { Some(*f) } else { None })
+        .and_then(|v| match v {
+            nwn_gff::FieldValue::Float(f) => Some(*f),
+            nwn_gff::FieldValue::Double(f) => Some(*f as f32),
+            _ => None,
+        })
         .unwrap_or(0.0)
 }
 
 pub(crate) fn gff_bearing(s: &nwn_gff::Struct) -> f32 {
     s.find("Bearing")
-        .and_then(|v| if let nwn_gff::FieldValue::Float(f) = v { Some(*f) } else { None })
+        .and_then(|v| match v {
+            nwn_gff::FieldValue::Float(f) => Some(*f),
+            nwn_gff::FieldValue::Double(f) => Some(*f as f32),
+            _ => None,
+        })
         .unwrap_or_else(|| {
             let ox = gff_float_or(s, "XOrientation");
             let oy = gff_float_or(s, "YOrientation");
@@ -534,9 +546,9 @@ impl DoorInstance {
             fields: vec![
                 resref_field("TemplateResRef", &self.resref),
                 string_field("Tag", &self.tag),
-                float_field("X", self.x),
-                float_field("Y", self.y),
-                float_field("Z", self.z),
+                float_field("XPosition", self.x),
+                float_field("YPosition", self.y),
+                float_field("ZPosition", self.z),
                 float_field("Bearing", self.bearing),
             ],
         }
@@ -547,9 +559,9 @@ impl DoorInstance {
             properties: vec![
                 Property { label: "TemplateResRef".into(), value: PropertyValue::ResRef(self.resref.clone()), field_type: 11, category: String::new(), description: String::new() },
                 Property { label: "Tag".into(), value: PropertyValue::CExoString(self.tag.clone()), field_type: 10, category: String::new(), description: String::new() },
-                Property { label: "X".into(), value: PropertyValue::Float(self.x), field_type: 8, category: String::new(), description: String::new() },
-                Property { label: "Y".into(), value: PropertyValue::Float(self.y), field_type: 8, category: String::new(), description: String::new() },
-                Property { label: "Z".into(), value: PropertyValue::Float(self.z), field_type: 8, category: String::new(), description: String::new() },
+                Property { label: "XPosition".into(), value: PropertyValue::Float(self.x), field_type: 8, category: String::new(), description: String::new() },
+                Property { label: "YPosition".into(), value: PropertyValue::Float(self.y), field_type: 8, category: String::new(), description: String::new() },
+                Property { label: "ZPosition".into(), value: PropertyValue::Float(self.z), field_type: 8, category: String::new(), description: String::new() },
                 Property { label: "Bearing".into(), value: PropertyValue::Float(self.bearing), field_type: 8, category: String::new(), description: String::new() },
             ],
         }
@@ -559,9 +571,9 @@ impl DoorInstance {
         Self {
             resref: bag.get_string("TemplateResRef").unwrap_or("").to_string(),
             tag: bag.get_string("Tag").unwrap_or("").to_string(),
-            x: bag.get_float("X").unwrap_or(0.0),
-            y: bag.get_float("Y").unwrap_or(0.0),
-            z: bag.get_float("Z").unwrap_or(0.0),
+            x: bag.get_float("XPosition").or_else(|| bag.get_float("X")).unwrap_or(0.0),
+            y: bag.get_float("YPosition").or_else(|| bag.get_float("Y")).unwrap_or(0.0),
+            z: bag.get_float("ZPosition").or_else(|| bag.get_float("Z")).unwrap_or(0.0),
             bearing: bag.get_float("Bearing").unwrap_or(0.0),
         }
     }
@@ -570,9 +582,9 @@ impl DoorInstance {
         Self {
             resref: gff_resref_from_struct(s),
             tag: s.find("Tag").and_then(|v| if let nwn_gff::FieldValue::String(s) = v { Some(s.clone()) } else { None }).unwrap_or_default(),
-            x: gff_float(s, "X", "XPosition"),
-            y: gff_float(s, "Y", "YPosition"),
-            z: gff_float(s, "Z", "ZPosition"),
+            x: gff_float(s, "XPosition", "X"),
+            y: gff_float(s, "YPosition", "Y"),
+            z: gff_float(s, "ZPosition", "Z"),
             bearing: gff_bearing(s),
         }
     }
@@ -595,9 +607,9 @@ impl PlaceableInstance {
             fields: vec![
                 resref_field("TemplateResRef", &self.resref),
                 string_field("Tag", &self.tag),
-                float_field("X", self.x),
-                float_field("Y", self.y),
-                float_field("Z", self.z),
+                float_field("XPosition", self.x),
+                float_field("YPosition", self.y),
+                float_field("ZPosition", self.z),
                 float_field("Bearing", self.bearing),
             ],
         }
@@ -608,9 +620,9 @@ impl PlaceableInstance {
             properties: vec![
                 Property { label: "TemplateResRef".into(), value: PropertyValue::ResRef(self.resref.clone()), field_type: 11, category: String::new(), description: String::new() },
                 Property { label: "Tag".into(), value: PropertyValue::CExoString(self.tag.clone()), field_type: 10, category: String::new(), description: String::new() },
-                Property { label: "X".into(), value: PropertyValue::Float(self.x), field_type: 8, category: String::new(), description: String::new() },
-                Property { label: "Y".into(), value: PropertyValue::Float(self.y), field_type: 8, category: String::new(), description: String::new() },
-                Property { label: "Z".into(), value: PropertyValue::Float(self.z), field_type: 8, category: String::new(), description: String::new() },
+                Property { label: "XPosition".into(), value: PropertyValue::Float(self.x), field_type: 8, category: String::new(), description: String::new() },
+                Property { label: "YPosition".into(), value: PropertyValue::Float(self.y), field_type: 8, category: String::new(), description: String::new() },
+                Property { label: "ZPosition".into(), value: PropertyValue::Float(self.z), field_type: 8, category: String::new(), description: String::new() },
                 Property { label: "Bearing".into(), value: PropertyValue::Float(self.bearing), field_type: 8, category: String::new(), description: String::new() },
             ],
         }
@@ -620,9 +632,9 @@ impl PlaceableInstance {
         Self {
             resref: bag.get_string("TemplateResRef").unwrap_or("").to_string(),
             tag: bag.get_string("Tag").unwrap_or("").to_string(),
-            x: bag.get_float("X").unwrap_or(0.0),
-            y: bag.get_float("Y").unwrap_or(0.0),
-            z: bag.get_float("Z").unwrap_or(0.0),
+            x: bag.get_float("XPosition").or_else(|| bag.get_float("X")).unwrap_or(0.0),
+            y: bag.get_float("YPosition").or_else(|| bag.get_float("Y")).unwrap_or(0.0),
+            z: bag.get_float("ZPosition").or_else(|| bag.get_float("Z")).unwrap_or(0.0),
             bearing: bag.get_float("Bearing").unwrap_or(0.0),
         }
     }
@@ -631,9 +643,9 @@ impl PlaceableInstance {
         Self {
             resref: gff_resref_from_struct(s),
             tag: s.find("Tag").and_then(|v| if let nwn_gff::FieldValue::String(s) = v { Some(s.clone()) } else { None }).unwrap_or_default(),
-            x: gff_float(s, "X", "XPosition"),
-            y: gff_float(s, "Y", "YPosition"),
-            z: gff_float(s, "Z", "ZPosition"),
+            x: gff_float(s, "XPosition", "X"),
+            y: gff_float(s, "YPosition", "Y"),
+            z: gff_float(s, "ZPosition", "Z"),
             bearing: gff_bearing(s),
         }
     }

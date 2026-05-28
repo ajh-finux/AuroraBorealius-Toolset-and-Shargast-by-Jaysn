@@ -134,6 +134,7 @@ impl PropertyBag {
             .find(|p| p.label == label)
             .and_then(|p| match &p.value {
                 PropertyValue::Float(f) => Some(*f),
+                PropertyValue::Double(f) => Some(*f as f32),
                 _ => None,
             })
     }

@@ -104,6 +104,19 @@ enum ManipMode {
     Rotate,
 }
 
+#[derive(Clone)]
+#[allow(dead_code)]
+struct DragState {
+    obj_type: String,
+    obj_idx: usize,
+    orig_x: f32,
+    orig_y: f32,
+    orig_z: f32,
+    orig_bearing: f32,
+    start_render_x: f32,
+    start_render_z: f32,
+}
+
 #[allow(dead_code)]
 fn nwn_modules_dir() -> String {
     if let Ok(home) = std::env::var("HOME") {
@@ -191,6 +204,7 @@ struct AuroraBorealisApp {
     inventory_editor: Option<InventoryEditorState>,
     placement_state: PlacementState,
     manip_mode: ManipMode,
+    drag_state: Option<DragState>,
     manip_nudge_speed: f32,
     ghost_screen_pos: Option<egui::Pos2>,
     faction_editor_open: bool,
@@ -786,6 +800,7 @@ impl AuroraBorealisApp {
             inventory_editor: None,
             placement_state: PlacementState::Inactive,
             manip_mode: ManipMode::None,
+            drag_state: None,
             manip_nudge_speed: 0.5,
             ghost_screen_pos: None,
             faction_editor_open: false,
@@ -3024,14 +3039,16 @@ impl eframe::App for AuroraBorealisApp {
                     self.ghost_screen_pos = None;
                 }
 
-                let (is_hovered, has_w, has_s, has_a, has_d, delta, secondary_down, middle_down, primary_clicked, click_pos, scroll) = ctx.input(|i| {
+                let (is_hovered, has_w, has_s, has_a, has_d, delta, secondary_down, middle_down, primary_clicked, primary_down, click_pos, scroll) = ctx.input(|i| {
                     let hovered = i.pointer.hover_pos().map_or(false, |p| rect.contains(p));
                     let w = i.keys_down.contains(&egui::Key::W);
                     let s = i.keys_down.contains(&egui::Key::S);
                     let a = i.keys_down.contains(&egui::Key::A);
                     let d = i.keys_down.contains(&egui::Key::D);
-                    (hovered, w, s, a, d, i.pointer.delta(), i.pointer.secondary_down(), i.pointer.middle_down(), i.pointer.primary_clicked(), i.pointer.interact_pos(), i.raw_scroll_delta)
+                    (hovered, w, s, a, d, i.pointer.delta(), i.pointer.secondary_down(), i.pointer.middle_down(), i.pointer.primary_clicked(), i.pointer.primary_down(), i.pointer.interact_pos(), i.raw_scroll_delta)
                 });
+                let vp_w = rect.width();
+                let vp_h = rect.height();
 
                 // Handle DnD drop from blueprint palette over viewport
                 if is_hovered {
@@ -3048,8 +3065,6 @@ impl eframe::App for AuroraBorealisApp {
                     if let Some(pos) = click_pos {
                         let vp_x = pos.x - rect.left();
                         let vp_y = pos.y - rect.top();
-                        let vp_w = rect.width();
-                        let vp_h = rect.height();
                         if let Some(world) = self.viewport.pick_ground(vp_x, vp_y, vp_w, vp_h) {
                             let wall_x = (world[0] / 10.0).round() as usize;
                             let _wall_z = (world[2] / 10.0).round() as usize;
@@ -3068,8 +3083,6 @@ impl eframe::App for AuroraBorealisApp {
                     if let Some(pos) = click_pos {
                         let vp_x = pos.x - rect.left();
                         let vp_y = pos.y - rect.top();
-                        let vp_w = rect.width();
-                        let vp_h = rect.height();
                         if let Some(world) = self.viewport.pick_ground(vp_x, vp_y, vp_w, vp_h) {
                             let center_col = (world[0] / 10.0).floor() as i32;
                             let center_row = (-world[2] / 10.0).floor() as i32;
@@ -3133,8 +3146,6 @@ impl eframe::App for AuroraBorealisApp {
                     if let Some(pos) = click_pos {
                         let vp_x = pos.x - rect.left();
                         let vp_y = pos.y - rect.top();
-                        let vp_w = rect.width();
-                        let vp_h = rect.height();
                         if let Some(world) = self.viewport.pick_ground(vp_x, vp_y, vp_w, vp_h) {
                             let tile_col = (world[0] / 10.0).floor() as usize;
                             let tile_row = (-world[2] / 10.0).floor() as usize;
@@ -3163,7 +3174,7 @@ impl eframe::App for AuroraBorealisApp {
                     }
                 }
 
-                if is_hovered {
+                if is_hovered && self.drag_state.is_none() {
                     let mut fwd = 0.0f32;
                     let mut rgt = 0.0f32;
                     if has_w { fwd += 1.0; }
@@ -3186,8 +3197,6 @@ impl eframe::App for AuroraBorealisApp {
                         if let Some(pos) = click_pos {
                             let vp_x = pos.x - rect.left();
                             let vp_y = pos.y - rect.top();
-                            let vp_w = rect.width();
-                            let vp_h = rect.height();
 
                             // Placement mode: place object at ground hit
                             let is_placement = matches!(self.placement_state, PlacementState::Pending(..));
@@ -3308,6 +3317,31 @@ impl eframe::App for AuroraBorealisApp {
                                             });
                                             self.selected_object = Some(SelectedObject { title, bag: full_bag.unwrap_or(bag) });
                                             self.selected_obj_info = Some(key);
+
+                                            // Start 3D drag-to-move
+                                            if !ctrl_held && !self.walkmesh_wall_mode && !self.terrain_smooth_mode && !self.terrain_edit_mode {
+                                                if let Some(world) = self.viewport.pick_ground(vp_x, vp_y, vp_w, vp_h) {
+                                                    let orig = match marker.obj_type {
+                                                        ObjectType::Creature => area.creatures.get(marker.index).map(|o| (o.x, o.y, o.z, o.bearing)),
+                                                        ObjectType::Door => area.doors.get(marker.index).map(|o| (o.x, o.y, o.z, o.bearing)),
+                                                        ObjectType::Placeable => area.placeables.get(marker.index).map(|o| (o.x, o.y, o.z, o.bearing)),
+                                                        ObjectType::Trigger => area.triggers.get(marker.index).map(|o| (o.x, o.y, o.z, o.bearing)),
+                                                        ObjectType::Waypoint => area.waypoints.get(marker.index).map(|o| (o.x, o.y, o.z, o.bearing)),
+                                                        ObjectType::Encounter => area.encounters.get(marker.index).map(|o| (o.x, o.y, o.z, o.bearing)),
+                                                        ObjectType::SoundEmitter => area.sound_emitters.get(marker.index).map(|o| (o.x, o.y, o.z, o.bearing)),
+                                                    };
+                                                    if let Some((ox, oy, oz, ob)) = orig {
+                                                        self.drag_state = Some(DragState {
+                                                            obj_type: obj_type_str.to_string(),
+                                                            obj_idx: marker.index,
+                                                            orig_x: ox, orig_y: oy, orig_z: oz, orig_bearing: ob,
+                                                            start_render_x: world[0],
+                                                            start_render_z: world[2],
+                                                        });
+                                                    }
+                                                }
+                                            }
+
                                             let total = self.selection_list.len();
                                             if total > 1 {
                                                 self.status = format!("Selected {} #{} (+{} more)", obj_type_str, marker.index, total - 1);
@@ -3330,6 +3364,59 @@ impl eframe::App for AuroraBorealisApp {
                                     }
                                 }
                             }
+                        }
+                    }
+                }
+
+                // ── 3D drag-to-move (live update while dragging, commit on release) ──
+                let drag_clone = self.drag_state.clone();
+                if let Some(ref drag) = drag_clone {
+                    if primary_down {
+                        if is_hovered {
+                            let cur_hover = ctx.input(|i| i.pointer.hover_pos());
+                            if let Some(pos) = cur_hover.filter(|p| rect.contains(*p)) {
+                                let vp_cx = pos.x - rect.left();
+                                let vp_cy = pos.y - rect.top();
+                                if let Some(world) = self.viewport.pick_ground(vp_cx, vp_cy, vp_w, vp_h) {
+                                    let dx = world[0] - drag.start_render_x;
+                                    let dz = world[2] - drag.start_render_z;
+                                    let new_x = drag.orig_x + dx;
+                                    let new_y = drag.orig_y - dz;
+                                    if let Some(area) = self.current_area.as_mut() {
+                                        let area = Arc::make_mut(area);
+                                        match drag.obj_type.as_str() {
+                                            "creature" => { if let Some(c) = area.creatures.get_mut(drag.obj_idx) { c.x = new_x; c.y = new_y; } }
+                                            "door" => { if let Some(d) = area.doors.get_mut(drag.obj_idx) { d.x = new_x; d.y = new_y; } }
+                                            "placeable" => { if let Some(p) = area.placeables.get_mut(drag.obj_idx) { p.x = new_x; p.y = new_y; } }
+                                            "trigger" => { if let Some(t) = area.triggers.get_mut(drag.obj_idx) { t.x = new_x; t.y = new_y; } }
+                                            "waypoint" => { if let Some(w) = area.waypoints.get_mut(drag.obj_idx) { w.x = new_x; w.y = new_y; } }
+                                            "encounter" => { if let Some(e) = area.encounters.get_mut(drag.obj_idx) { e.x = new_x; e.y = new_y; } }
+                                            "sound_emitter" => { if let Some(s) = area.sound_emitters.get_mut(drag.obj_idx) { s.x = new_x; s.y = new_y; } }
+                                            _ => {}
+                                        }
+                                        let area_clone = Arc::new(area.clone());
+                                        self.area_version = self.area_version.wrapping_add(1);
+                                        self.viewport.set_area(area_clone, self.area_version, target_format);
+                                    }
+                                }
+                            }
+                        }
+                    } else {
+                        // Primary released — commit drag
+                        self.drag_state = None;
+                        let area_exists = self.current_area.is_some();
+                        if area_exists {
+                            self.push_undo();
+                        }
+                        if let Some(area) = self.current_area.as_mut() {
+                            let area = Arc::make_mut(area);
+                            let resref = area.resref.clone();
+                            if let Some(ref mut module) = self.module {
+                                module.update_area_git(&resref, area);
+                            }
+                            self.area_version = self.area_version.wrapping_add(1);
+                            self.viewport.set_area(Arc::new(area.clone()), self.area_version, target_format);
+                            self.status = format!("Moved {} #{}", drag.obj_type, drag.obj_idx);
                         }
                     }
                 }

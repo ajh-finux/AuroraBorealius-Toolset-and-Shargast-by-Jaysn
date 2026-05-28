@@ -125,6 +125,7 @@ impl GffFile {
     pub fn get_float(&self, field: &str) -> Result<f32> {
         match self.inner.root.find(field) {
             Some(FieldValue::Float(f)) => Ok(*f),
+            Some(FieldValue::Double(f)) => Ok(*f as f32),
             Some(v) => Err(GffError::TypeMismatch {
                 field: field.to_string(),
                 expected: "float".into(),
