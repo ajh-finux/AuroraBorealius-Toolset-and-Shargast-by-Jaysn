@@ -1,4 +1,11 @@
 pub const VERTEX_SHADER: &str = r#"
+struct PointLight {
+    position_radius: vec4<f32>,
+    color_pad: vec4<f32>,
+}
+
+const MAX_LIGHTS: u32 = 32u;
+
 struct Uniforms {
     view_proj: mat4x4<f32>,
     ambient_color: vec4<f32>,
@@ -6,6 +13,7 @@ struct Uniforms {
     fog_params: vec4<f32>,
     camera_pos: vec4<f32>,
     diffuse_color: vec4<f32>,
+    lights: array<PointLight, 32>,
 }
 @group(0) @binding(0) var<uniform> uniforms: Uniforms;
 
@@ -57,7 +65,18 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
         let light_dir = normalize(vec3<f32>(0.5, 1.0, 0.3));
         let ambient = uniforms.ambient_color.xyz;
         let diffuse = max(dot(normalize(input.world_normal), light_dir), 0.0) * uniforms.diffuse_color.xyz;
-        let lighting = ambient + diffuse;
+        var lighting = ambient + diffuse;
+        let num_lights = min(u32(uniforms.fog_params.z), MAX_LIGHTS);
+        let world_norm = normalize(input.world_normal);
+        for (var i = 0u; i < num_lights; i++) {
+            let pl = uniforms.lights[i];
+            let to_light = pl.position_radius.xyz - input.world_pos;
+            let dist_sq = dot(to_light, to_light);
+            let radius = pl.position_radius.w;
+            let atten = radius / (radius + dist_sq);
+            let ndotl = max(dot(world_norm, normalize(to_light)), 0.0);
+            lighting += pl.color_pad.rgb * ndotl * atten;
+        }
         final_color = vec4<f32>(final_color.rgb * lighting, final_color.a);
     }
     let fog_amount = uniforms.fog_params.x;

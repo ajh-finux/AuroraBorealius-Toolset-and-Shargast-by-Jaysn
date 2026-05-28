@@ -1,4 +1,5 @@
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use egui_wgpu::{CallbackTrait, CallbackResources, ScreenDescriptor};
@@ -7,6 +8,22 @@ use wgpu::util::DeviceExt;
 
 use crate::camera::{OrbitCamera, mat4_mul};
 use crate::pipeline;
+
+/// Maximum number of point lights that can be uploaded to the GPU
+pub const MAX_POINT_LIGHTS: u32 = 32;
+
+/// GPU-uploadable point light data (2 × vec4<f32>, 32 bytes, matches WGSL PointLight)
+#[repr(C)]
+#[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct PointLightData {
+    pub position_radius: [f32; 4], // x,y,z in renderer space, w = radius
+    pub color_pad: [f32; 4],       // r,g,b normalized, w unused
+}
+
+/// Combined size of the uniform buffer in bytes:
+///   144 bytes for existing fields (view_proj+ambient+fog+camera+diffuse)
+///   + 32 * 32 bytes for up to 32 point lights
+const UNIFORM_BUF_SIZE: u64 = 144 + MAX_POINT_LIGHTS as u64 * 32;
 use crate::tile_renderer::{self, MarkerInfo};
 
 struct TextureSlot {
@@ -111,6 +128,14 @@ pub struct ViewportState {
     sprite_quad_ibuf: wgpu::Buffer,
     sprite_instance_buf: wgpu::Buffer,
     show_sprites: bool,
+
+    // CPU-side instance data for fast drag updates
+    instance_data: Vec<Vec<tile_renderer::InstanceData>>,
+    tile_group_count: usize,
+    object_instance_map: std::collections::HashMap<(String, usize), Vec<(usize, usize)>>,
+
+    /// Point lights uploaded to the GPU each frame
+    lights: Vec<PointLightData>,
 }
 
 fn load_texture(name: &str, module_erf: Option<&nwn_erf::ErfFile>, hak_index: Option<&nwn_tileset::HakIndex>, mod_path: Option<&Path>, _hak_names: &[String]) -> Option<(u32, u32, Vec<u8>)> {
@@ -122,7 +147,7 @@ fn load_texture(name: &str, module_erf: Option<&nwn_erf::ErfFile>, hak_index: Op
     }
     // Try specific hak via HakIndex (fast, no full file reads)
     if let (Some(idx), Some(dir)) = (hak_index, mod_path) {
-        for &restype in &[8u16, 3u16, 1u16] {
+        for &restype in &[8u16, 3u16, 1u16, 6u16] {
             if let Some(data) = idx.get_resource_from_path(name, restype, dir) {
                 if let Some(tex) = nwn_tileset::decode_texture_data(restype, &data) {
                     return Some((tex.width, tex.height, tex.rgba));
@@ -156,6 +181,8 @@ impl ViewportState {
         module_erf: Option<&nwn_erf::ErfFile>,
         mod_path: Option<&std::path::Path>,
         hak_names: &[String],
+        existing_cache: Option<&mut tile_renderer::ModelCache>,
+        max_texture_bytes: u64,
     ) -> Self {
 
         let camera = existing_camera.unwrap_or_else(|| OrbitCamera::new(area.width as f32, area.height as f32));
@@ -210,18 +237,25 @@ impl ViewportState {
             names
         };
 
-        // Load all models in parallel
-        let mut model_cache = tile_renderer::ModelCache::new();
-        {
+        // Use existing cache or create fresh one
+        let mut local_cache = tile_renderer::ModelCache::new();
+        let model_cache: &mut tile_renderer::ModelCache = if let Some(c) = existing_cache {
+            c
+        } else {
+            &mut local_cache
+        };
+
+        // Only load models not already in the cache
+        let already_cached: std::collections::HashSet<&str> = model_cache.cache.keys().map(|s| s.as_str()).collect();
+        let to_load: Vec<&String> = unique_models.iter().filter(|n| !already_cached.contains(n.as_str())).collect();
+
+        if !to_load.is_empty() {
             use rayon::prelude::*;
-            let results: Vec<_> = unique_models.par_iter()
+            let results: Vec<_> = to_load.par_iter()
                 .map(|name| {
-                    // Try game data first
                     let mut loaded = nwn_tileset::load_model_meshes(name).ok().flatten();
-                    // Fall back to module ERF
                     if loaded.is_none() {
                         if let Some(erf) = module_erf {
-                            // Try MDL (2002) then MDB (2001)
                             for restype in &[2002u16, 2001] {
                                 if let Some(data) = erf.get(name, *restype) {
                                     if let Ok(meshes) = nwn_tileset::load_model_meshes_from_data(name, &data) {
@@ -232,7 +266,6 @@ impl ViewportState {
                             }
                         }
                     }
-                    // Fall back to haks (one at a time to avoid OOM)
                     if loaded.is_none() {
                         if let (Some(dir), hak_list) = (mod_path, hak_names) {
                             if !hak_list.is_empty() {
@@ -245,21 +278,25 @@ impl ViewportState {
                     } else {
                         eprintln!("  DEBUG model '{}' NOT FOUND", name);
                     }
-                    (name.clone(), loaded)
+                    ((*name).clone(), loaded)
                 })
                 .collect();
             for (name, meshes) in results {
                 if let Some(m) = meshes {
-                    model_cache.cache.insert(name, m);
+                    model_cache.cache.entry(name.to_string()).or_insert(m);
                 }
             }
         }
 
-        let mut instanced = tile_renderer::build_instanced_tiles(area, &mut model_cache);
-        let obj_instanced = tile_renderer::build_object_models(area, &mut model_cache);
+        let mut instanced = tile_renderer::build_instanced_tiles(area, model_cache);
+        let tile_group_count = instanced.models.len();
+        let obj_instanced = tile_renderer::build_object_models(area, model_cache);
+        let object_instance_map = tile_renderer::build_object_instance_map(area, &obj_instanced, model_cache);
+        let obj_models = obj_instanced.models;
+        let obj_instance_data = obj_instanced.instance_data;
         // Merge object models into instanced
-        instanced.models.extend(obj_instanced.models);
-        instanced.instance_data.extend(obj_instanced.instance_data);
+        instanced.models.extend(obj_models);
+        instanced.instance_data.extend(obj_instance_data);
 
         let markers_result = tile_renderer::build_object_markers(area, visibility_filter);
         let marker_data = markers_result.mesh;
@@ -347,12 +384,27 @@ impl ViewportState {
             }
         }
 
-        // Load all textures sequentially (hak fallback can't handle parallel opens of multi-GB files)
+        // Load textures with memory cap
+        let mut total_tex_bytes: u64 = 0;
         let tex_data: Vec<(String, Option<(u32, u32, Vec<u8>)>)> = {
             tex_names.iter()
-                .map(|name| (name.clone(), load_texture(name, module_erf, hak_index.as_ref(), mod_path, hak_names)))
+                .map(|name| {
+                    if total_tex_bytes >= max_texture_bytes {
+                        return (name.clone(), None);
+                    }
+                    let result = load_texture(name, module_erf, hak_index.as_ref(), mod_path, hak_names);
+                    if let Some((w, h, ref _data)) = result {
+                        total_tex_bytes += w as u64 * h as u64 * 4;
+                    }
+                    (name.clone(), result)
+                })
                 .collect()
         };
+        let loaded_count = tex_data.iter().filter(|(_, d)| d.is_some()).count();
+        let skipped_count = tex_data.len() - loaded_count;
+        if skipped_count > 0 {
+            eprintln!("  Texture cap ({} MB): loaded {}, skipped {} textures", max_texture_bytes / 1024 / 1024, loaded_count, skipped_count);
+        }
 
         // Create texture slots from loaded data
         let mut texture_slots: Vec<TextureSlot> = tex_data.iter().map(|(name, pending)| {
@@ -409,7 +461,7 @@ impl ViewportState {
             let instance_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some("nwn3d_inst_instance_buf"),
                 contents: bytemuck::cast_slice(&instanced.instance_data[midx]),
-                usage: wgpu::BufferUsages::VERTEX,
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
             });
 
             group_resources.push(GroupResources {
@@ -631,7 +683,7 @@ impl ViewportState {
 
         let uniform_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("nwn3d_uniform_buf"),
-            size: std::mem::size_of::<[f32; 36]>() as u64,
+            size: UNIFORM_BUF_SIZE,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -684,6 +736,10 @@ impl ViewportState {
         let marker_idx_count = marker_data.indices.len() as u32;
         let walkmesh_idx_count = walkmesh_data.indices.len() as u32;
         let paint_idx_count = paint_data.indices.len() as u32;
+
+        // Evict models not in current area from cache to free memory
+        let keep_set: std::collections::HashSet<String> = unique_models.iter().cloned().collect();
+        model_cache.retain(&keep_set);
 
         Self {
             camera,
@@ -764,9 +820,9 @@ impl ViewportState {
             fog_amount_norm: area.sun_fog_amount as f32 / 255.0,
             fog_clip_dist: area.fog_clip_dist,
             ambient_color: [
-                area.sun_ambient_color[0] as f32 / 255.0,
-                area.sun_ambient_color[1] as f32 / 255.0,
-                area.sun_ambient_color[2] as f32 / 255.0,
+                (area.sun_ambient_color[0] as f32 / 255.0).max(0.5),
+                (area.sun_ambient_color[1] as f32 / 255.0).max(0.5),
+                (area.sun_ambient_color[2] as f32 / 255.0).max(0.5),
             ],
             diffuse_color: [
                 area.sun_diffuse_color[0] as f32 / 255.0,
@@ -780,6 +836,51 @@ impl ViewportState {
             sprite_quad_ibuf,
             sprite_instance_buf,
             show_sprites: true,
+
+            instance_data: instanced.instance_data,
+            tile_group_count,
+            object_instance_map,
+
+            // Convert area point lights to renderer-space GPU data
+            lights: area.lights.iter().take(MAX_POINT_LIGHTS as usize).map(|l| {
+                let (rx, ry, rz) = tile_renderer::nwn_to_renderer(l.x, l.y, l.z);
+                PointLightData {
+                    position_radius: [rx, ry, rz, l.radius.max(0.1)],
+                    color_pad: [
+                        l.color[0] as f32 / 255.0,
+                        l.color[1] as f32 / 255.0,
+                        l.color[2] as f32 / 255.0,
+                        1.0,
+                    ],
+                }
+            }).collect(),
+        }
+
+    }
+
+    /// Fast-path: update a single object's instance transform without rebuilding the entire scene.
+    /// `obj_type` is "placeable", "door", or "creature".
+    pub fn set_object_transform(&mut self, queue: &wgpu::Queue, obj_type: &str, obj_idx: usize,
+                                 x: f32, y: f32, z: f32, bearing: f32) {
+        let key = (obj_type.to_string(), obj_idx);
+        let Some(entries) = self.object_instance_map.get(&key) else { return };
+        let (rx, ry, rz) = tile_renderer::nwn_to_renderer(x, y, z);
+        let (s, c) = bearing.sin_cos();
+        for &(gidx, inst_idx) in entries {
+            let agidx = gidx + self.tile_group_count;
+            if agidx >= self.groups.len() { continue; }
+            if inst_idx >= self.instance_data[agidx].len() { continue; }
+            let inst = tile_renderer::InstanceData {
+                row0: [c, 0.0, -s, 0.0],
+                row1: [0.0, 1.0, 0.0, 0.0],
+                row2: [s, 0.0, c, 0.0],
+                row3: [rx, ry, rz, 1.0],
+            };
+            // Update CPU copy
+            self.instance_data[agidx][inst_idx] = inst;
+            // Patch GPU buffer at the right offset (64 bytes per instance)
+            let offset = inst_idx as u64 * 64;
+            queue.write_buffer(&self.groups[agidx].instance_buf, offset, bytemuck::cast_slice(&[inst]));
         }
     }
 
@@ -890,11 +991,12 @@ impl ViewportState {
         queue.write_buffer(&self.uniform_buf, 64, bytemuck::cast_slice(&ambient));
         // fog_color at offset 80 (float[20])
         queue.write_buffer(&self.uniform_buf, 80, bytemuck::cast_slice(&self.fog_color));
-        // fog_params at offset 96 (float[24]): x=fog_amount_norm, y=fog_clip_dist
+        // fog_params at offset 96 (float[24]): x=fog_amount_norm, y=fog_clip_dist, z=light_count
         let fog_params = [
             if self.show_fog { self.fog_amount_norm } else { 0.0 },
             self.fog_clip_dist,
-            0.0, 0.0,
+            self.lights.len() as f32,
+            0.0,
         ];
         queue.write_buffer(&self.uniform_buf, 96, bytemuck::cast_slice(&fog_params));
         // camera_pos at offset 112 (float[28])
@@ -902,6 +1004,11 @@ impl ViewportState {
         queue.write_buffer(&self.uniform_buf, 112, bytemuck::cast_slice(&[eye[0], eye[1], eye[2], 0.0]));
         // diffuse_color at offset 128 (float[32])
         queue.write_buffer(&self.uniform_buf, 128, bytemuck::cast_slice(&self.diffuse_color));
+        // point lights at offset 144: each light is 2 × vec4<f32> = 32 bytes
+        if !self.lights.is_empty() {
+            let light_bytes = bytemuck::cast_slice(&self.lights);
+            queue.write_buffer(&self.uniform_buf, 144, light_bytes);
+        }
     }
 
     pub fn update_sprite_instances(&self, queue: &wgpu::Queue) {
@@ -1060,7 +1167,7 @@ impl ViewportState {
     pub fn raypick(&self, screen_x: f32, screen_y: f32, view_w: f32, view_h: f32) -> Option<(usize, &MarkerInfo)> {
         if view_w <= 0.0 || view_h <= 0.0 { return None; }
         let (origin, dir) = self.camera.ray_from_screen(screen_x, screen_y, view_w, view_h);
-        let half = 0.5;
+        let half = 1.5;
         let eps = 1e-15;
         let inv_dir = [
             if dir[0].abs() > eps { 1.0 / dir[0] } else { f32::INFINITY },
@@ -1162,6 +1269,65 @@ impl ViewportState {
         self.highlight_count = indices.len() as u32;
     }
 
+    /// Draw a green wireframe box around a world position (for selected objects).
+    pub fn set_highlight_object(&mut self, device: &wgpu::Device, pos: Option<[f32; 3]>, half_size: f32) {
+        self.highlight_vbuf = None;
+        self.highlight_ibuf = None;
+        self.highlight_count = 0;
+
+        let [cx, cy, cz] = match pos {
+            Some(p) => p,
+            None => return,
+        };
+        let hs = half_size;
+
+        let corners: [[f32; 3]; 8] = [
+            [cx - hs, cy - hs, cz - hs],
+            [cx + hs, cy - hs, cz - hs],
+            [cx + hs, cy - hs, cz + hs],
+            [cx - hs, cy - hs, cz + hs],
+            [cx - hs, cy + hs, cz - hs],
+            [cx + hs, cy + hs, cz - hs],
+            [cx + hs, cy + hs, cz + hs],
+            [cx - hs, cy + hs, cz + hs],
+        ];
+
+        let edges: [(u32, u32); 12] = [
+            (0,1),(1,2),(2,3),(3,0),
+            (4,5),(5,6),(6,7),(7,4),
+            (0,4),(1,5),(2,6),(3,7),
+        ];
+
+        let color: [f32; 4] = [0.0, 1.0, 0.2, 0.8];
+        let mut verts: Vec<f32> = Vec::new();
+        for &(a, b) in &edges {
+            for &ci in &[a, b] {
+                verts.push(corners[ci as usize][0]);
+                verts.push(corners[ci as usize][1]);
+                verts.push(corners[ci as usize][2]);
+                verts.push(color[0]);
+                verts.push(color[1]);
+                verts.push(color[2]);
+                verts.push(color[3]);
+            }
+        }
+        let indices: Vec<u32> = (0..(edges.len() * 2) as u32).collect();
+
+        if verts.is_empty() { return; }
+
+        self.highlight_vbuf = Some(device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("nwn3d_highlight_obj_vbuf"),
+            contents: bytemuck::cast_slice(&verts),
+            usage: wgpu::BufferUsages::VERTEX,
+        }));
+        self.highlight_ibuf = Some(device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("nwn3d_highlight_obj_ibuf"),
+            contents: bytemuck::cast_slice(&indices),
+            usage: wgpu::BufferUsages::INDEX,
+        }));
+        self.highlight_count = indices.len() as u32;
+    }
+
     fn ensure_textures(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) {
         for slot in &mut self.texture_slots {
             if slot.bind_group.is_some() {
@@ -1229,12 +1395,17 @@ struct PendingArea {
 pub struct WgpuViewport {
     pub inner: Arc<Mutex<Option<ViewportState>>>,
     pending: Arc<Mutex<Option<PendingArea>>>,
+    pending_rebuild: Arc<Mutex<Option<ViewportState>>>,
+    rebuild_in_progress: Arc<AtomicBool>,
     visibility_filter: Arc<Mutex<tile_renderer::VisibilityFilter>>,
+    texture_mem_limit: Arc<Mutex<u64>>,
     module_erf_bytes: Arc<Mutex<Option<Arc<Vec<u8>>>>>,
     mod_path: Arc<Mutex<Option<std::path::PathBuf>>>,
     hak_names: Arc<Mutex<Vec<String>>>,
     device: Arc<Mutex<Option<wgpu::Device>>>,
     queue: Arc<Mutex<Option<wgpu::Queue>>>,
+    /// Persistent model cache to avoid reloading models from disk on rebuild
+    model_cache: Arc<Mutex<tile_renderer::ModelCache>>,
 }
 
 impl WgpuViewport {
@@ -1242,12 +1413,16 @@ impl WgpuViewport {
         Self {
             inner: Arc::new(Mutex::new(None)),
             pending: Arc::new(Mutex::new(None)),
+            pending_rebuild: Arc::new(Mutex::new(None)),
+            rebuild_in_progress: Arc::new(AtomicBool::new(false)),
             visibility_filter: Arc::new(Mutex::new(Default::default())),
+            texture_mem_limit: Arc::new(Mutex::new(512 * 1024 * 1024)),
             module_erf_bytes: Arc::new(Mutex::new(None)),
             mod_path: Arc::new(Mutex::new(None)),
             hak_names: Arc::new(Mutex::new(Vec::new())),
             device: Arc::new(Mutex::new(None)),
             queue: Arc::new(Mutex::new(None)),
+            model_cache: Arc::new(Mutex::new(tile_renderer::ModelCache::new())),
         }
     }
 
@@ -1255,12 +1430,16 @@ impl WgpuViewport {
         Self {
             inner: Arc::clone(&self.inner),
             pending: Arc::clone(&self.pending),
+            pending_rebuild: Arc::clone(&self.pending_rebuild),
+            rebuild_in_progress: Arc::clone(&self.rebuild_in_progress),
             visibility_filter: Arc::clone(&self.visibility_filter),
+            texture_mem_limit: Arc::clone(&self.texture_mem_limit),
             module_erf_bytes: Arc::clone(&self.module_erf_bytes),
             mod_path: Arc::clone(&self.mod_path),
             hak_names: Arc::clone(&self.hak_names),
             device: Arc::clone(&self.device),
             queue: Arc::clone(&self.queue),
+            model_cache: Arc::clone(&self.model_cache),
         }
     }
 
@@ -1285,9 +1464,28 @@ impl WgpuViewport {
         }
     }
 
+    pub fn set_texture_mem_limit(&self, limit_bytes: u64) {
+        if let Ok(mut guard) = self.texture_mem_limit.lock() {
+            *guard = limit_bytes;
+        }
+    }
+
     pub fn set_area(&self, area: Arc<nwn_gamemodel::Area>, version: u64, format: wgpu::TextureFormat) {
         if let Ok(mut guard) = self.pending.lock() {
             *guard = Some(PendingArea { area, version, format });
+        }
+    }
+
+    /// Fast-path: update a single object's transform without rebuilding the scene.
+    pub fn set_object_transform(&self, obj_type: &str, obj_idx: usize,
+                                 x: f32, y: f32, z: f32, bearing: f32) {
+        let queue = self.queue.lock().ok().and_then(|q| q.clone());
+        if let Some(queue) = queue {
+            if let Ok(mut guard) = self.inner.lock() {
+                if let Some(ref mut state) = *guard {
+                    state.set_object_transform(&queue, obj_type, obj_idx, x, y, z, bearing);
+                }
+            }
         }
     }
 
@@ -1494,6 +1692,17 @@ impl WgpuViewport {
         None
     }
 
+    pub fn set_highlight_object(&self, pos: Option<[f32; 3]>, half_size: f32) {
+        let device_guard = self.device.lock().ok();
+        let device = device_guard.as_ref().and_then(|d| d.as_ref());
+        let Some(device) = device else { return };
+        if let Ok(mut guard) = self.inner.lock() {
+            if let Some(ref mut state) = *guard {
+                state.set_highlight_object(device, pos, half_size);
+            }
+        }
+    }
+
     /// Capture the current viewport at a given resolution, returning RGBA pixels.
     /// Returns `None` if the viewport hasn't been initialized yet.
     pub fn capture_frame(&self, width: u32, height: u32) -> Option<Vec<u8>> {
@@ -1630,55 +1839,114 @@ impl CallbackTrait for WgpuViewport {
         _egui_encoder: &mut wgpu::CommandEncoder,
         _callback_resources: &mut CallbackResources,
     ) -> Vec<wgpu::CommandBuffer> {
-        // Store device/queue for capture_frame usage
+        // Store device/queue for background rebuild usage
         if let Ok(mut d) = self.device.lock() { *d = Some(device.clone()); }
         if let Ok(mut q) = self.queue.lock() { *q = Some(queue.clone()); }
 
-        // Handle pending area load (called from update thread)
+        // Check if a background rebuild finished
+        if let Ok(mut rb_guard) = self.pending_rebuild.lock() {
+            if let Some(mut state) = rb_guard.take() {
+                // Copy camera from old state if user moved it during rebuild
+                if let Ok(guard) = self.inner.lock() {
+                    if let Some(ref old) = *guard {
+                        state.camera = old.camera.clone();
+                        // Copy live object transforms (drag/rotate/nudge) from old state
+                        for (key, old_entries) in &old.object_instance_map {
+                            if let Some(new_entries) = state.object_instance_map.get(key) {
+                                let count = old_entries.len().min(new_entries.len());
+                                for k in 0..count {
+                                    let (og, oi) = old_entries[k];
+                                    let (ng, ni) = new_entries[k];
+                                    if og < old.instance_data.len() && oi < old.instance_data[og].len()
+                                        && ng < state.instance_data.len() && ni < state.instance_data[ng].len()
+                                    {
+                                        let inst = old.instance_data[og][oi];
+                                        state.instance_data[ng][ni] = inst;
+                                        let offset = ni as u64 * 64;
+                                        let queue = self.queue.lock().ok().and_then(|q| q.clone());
+                                        if let Some(ref q) = queue {
+                                            q.write_buffer(&state.groups[ng].instance_buf, offset, bytemuck::cast_slice(&[inst]));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                if let Ok(mut guard) = self.inner.lock() {
+                    *guard = Some(state);
+                }
+            }
+        }
+
+        // Spawn background rebuild if there's a pending area and no rebuild is running
         if let Ok(mut pending_guard) = self.pending.lock() {
-            if let Some(pending) = pending_guard.take() {
-                let config = wgpu::SurfaceConfiguration {
-                    usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-                    format: pending.format,
-                    width: screen_descriptor.size_in_pixels[0],
-                    height: screen_descriptor.size_in_pixels[1],
-                    present_mode: wgpu::PresentMode::Fifo,
-                    alpha_mode: wgpu::CompositeAlphaMode::Auto,
-                    view_formats: vec![],
-                    desired_maximum_frame_latency: 2,
-                };
-                let existing_camera = self.inner.lock().ok().and_then(|g| g.as_ref().map(|s| s.camera.clone()));
+            if pending_guard.is_some() && !self.rebuild_in_progress.load(Ordering::SeqCst) {
+                let pending = pending_guard.take().unwrap();
+                self.rebuild_in_progress.store(true, Ordering::SeqCst);
+
+                let pending_rebuild = self.pending_rebuild.clone();
+                let rebuild_flag = self.rebuild_in_progress.clone();
+                let inner = self.inner.clone();
                 let vf = self.visibility_filter.lock().map(|g| g.clone()).unwrap_or_default();
                 let erf = self.module_erf_bytes.lock().ok()
                     .and_then(|g| g.clone())
                     .and_then(|bytes| nwn_erf::ErfFile::from_bytes(&bytes).ok());
-                let mut state = ViewportState::new(device, &config, &pending.area, pending.version, vf, existing_camera,
-                    erf.as_ref(),
-                    self.mod_path.lock().ok().and_then(|g| g.clone()).as_deref(),
-                    &self.hak_names.lock().map(|g| g.clone()).unwrap_or_default(),
-                );
-                let area_ref = &*pending.area;
-                let paint_data = tile_renderer::build_paint_overlay_ex(area_ref, 0, false, [40, 80, 200, 160]);
-                let paint_vertex_buf = if !paint_data.vertices.is_empty() {
-                    Some(device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                        label: Some("nwn3d_paint_vbuf"),
-                        contents: bytemuck::cast_slice(&paint_data.vertices),
-                        usage: wgpu::BufferUsages::VERTEX,
-                    }))
-                } else { None };
-                let paint_index_buf = if !paint_data.indices.is_empty() {
-                    Some(device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                        label: Some("nwn3d_paint_ibuf"),
-                        contents: bytemuck::cast_slice(&paint_data.indices),
-                        usage: wgpu::BufferUsages::INDEX,
-                    }))
-                } else { None };
-                state.paint_idx_count = paint_data.indices.len() as u32;
-                state.paint_vertex_buf = paint_vertex_buf;
-                state.paint_index_buf = paint_index_buf;
-                if let Ok(mut guard) = self.inner.lock() {
-                    *guard = Some(state);
-                }
+                let mod_path = self.mod_path.lock().ok().and_then(|g| g.clone());
+                let hak_names = self.hak_names.lock().map(|g| g.clone()).unwrap_or_default();
+                let device_arc = self.device.clone();
+                let size = screen_descriptor.size_in_pixels;
+                let model_cache_arc = self.model_cache.clone();
+                let max_tex_bytes = self.texture_mem_limit.lock().map(|g| *g).unwrap_or(u64::MAX);
+
+                std::thread::spawn(move || {
+                    let dev = device_arc.lock().ok().and_then(|g| g.clone());
+                    if let Some(ref device) = dev.as_ref() {
+                        let config = wgpu::SurfaceConfiguration {
+                            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+                            format: pending.format,
+                            width: size[0],
+                            height: size[1],
+                            present_mode: wgpu::PresentMode::AutoNoVsync,
+                            alpha_mode: wgpu::CompositeAlphaMode::Auto,
+                            view_formats: vec![],
+                            desired_maximum_frame_latency: 3,
+                        };
+                        let existing_camera = inner.lock().ok().and_then(|g| g.as_ref().map(|s| s.camera.clone()));
+                        let mut cache_guard = model_cache_arc.lock().unwrap();
+                        let mut state = ViewportState::new(device, &config, &pending.area, pending.version, vf, existing_camera,
+                            erf.as_ref(),
+                            mod_path.as_deref(),
+                            &hak_names,
+                            Some(&mut *cache_guard),
+                            max_tex_bytes,
+                        );
+                        drop(cache_guard);
+                        let area_ref = &*pending.area;
+                        let paint_data = tile_renderer::build_paint_overlay_ex(area_ref, 0, false, [40, 80, 200, 160]);
+                        let paint_vertex_buf = if !paint_data.vertices.is_empty() {
+                            Some(device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                                label: Some("nwn3d_paint_vbuf"),
+                                contents: bytemuck::cast_slice(&paint_data.vertices),
+                                usage: wgpu::BufferUsages::VERTEX,
+                            }))
+                        } else { None };
+                        let paint_index_buf = if !paint_data.indices.is_empty() {
+                            Some(device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                                label: Some("nwn3d_paint_ibuf"),
+                                contents: bytemuck::cast_slice(&paint_data.indices),
+                                usage: wgpu::BufferUsages::INDEX,
+                            }))
+                        } else { None };
+                        state.paint_idx_count = paint_data.indices.len() as u32;
+                        state.paint_vertex_buf = paint_vertex_buf;
+                        state.paint_index_buf = paint_index_buf;
+                        if let Ok(mut guard) = pending_rebuild.lock() {
+                            *guard = Some(state);
+                        }
+                    }
+                    rebuild_flag.store(false, Ordering::SeqCst);
+                });
             }
         }
 

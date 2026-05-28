@@ -507,17 +507,30 @@ impl Module {
                 }
             }
             if c.model_name.is_none() {
-                c.model_name = if creature_appearance >= 0 {
-                    let mut name = nwn_tileset::lookup_creature_model(creature_appearance, &[erf]);
+                // If creature_appearance was -1 (no appearance data), try default appearance 0
+                if creature_appearance < 0 {
+                    creature_appearance = 0;
+                }
+                let mut name = nwn_tileset::lookup_creature_model(creature_appearance, &[erf]);
+                if name.is_none() {
+                    name = hak_index.parse_2da_across_haks("appearance", creature_appearance, "ModelName", mod_dir_path);
                     if name.is_none() {
-                        // Try simple ModelName column first, fall back to complex multi-column lookup
-                        name = hak_index.parse_2da_across_haks("appearance", creature_appearance, "ModelName", mod_dir_path);
-                        if name.is_none() {
-                            name = hak_index.find_creature_across_haks(creature_appearance, mod_dir_path);
-                        }
+                        name = hak_index.find_creature_across_haks(creature_appearance, mod_dir_path);
                     }
-                    name
-                } else { None };
+                }
+                // Final fallback: use hash of resref to pick a diverse model
+                if name.as_deref().map_or(true, |n| n.is_empty() || n.len() <= 2) {
+                    let pool = [
+                        "c_gnoll", "c_goblinx", "c_basilisk", "c_cat_mpanth",
+                        "c_direrat", "c_rat", "c_spidgiant", "c_wagn2",
+                        "c_wagn3", "c_behold", "c_jelly", "c_wingbat",
+                        "c_wingbut", "c_wyrmlblk", "c_drider", "c_manticore",
+                    ];
+                    let hash: u64 = c.resref.bytes().fold(314159u64, |h, b| h.wrapping_mul(2654435761).wrapping_add(b as u64));
+                    let idx = (hash as usize) % pool.len();
+                    name = Some(pool[idx].to_string());
+                }
+                c.model_name = name;
             }
         }
 
@@ -765,6 +778,15 @@ impl Module {
             }
         }
 
+        // Hak resources (not already seen)
+        let hak_index = self.get_hak_index();
+        for (resref, restype) in hak_index.all_resources() {
+            let key = (resref.to_lowercase(), restype);
+            if seen.insert(key) {
+                list.push((resref.clone(), restype));
+            }
+        }
+
         list.sort_by(|a, b| a.0.to_lowercase().cmp(&b.0.to_lowercase()));
         list
     }
@@ -785,7 +807,12 @@ impl Module {
             })
         };
 
-        match restype {
+        let hak_fallback = |n: &str| -> Option<Vec<u8>> {
+            let mod_dir = self.path.parent()?;
+            self.get_hak_index().get_resource(n, restype, mod_dir)
+        };
+
+        let result = match restype {
             t if t == resource_types::NSS => {
                 self.scripts.get(&name).cloned()
                     .or_else(|| erf_fallback(&name))
@@ -811,10 +838,28 @@ impl Module {
             t if t == resource_types::FAC => {
                 self.raw_fac.clone()
                     .or_else(|| erf_fallback(&name))
+                    .or_else(|| {
+                        if name.to_lowercase() == "faction" {
+                            erf_fallback("repute")
+                        } else if name.to_lowercase() == "repute" {
+                            erf_fallback("faction")
+                        } else {
+                            None
+                        }
+                    })
             }
             t if t == resource_types::JRL => {
                 self.modified_jrl.clone()
-                    .or_else(|| erf_fallback("journal"))
+                    .or_else(|| erf_fallback(&name))
+                    .or_else(|| {
+                        if name.to_lowercase() == "journal" {
+                            erf_fallback("module")
+                        } else if name.to_lowercase() == "module" {
+                            erf_fallback("journal")
+                        } else {
+                            None
+                        }
+                    })
             }
             t if t == resource_types::TLK => {
                 self.modified_tlk.as_ref().map(|(_, d)| d.clone())
@@ -824,7 +869,8 @@ impl Module {
                 self.blueprints.get(&(name_lower, restype)).cloned()
                     .or_else(|| erf_fallback(&name))
             }
-        }
+        };
+        result.or_else(|| hak_fallback(&name))
     }
 
     /// Get or create the hak index (lazily initialized).
@@ -838,7 +884,28 @@ impl Module {
     /// List available blueprint resrefs for a given 2DA table (e.g. "placeables", "creatures").
     pub fn blueprint_resrefs(&self, two_da_name: &str) -> Vec<(String, String)> {
         let mod_dir = self.path.parent().unwrap_or(Path::new("."));
-        self.get_hak_index().list_2da_column(two_da_name, "Label", mod_dir)
+        let hak_index = self.get_hak_index();
+        let result = hak_index.list_2da_column(two_da_name, "Label", mod_dir);
+        if !result.is_empty() { return result; }
+        // Fallback: try alternative 2DA names for known types
+        match two_da_name {
+            "creatures" => hak_index.list_2da_column("appearance", "Label", mod_dir),
+            _ => result,
+        }
+    }
+
+    /// Load relevant 2DA files from haks into the resource manager for the blueprint palette.
+    pub fn load_hak_2das(&mut self) {
+        let mod_dir = self.path.parent().unwrap_or(Path::new("."));
+        let hak_index = nwn_tileset::HakIndex::new(mod_dir, &self.haks);
+        for name in &["placeables", "doortypes", "baseitems", "appearance", "creatures", "genericdoors", "triggers", "waypoints", "encounters", "iprp", "armor", "weapons"] {
+            if self.resource_manager.get_2da(name).is_some() { continue; }
+            if let Some(data) = hak_index.get_resource(name, 2017, mod_dir) {
+                if let Ok(s) = std::str::from_utf8(&data) {
+                    let _ = self.resource_manager.load_2da(name, s);
+                }
+            }
+        }
     }
 
     pub fn save(&mut self) -> Result<()> {

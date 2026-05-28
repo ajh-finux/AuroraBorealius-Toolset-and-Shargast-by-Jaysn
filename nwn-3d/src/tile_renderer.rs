@@ -52,6 +52,11 @@ impl ModelCache {
             _ => None,
         }
     }
+
+    /// Retain only the model names in `keep`, evicting the rest to free memory.
+    pub fn retain(&mut self, keep: &std::collections::HashSet<String>) {
+        self.cache.retain(|k, _| keep.contains(k));
+    }
 }
 
 fn tile_instance_transform(col: usize, row: usize, height: f32, orientation: u8) -> InstanceData {
@@ -293,6 +298,62 @@ pub fn build_object_models(area: &Area, model_cache: &mut ModelCache) -> Instanc
     InstancedTiles { models, instance_data }
 }
 
+/// Maps (obj_type_str, obj_idx) -> list of (group_idx, instance_idx) pairs in the returned instance_data.
+pub fn build_object_instance_map(area: &Area, obj_inst: &InstancedTiles, model_cache: &ModelCache) -> HashMap<(String, usize), Vec<(usize, usize)>> {
+    let mut map: HashMap<(String, usize), Vec<(usize, usize)>> = HashMap::new();
+    let mut group_counts = vec![0usize; obj_inst.instance_data.len()];
+    // Reconstruct group_map: (model_name, mesh_idx) → group_idx, in first-encounter order
+    let mut group_map: HashMap<(String, usize), usize> = HashMap::new();
+    // Track how many groups have been "seen" to match models.len() ordering
+    let mut next_group = 0usize;
+
+    let add_mapping = |model_name: &str, obj_type: &str, obj_idx: usize,
+                           group_map: &mut HashMap<(String, usize), usize>,
+                           next_group: &mut usize,
+                           group_counts: &mut Vec<usize>,
+                           map: &mut HashMap<(String, usize), Vec<(usize, usize)>>,
+                           model_cache: &ModelCache| {
+        let meshes = match model_cache.cache.get(model_name) {
+            Some(ms) => ms,
+            None => return,
+        };
+        let mut entries = Vec::new();
+        for (mi, mesh) in meshes.iter().enumerate() {
+            if mesh.indices.is_empty() { continue; }
+            if !group_map.contains_key(&(model_name.to_string(), mi)) {
+                group_map.insert((model_name.to_string(), mi), *next_group);
+                *next_group += 1;
+            }
+            let gidx = group_map[&(model_name.to_string(), mi)];
+            if group_counts[gidx] < obj_inst.instance_data[gidx].len() {
+                entries.push((gidx, group_counts[gidx]));
+                group_counts[gidx] += 1;
+            }
+        }
+        if !entries.is_empty() {
+            map.insert((obj_type.to_string(), obj_idx), entries);
+        }
+    };
+
+    for (i, p) in area.placeables.iter().enumerate() {
+        if let Some(ref name) = p.model_name {
+            add_mapping(name, "placeable", i, &mut group_map, &mut next_group, &mut group_counts, &mut map, model_cache);
+        }
+    }
+    for (i, d) in area.doors.iter().enumerate() {
+        if let Some(ref name) = d.model_name {
+            add_mapping(name, "door", i, &mut group_map, &mut next_group, &mut group_counts, &mut map, model_cache);
+        }
+    }
+    for (i, c) in area.creatures.iter().enumerate() {
+        if let Some(ref name) = c.model_name {
+            add_mapping(name, "creature", i, &mut group_map, &mut next_group, &mut group_counts, &mut map, model_cache);
+        }
+    }
+
+    map
+}
+
 pub fn build_tile_mesh(area: &Area) -> MeshData {
     if area.width <= 0 || area.height <= 0 || area.tiles.is_empty() {
         return MeshData { vertices: Vec::new(), indices: Vec::new() };
@@ -372,6 +433,7 @@ pub enum ObjectType {
     Waypoint,
     Encounter,
     SoundEmitter,
+    Light,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -393,6 +455,7 @@ pub struct VisibilityFilter {
     pub show_waypoints: bool,
     pub show_encounters: bool,
     pub show_sound_emitters: bool,
+    pub show_lights: bool,
 }
 
 impl Default for VisibilityFilter {
@@ -406,6 +469,7 @@ impl Default for VisibilityFilter {
             show_waypoints: true,
             show_encounters: true,
             show_sound_emitters: true,
+            show_lights: true,
         }
     }
 }
@@ -421,11 +485,12 @@ pub fn object_type_icon(obj_type: ObjectType) -> Option<&'static str> {
     match obj_type {
         ObjectType::Waypoint => Some("po_hu_f_01_h"),
         ObjectType::Door => Some("do_hide"),
-        ObjectType::Creature => Some("po_hu_m_01_h"),
-        ObjectType::Placeable => Some("iit_chest"),
+        ObjectType::Creature => None,
+        ObjectType::Placeable => None,
         ObjectType::Trigger => None,
         ObjectType::Encounter => None,
         ObjectType::SoundEmitter => None,
+        ObjectType::Light => None,
     }
 }
 
@@ -436,25 +501,28 @@ pub fn build_object_markers(area: &Area, filter: VisibilityFilter) -> MarkersRes
 
     if filter.show_creatures {
         for (i, c) in area.creatures.iter().enumerate() {
-            if c.model_name.is_some() { continue; }
             let oz = c.z + 0.3;
             markers.push(MarkerInfo { obj_type: ObjectType::Creature, index: i, x: c.x, y: c.y, z: oz });
-            add_creature_marker(&mut vertices, &mut indices, c.x, c.y, oz, c.bearing, [1.0, 0.3, 0.3, 1.0]);
+            if c.model_name.is_none() {
+                add_creature_marker(&mut vertices, &mut indices, c.x, c.y, oz, c.bearing, [1.0, 0.3, 0.3, 1.0]);
+            }
         }
     }
     if filter.show_doors {
         for (i, d) in area.doors.iter().enumerate() {
-            if d.model_name.is_some() { continue; }
             markers.push(MarkerInfo { obj_type: ObjectType::Door, index: i, x: d.x, y: d.y, z: d.z });
-            add_door_marker(&mut vertices, &mut indices, d.x, d.y, d.z, d.bearing, [1.0, 0.8, 0.0, 1.0]);
+            if d.model_name.is_none() {
+                add_door_marker(&mut vertices, &mut indices, d.x, d.y, d.z, d.bearing, [1.0, 0.8, 0.0, 1.0]);
+            }
         }
     }
     if filter.show_placeables {
         for (i, p) in area.placeables.iter().enumerate() {
-            if p.model_name.is_some() { continue; }
             let oz = p.z + 0.3;
             markers.push(MarkerInfo { obj_type: ObjectType::Placeable, index: i, x: p.x, y: p.y, z: oz });
-            add_placeable_marker(&mut vertices, &mut indices, p.x, p.y, oz, p.bearing, [0.2, 0.4, 1.0, 1.0]);
+            if p.model_name.is_none() {
+                add_placeable_marker(&mut vertices, &mut indices, p.x, p.y, oz, p.bearing, [0.2, 0.4, 1.0, 1.0]);
+            }
         }
     }
     if filter.show_triggers {
@@ -479,6 +547,18 @@ pub fn build_object_markers(area: &Area, filter: VisibilityFilter) -> MarkersRes
         for (i, s) in area.sound_emitters.iter().enumerate() {
             markers.push(MarkerInfo { obj_type: ObjectType::SoundEmitter, index: i, x: s.x, y: s.y, z: s.z });
             add_sound_emitter_marker(&mut vertices, &mut indices, s.x, s.y, s.z, [0.2, 0.8, 1.0, 0.8]);
+        }
+    }
+    if filter.show_lights {
+        for (i, l) in area.lights.iter().enumerate() {
+            markers.push(MarkerInfo { obj_type: ObjectType::Light, index: i, x: l.x, y: l.y, z: l.z });
+            let light_color: [f32; 4] = [
+                l.color[0] as f32 / 255.0,
+                l.color[1] as f32 / 255.0,
+                l.color[2] as f32 / 255.0,
+                l.color[3] as f32 / 255.0,
+            ];
+            add_light_marker(&mut vertices, &mut indices, l.x, l.y, l.z, light_color);
         }
     }
 
@@ -906,7 +986,7 @@ fn add_rotated_box(vertices: &mut Vec<Vertex>, indices: &mut Vec<u32>,
     }
 }
 
-fn nwn_to_renderer(x: f32, y: f32, z: f32) -> (f32, f32, f32) {
+pub(crate) fn nwn_to_renderer(x: f32, y: f32, z: f32) -> (f32, f32, f32) {
     (x, z, -y)
 }
 
@@ -1061,5 +1141,37 @@ fn add_sound_emitter_marker(vertices: &mut Vec<Vertex>, indices: &mut Vec<u32>,
         for i in 0..arc_n {
             indices.extend_from_slice(&[abase + i as u32, abase + i as u32 + 1]);
         }
+    }
+}
+
+fn add_light_marker(vertices: &mut Vec<Vertex>, indices: &mut Vec<u32>,
+    x: f32, y: f32, z: f32, color: [f32; 4])
+{
+    let (rx, ry, rz) = nwn_to_renderer(x, y, z);
+    let r = 0.3;
+    let n = 8;
+    let base = vertices.len() as u32;
+    vertices.push(Vertex { position: [rx, ry, rz], normal: [0.0, 1.0, 0.0], uv: [0.0, 0.0], color });
+    for i in 0..n {
+        let angle = (i as f32 / n as f32) * std::f32::consts::TAU;
+        let cx = rx + angle.cos() * r;
+        let cz = rz + angle.sin() * r;
+        vertices.push(Vertex { position: [cx, ry, cz], normal: [0.0, 1.0, 0.0], uv: [0.0, 0.0], color });
+    }
+    let c = base;
+    for i in 0..n {
+        let vi = base + 1 + i as u32;
+        let v_next = base + 1 + ((i + 1) % n) as u32;
+        indices.extend_from_slice(&[c, v_next, vi]);
+    }
+    // Starburst rays
+    for ray in 0..4 {
+        let ra = ray as f32 * std::f32::consts::FRAC_PI_2;
+        let ra_x = rx + ra.cos() * (r + 0.2);
+        let ra_z = rz + ra.sin() * (r + 0.2);
+        let ray_base = vertices.len() as u32;
+        vertices.push(Vertex { position: [rx, ry, rz], normal: [0.0, 1.0, 0.0], uv: [0.0, 0.0], color });
+        vertices.push(Vertex { position: [ra_x, ry, ra_z], normal: [0.0, 1.0, 0.0], uv: [0.0, 0.0], color });
+        indices.extend_from_slice(&[ray_base, ray_base + 1]);
     }
 }

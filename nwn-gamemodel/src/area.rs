@@ -1,6 +1,6 @@
 use std::rc::Rc;
 use std::str::FromStr;
-use crate::{Result, PropertyValue, Property, EncounterInstance, SoundEmitterInstance};
+use crate::{Result, PropertyValue, Property, EncounterInstance, SoundEmitterInstance, LightInstance};
 
 #[derive(Debug, Clone)]
 pub struct TileInfo {
@@ -27,6 +27,7 @@ pub struct Area {
     pub waypoints: Vec<WayPointInstance>,
     pub encounters: Vec<EncounterInstance>,
     pub sound_emitters: Vec<SoundEmitterInstance>,
+    pub lights: Vec<LightInstance>,
     pub walkmesh_walls: Vec<(usize, u8)>,
     pub tile_tints: Vec<(usize, [u8; 4])>,
     // Lighting
@@ -91,6 +92,7 @@ impl Area {
             waypoints: Vec::new(),
             encounters: Vec::new(),
             sound_emitters: Vec::new(),
+            lights: Vec::new(),
             walkmesh_walls,
             tile_tints,
             sun_ambient_color,
@@ -157,6 +159,11 @@ pub fn reload_from_git(area: &mut Area, git: &nwn_gff::GffFile) {
     } else {
         area.sound_emitters.clear();
     }
+    if let Some(list) = find_list(git.root(), &["LightList", "Light_List"]) {
+        area.lights = list.iter().map(|s| LightInstance::from_gff_struct(s)).collect();
+    } else {
+        area.lights.clear();
+    }
 }
 
 pub fn build_git_gff(area: &Area) -> nwn_gff::GffFile {
@@ -192,6 +199,10 @@ pub fn build_git_gff(area: &Area) -> nwn_gff::GffFile {
     }
     if !sound_emitter_structs.is_empty() {
         fields.push(make_field("SoundList", FieldValue::List(nwn_gff::list_from_vec(sound_emitter_structs))));
+    }
+    let light_structs: Vec<nwn_gff::Struct> = area.lights.iter().map(|l| l.to_gff_struct()).collect();
+    if !light_structs.is_empty() {
+        fields.push(make_field("LightList", FieldValue::List(nwn_gff::list_from_vec(light_structs))));
     }
 
     let root = nwn_gff::Struct {

@@ -6,6 +6,6 @@ license.workspace = true
 
 [dependencies]
 nwn-lib-rs = { version = "0.4", default-features = false }
-nwnrs-types = { version = "0.0.1", default-features = false, features = ["set", "key", "mdl", "dds", "tga", "checksums", "compressedbuf"] }
+nwnrs-types = { version = "0.0.1", default-features = false, features = ["set", "key", "mdl", "dds", "tga", "plt", "checksums", "compressedbuf"] }
 nwn-erf = { path = "../nwn-erf" }
 thiserror = "2"

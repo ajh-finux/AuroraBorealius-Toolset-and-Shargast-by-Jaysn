@@ -8,6 +8,7 @@ use wgpu;
 use nwn_gamemodel::FactionList;
 use nwn_tlk::TlkFile;
 use nwn_3d::{ObjectType, VisibilityFilter};
+use nwn_gamemodel::LightInstance;
 use nwn_gamemodel::PropertyBag;
 use crate::inspector::{SelectedObject, show_inspector, show_bag_editor};
 
@@ -28,8 +29,10 @@ use crate::blueprint_palette::show_blueprint_palette;
 use crate::item_editor::show_item_browser;
 use crate::two_da_editor::{TwoDaEditorState, show_two_da_editor};
 use crate::texture_browser::{TextureBrowserState, show_texture_browser};
-use crate::tileset_browser::{TilesetBrowserState, show_tileset_browser};
+
 use crate::area_geometry_editor::{GeometryEditorState, show_geometry_editor};
+use crate::universal_search::show_universal_search;
+use crate::tools_panel::{Tool, show_tools_panel};
 
 mod icons;
 mod inspector;
@@ -43,8 +46,11 @@ mod journal_editor;
 mod two_da_editor;
 mod encounter_editor;
 mod texture_browser;
-mod tileset_browser;
+
 mod area_geometry_editor;
+mod universal_search;
+mod tools_panel;
+mod nwsync_gen;
 
 // ── Platform-specific file dialog helpers ──────────────────────────────
 #[cfg(not(target_arch = "wasm32"))]
@@ -147,7 +153,6 @@ struct AuroraBorealisApp {
     selection_list: Vec<(String, usize)>,
 
     module: Option<nwn_gamemodel::Module>,
-    module_data: Option<Vec<u8>>,
     module_name_edit: String,
     module_tag_edit: String,
     module_entry_edit: String,
@@ -156,9 +161,11 @@ struct AuroraBorealisApp {
     clear_override: Option<[u8; 3]>,
     show_resource_viewer: bool,
     texture_browser: TextureBrowserState,
-    tileset_browser: TilesetBrowserState,
+
+
     geometry_editor: GeometryEditorState,
     show_blueprint_palette: bool,
+    universal_search_open: bool,
     show_sky_override: bool,
     nwn_process_handle: Option<std::process::Child>,
     #[allow(dead_code)]
@@ -185,6 +192,7 @@ struct AuroraBorealisApp {
     tlk_file: Option<std::sync::Arc<TlkFile>>,
     #[allow(dead_code)]
     area_list_cache: Vec<(String, String)>,
+    area_search: String,
     show_minimap: bool,
     graph_view_open: bool,
     graph_view_state: GraphViewState,
@@ -201,6 +209,7 @@ struct AuroraBorealisApp {
     show_waypoints: bool,
     show_encounters: bool,
     show_sound_emitters: bool,
+    show_lights: bool,
     water_level: i32,
     show_water: bool,
     module_props_popup: bool,
@@ -217,11 +226,13 @@ struct AuroraBorealisApp {
     placement_state: PlacementState,
     manip_mode: ManipMode,
     drag_state: Option<DragState>,
+    space_move_active: bool,
     manip_nudge_speed: f32,
     ghost_screen_pos: Option<egui::Pos2>,
     faction_editor_open: bool,
     journal_editor_open: bool,
     encounter_editor_open: bool,
+    encounter_editor_selected: Option<usize>,
     env_settings_open: bool,
     transition_editor_open: bool,
     module_tree_open: bool,
@@ -238,11 +249,9 @@ struct AuroraBorealisApp {
     env_moon_fog_color: [u8; 3],
     env_fog_clip_dist: f32,
     env_sun_ambient_color: [u8; 3],
-    walkmesh_wall_mode: bool,
+    active_tool: Tool,
     walkmesh_gen_threshold: i32,
-    terrain_edit_mode: bool,
     terrain_edit_raise_amount: i32,
-    terrain_smooth_mode: bool,
     terrain_smooth_radius: i32,
     show_contents_panel: bool,
     new_area_open: bool,
@@ -269,6 +278,10 @@ struct AuroraBorealisApp {
     new_object_y: f32,
     new_object_z: f32,
     new_object_bearing: f32,
+    nwsync_output_path: Option<std::path::PathBuf>,
+    nwsync_busy: bool,
+    nwsync_result: std::sync::Arc<std::sync::Mutex<Option<String>>>,
+    max_texture_mem_mb: u32,
     icons: icons::Icons,
 }
 
@@ -754,7 +767,6 @@ impl AuroraBorealisApp {
             selection_list: Vec::new(),
 
             module: None,
-            module_data: None,
             module_name_edit: String::new(),
             module_tag_edit: String::new(),
             module_entry_edit: String::new(),
@@ -763,9 +775,11 @@ impl AuroraBorealisApp {
             clear_override: None,
             show_resource_viewer: false,
             texture_browser: TextureBrowserState::default(),
-            tileset_browser: TilesetBrowserState::default(),
+
+
             geometry_editor: GeometryEditorState::default(),
             show_blueprint_palette: false,
+            universal_search_open: false,
             show_sky_override: false,
             nwn_process_handle: None,
             module_save_handle: None,
@@ -786,6 +800,7 @@ impl AuroraBorealisApp {
             recent_files,
             tlk_file: None,
             area_list_cache: Vec::new(),
+            area_search: String::new(),
             show_minimap: false,
             graph_view_open: false,
             graph_view_state: GraphViewState::default(),
@@ -803,6 +818,7 @@ impl AuroraBorealisApp {
             show_waypoints: true,
             show_encounters: true,
             show_sound_emitters: true,
+            show_lights: true,
             water_level: 0,
             show_water: false,
             module_props_popup: false,
@@ -819,11 +835,13 @@ impl AuroraBorealisApp {
             placement_state: PlacementState::Inactive,
             manip_mode: ManipMode::None,
             drag_state: None,
+            space_move_active: false,
             manip_nudge_speed: 0.5,
             ghost_screen_pos: None,
             faction_editor_open: false,
             journal_editor_open: false,
             encounter_editor_open: false,
+            encounter_editor_selected: None,
             env_settings_open: false,
             transition_editor_open: false,
             module_tree_open: false,
@@ -840,11 +858,9 @@ impl AuroraBorealisApp {
             env_moon_fog_color: [0, 0, 0],
             env_fog_clip_dist: 45.0,
             env_sun_ambient_color: [0, 0, 0],
-            walkmesh_wall_mode: false,
+            active_tool: Tool::Select,
             walkmesh_gen_threshold: 3,
-            terrain_edit_mode: false,
             terrain_edit_raise_amount: 1,
-            terrain_smooth_mode: false,
             terrain_smooth_radius: 2,
             show_contents_panel: false,
             new_area_open: false,
@@ -870,6 +886,10 @@ impl AuroraBorealisApp {
             new_object_y: 0.0,
             new_object_z: 0.0,
             new_object_bearing: 0.0,
+            nwsync_output_path: None,
+            nwsync_busy: false,
+            nwsync_result: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            max_texture_mem_mb: 512,
             icons: icons::Icons::new(&cc.egui_ctx),
         }
     }
@@ -987,6 +1007,12 @@ impl eframe::App for AuroraBorealisApp {
                         self.item_browser_open = ib;
                         ui.close_menu();
                     }
+                    let mut us = self.universal_search_open;
+                    ui.checkbox(&mut us, "Universal Search");
+                    if us != self.universal_search_open {
+                        self.universal_search_open = us;
+                        ui.close_menu();
+                    }
                     ui.checkbox(&mut self.show_sky_override, "Sky Color Override");
                     ui.checkbox(&mut self.show_navigator, "Navigator Panel");
                     ui.checkbox(&mut self.show_minimap, "Minimap Overlay");
@@ -995,18 +1021,8 @@ impl eframe::App for AuroraBorealisApp {
                     ui.checkbox(&mut self.module_tree_open, "Module Tree View");
                     ui.checkbox(&mut self.show_contents_panel, "Contents Panel");
                     ui.separator();
-                    let mut ww = self.walkmesh_wall_mode;
-                    ui.checkbox(&mut ww, "Walkmesh Wall Edit Mode");
-                    if ww != self.walkmesh_wall_mode { self.walkmesh_wall_mode = ww; self.status = if ww { "Walkmesh wall edit mode ON. Click walkmesh edges to toggle walls.".to_string() } else { "Walkmesh wall edit mode OFF.".to_string() }; }
-                    let mut te = self.terrain_edit_mode;
-                    ui.checkbox(&mut te, "Terrain Edit Mode");
-                    if te != self.terrain_edit_mode { self.terrain_edit_mode = te; if te { self.terrain_smooth_mode = false; } self.status = if te { "Terrain edit mode ON. Click to raise, Shift+click to lower.".to_string() } else { "Terrain edit mode OFF.".to_string() }; }
-                    let mut ts = self.terrain_smooth_mode;
-                    ui.checkbox(&mut ts, "Terrain Smooth Mode");
-                    if ts != self.terrain_smooth_mode { self.terrain_smooth_mode = ts; if ts { self.terrain_edit_mode = false; } self.status = if ts { "Terrain smooth mode ON. Click to smooth heights.".to_string() } else { "Terrain smooth mode OFF.".to_string() }; }
-                    if self.terrain_smooth_mode {
-                        ui.add(egui::Slider::new(&mut self.terrain_smooth_radius, 1..=5).text("Smooth Radius"));
-                    }
+                    ui.checkbox(&mut self.tile_palette_open, "Tile Palette");
+                    ui.separator();
                     let mut st = self.show_tiles;
                     ui.checkbox(&mut st, "Show Tiles");
                     if st != self.show_tiles { self.show_tiles = st; self.viewport.set_show_tiles(st); }
@@ -1014,11 +1030,13 @@ impl eframe::App for AuroraBorealisApp {
                     ui.checkbox(&mut sg, "Show Grid");
                     if sg != self.show_grid { self.show_grid = sg; self.viewport.set_show_grid(sg); }
                     let mut le = self.lighting_enabled;
-                    ui.checkbox(&mut le, "Full Bright");
+                    ui.checkbox(&mut le, "Enable Lighting");
                     if le != self.lighting_enabled { self.lighting_enabled = le; self.viewport.set_lighting_enabled(le); }
                     let mut ff = self.show_fog;
                     ui.checkbox(&mut ff, "Show Fog");
                     if ff != self.show_fog { self.show_fog = ff; self.viewport.set_show_fog(ff); }
+                    ui.add(egui::Slider::new(&mut self.max_texture_mem_mb, 128..=4096).text("Max Texture Memory (MB)"));
+                    self.viewport.set_texture_mem_limit(self.max_texture_mem_mb as u64 * 1024 * 1024);
                     ui.separator();
                     let mut sg = self.snap_to_grid_enabled;
                     ui.checkbox(&mut sg, "Snap to Grid");
@@ -1081,6 +1099,9 @@ impl eframe::App for AuroraBorealisApp {
                         let mut sse = self.show_sound_emitters;
                         ui.checkbox(&mut sse, "Sound Emitters");
                         if sse != self.show_sound_emitters { self.show_sound_emitters = sse; filter_changed = true; }
+                        let mut sl = self.show_lights;
+                        ui.checkbox(&mut sl, "Lights");
+                        if sl != self.show_lights { self.show_lights = sl; filter_changed = true; }
                     });
                     if filter_changed {
                         self.update_visibility_filter(target_format);
@@ -1172,10 +1193,6 @@ impl eframe::App for AuroraBorealisApp {
                         self.texture_browser.open = true;
                         ui.close_menu();
                     }
-                    if ui.button("Visual Tileset Browser").clicked() {
-                        self.tileset_browser.open = true;
-                        ui.close_menu();
-                    }
                     if self.module.is_some() {
                         if ui.button("Sound Browser").clicked() {
                             self.sound_browser_open = true;
@@ -1209,6 +1226,48 @@ impl eframe::App for AuroraBorealisApp {
                             self.transition_editor_open = true;
                             self.status = "Scanned transitions. Open the Transition Editor window.".to_string();
                             ui.close_menu();
+                        }
+                    }
+                    ui.separator();
+                    // ---- NWSync Export ----
+                    if self.module.is_some() {
+                        let module_path = self.module.as_ref().map(|m| m.path.clone());
+                        let module_name = self.module.as_ref().map(|m| m.name.clone());
+                        if let Some(ref mod_path) = module_path {
+                            let nwsync_path = self.nwsync_output_path.clone();
+                            if ui.button("Select NWSync Export Folder...").clicked() {
+                                if let Some(folder) = rfd::FileDialog::new().pick_folder() {
+                                    self.nwsync_output_path = Some(folder);
+                                }
+                                ui.close_menu();
+                            }
+                            if let Some(ref out_dir) = nwsync_path {
+                                ui.label(format!("Output: {}", out_dir.display()));
+                                let busy = self.nwsync_busy;
+                                if ui.add_enabled(!busy, egui::Button::new("Write NWSync")).clicked() {
+                                    self.nwsync_busy = true;
+                                    self.status = "Writing NWSync...".to_string();
+                                    let mod_path = mod_path.clone();
+                                    let hak_dir = std::path::PathBuf::from(
+                                        std::env::var("HOME").unwrap_or_else(|_| ".".to_string())
+                                    ).join(".local/share/Neverwinter Nights/hak");
+                                    let out = out_dir.clone();
+                                    let lbl = module_name.clone().unwrap_or_default();
+                                    let result = self.nwsync_result.clone();
+                                    std::thread::spawn(move || {
+                                        let msg = match nwsync_gen::gen_nwsync(&mod_path, &hak_dir, &out, &lbl) {
+                                            Ok(()) => format!("NWSync write OK for {}", lbl),
+                                            Err(e) => format!("NWSync write FAILED for {}: {}", lbl, e),
+                                        };
+                                        if let Ok(mut r) = result.lock() {
+                                            *r = Some(msg);
+                                        }
+                                    });
+                                    ui.close_menu();
+                                }
+                            } else {
+                                ui.label("No export folder selected");
+                            }
                         }
                     }
                 });
@@ -2038,8 +2097,14 @@ impl eframe::App for AuroraBorealisApp {
                         egui::ScrollArea::both().show(ui, |ui| {
                             for area_resref in area_names {
                                 let git_key = area_resref.trim().to_lowercase();
-                                let git_data = module.raw_git.get(&git_key);
-                                let gff = git_data.and_then(|d| nwn_gff::GffFile::from_bytes(d).ok());
+                                let git_data = module.raw_git.get(&git_key).cloned()
+                                    .or_else(|| {
+                                        module.erf.as_ref().and_then(|erf| {
+                                            erf.get(area_resref.trim(), resource_types::GIT)
+                                                .or_else(|| erf.get(&area_resref.trim().to_uppercase(), resource_types::GIT))
+                                        })
+                                    });
+                                let gff = git_data.as_deref().and_then(|d| nwn_gff::GffFile::from_bytes(d).ok());
                                 if gff.is_none() { continue; }
                                 let gff = gff.unwrap();
                                 let mut has_any = false;
@@ -2141,11 +2206,23 @@ impl eframe::App for AuroraBorealisApp {
             for (area_resref, list_name, idx_str, action) in save_results {
                 let idx: usize = match idx_str.parse() { Ok(i) => i, Err(_) => continue };
                 let git_key = area_resref.trim().to_lowercase();
-                let data = match self.module.as_ref().and_then(|m| m.raw_git.get(&git_key)) {
-                    Some(d) => d.clone(),
+                let data = {
+                    let m = match self.module.as_ref() {
+                        Some(m) => m,
+                        None => continue,
+                    };
+                    m.raw_git.get(&git_key).cloned()
+                        .or_else(|| {
+                            m.erf.as_ref().and_then(|erf| {
+                                erf.get(area_resref.trim(), resource_types::GIT)
+                                    .or_else(|| erf.get(&area_resref.trim().to_uppercase(), resource_types::GIT))
+                            })
+                        })
+                };
+                let mut gff = match data {
+                    Some(ref d) => match nwn_gff::GffFile::from_bytes(d) { Ok(g) => g, Err(_) => continue },
                     None => continue,
                 };
-                let mut gff = match nwn_gff::GffFile::from_bytes(&data) { Ok(g) => g, Err(_) => continue };
                 let list_fv = match gff.root_mut().find_mut(&list_name) {
                     Some(fv) => fv,
                     None => continue,
@@ -2218,10 +2295,16 @@ impl eframe::App for AuroraBorealisApp {
                         egui::ScrollArea::both().show(ui, |ui| {
                             // Areas
                             let area_names = module.area_names();
+                            ui.horizontal(|ui| {
+                                ui.label("Search:");
+                                ui.text_edit_singleline(&mut self.area_search);
+                            });
+                            let area_filter = self.area_search.to_lowercase();
                             egui::CollapsingHeader::new(format!("Areas ({})", area_names.len()))
                                 .default_open(true)
                                 .show(ui, |ui| {
                                     for name in area_names {
+                                        if !area_filter.is_empty() && !name.to_lowercase().contains(&area_filter) { continue; }
                                         let git_key = name.trim().to_lowercase();
                                         let counts = module.raw_git.get(&git_key).and_then(|d| {
                                             nwn_gff::GffFile::from_bytes(d).ok()
@@ -2428,7 +2511,6 @@ impl eframe::App for AuroraBorealisApp {
                                             if let Some(data) = erf.get(&res.resref, res.restype) {
                                                 let tmp_path = format!("/tmp/opencode/{}.{}", res.resref, ext);
                                                 let _ = std::fs::write(&tmp_path, &data);
-                                                // Try aplay, fallback to ffplay
                                                 let result = std::process::Command::new("aplay")
                                                     .arg(&tmp_path).arg("-q").spawn();
                                                 if result.is_err() {
@@ -2449,7 +2531,7 @@ impl eframe::App for AuroraBorealisApp {
                                 }
                             });
                         } else {
-                            ui.label("No ERF loaded.");
+                            ui.colored_label(egui::Color32::RED, "No ERF loaded.");
                         }
                     } else {
                         ui.label("No module loaded.");
@@ -2729,10 +2811,6 @@ impl eframe::App for AuroraBorealisApp {
         }
 
         // Tileset Browser window
-        if self.tileset_browser.open {
-            show_tileset_browser(&mut self.tileset_browser, ctx, self.module.as_ref());
-        }
-
         // Resource Viewer window
         if self.show_resource_viewer {
             egui::Window::new("Resource Viewer")
@@ -2763,6 +2841,12 @@ impl eframe::App for AuroraBorealisApp {
                 self.status = format!("Opened blueprint editor for {}.{}", resref, type_to_ext(restype).unwrap_or("?"));
             }
         }
+        if open_faction.is_some() {
+            self.faction_editor_open = true;
+        }
+        if open_journal.is_some() {
+            self.journal_editor_open = true;
+        }
 
         // Blueprint Palette window
         if self.show_blueprint_palette {
@@ -2788,6 +2872,31 @@ impl eframe::App for AuroraBorealisApp {
                     .show(ctx, |ui| {
                         show_item_browser(ui, &module.resource_manager);
                     });
+            }
+        }
+
+        // Tools Panel window
+        egui::Window::new("Tools")
+            .default_size([350.0, 160.0])
+            .show(ctx, |ui| {
+                show_tools_panel(ui, &mut self.active_tool, &mut self.terrain_edit_raise_amount, &mut self.terrain_smooth_radius);
+                ui.separator();
+                ui.label(self.active_tool.description());
+            });
+
+        // Universal Search window
+        if self.universal_search_open {
+            if let Some(ref module) = self.module {
+                let mut place_cmd: Option<(String, String)> = None;
+                egui::Window::new("Universal Search")
+                    .default_size([400.0, 500.0])
+                    .show(ctx, |ui| {
+                        show_universal_search(ui, &module.resource_manager, &mut place_cmd);
+                    });
+                if let Some((typ, resref)) = place_cmd {
+                    self.status = format!("Placement mode: {} {}. Click in viewport to place.", typ, resref);
+                    self.placement_state = PlacementState::Pending(typ, resref);
+                }
             }
         }
 
@@ -2975,9 +3084,12 @@ impl eframe::App for AuroraBorealisApp {
                 if names.is_empty() {
                     ui.label("No module loaded.");
                 } else {
+                    ui.text_edit_singleline(&mut self.area_search);
+                    let area_filter = self.area_search.to_lowercase();
                     egui::ScrollArea::vertical().show(ui, |ui| {
                         let mut delete_name: Option<String> = None;
                         for name in &names {
+                            if !area_filter.is_empty() && !name.to_lowercase().contains(&area_filter) { continue; }
                             let selected = current_resref.as_ref().map(|r| r == name).unwrap_or(false);
                             ui.horizontal(|ui| {
                                 if ui.selectable_label(selected, name).clicked() {
@@ -3043,18 +3155,50 @@ impl eframe::App for AuroraBorealisApp {
                 if self.show_navigator {
                     ui.horizontal(|ui| {
                         ui.heading(format!("Area: {}", area.resref));
-                        if self.show_minimap {
-                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                let mini_size = egui::vec2(160.0, 120.0);
-                                let (_id, rect) = ui.allocate_space(mini_size);
-                                let color = egui::Color32::from_rgba_unmultiplied(20, 20, 30, 200);
-                                ui.painter().rect_filled(rect, 0.0, color);
-                            });
-                        }
                     });
                     ui.separator();
                 }
                 let (_id, rect) = ui.allocate_space(ui.available_size());
+                // Minimap overlay (bottom-right corner of viewport)
+                if self.show_minimap {
+                    let mini_size = egui::vec2(150.0, 100.0);
+                    let mini_rect = egui::Rect::from_min_size(
+                        egui::pos2(rect.right() - mini_size.x - 6.0, rect.bottom() - mini_size.y - 6.0),
+                        mini_size,
+                    );
+                    ui.painter().rect_filled(mini_rect, 2.0, egui::Color32::from_black_alpha(180));
+                    let w = area.width.max(1) as usize;
+                    let h = area.height.max(1) as usize;
+                    let cell = ((mini_size.x / w as f32).min(mini_size.y / h as f32)).max(1.0);
+                    let total_w = w as f32 * cell;
+                    let total_h = h as f32 * cell;
+                    let ox = mini_rect.left() + (mini_size.x - total_w) / 2.0;
+                    let oy = mini_rect.top() + (mini_size.y - total_h) / 2.0;
+                    for row in 0..h {
+                        for col in 0..w {
+                            let ti = row * w + col;
+                            let tile = area.tiles.get(ti);
+                            let tint = area.tile_tints.iter().find(|&&(t, _)| t == ti).map(|&(_, c)| c);
+                            let (r, g, b) = if let Some(c) = tint {
+                                (c[0], c[1], c[2])
+                            } else if let Some(t) = tile {
+                                let id = t.id as u32;
+                                (((id * 137 + 53) % 200 + 55) as u8,
+                                 ((id * 251 + 97) % 200 + 55) as u8,
+                                 ((id * 199 + 173) % 200 + 55) as u8)
+                            } else {
+                                (40, 40, 40)
+                            };
+                            let cx = ox + col as f32 * cell;
+                            let cy = oy + row as f32 * cell;
+                            let c = egui::Color32::from_rgb(r, g, b);
+                            ui.painter().rect_filled(
+                                egui::Rect::from_min_size(egui::pos2(cx, cy), egui::vec2(cell, cell)),
+                                0.0, c,
+                            );
+                        }
+                    }
+                }
 
                 // Ghost preview: track mouse over viewport during placement mode
                 if matches!(self.placement_state, PlacementState::Pending(..)) {
@@ -3089,7 +3233,7 @@ impl eframe::App for AuroraBorealisApp {
                 }
 
                 // Walkmesh wall toggle on click
-                if primary_clicked && is_hovered && self.walkmesh_wall_mode {
+                if primary_clicked && is_hovered && self.active_tool == Tool::WalkmeshWall {
                     if let Some(pos) = click_pos {
                         let vp_x = pos.x - rect.left();
                         let vp_y = pos.y - rect.top();
@@ -3107,7 +3251,7 @@ impl eframe::App for AuroraBorealisApp {
                 }
 
                 // Terrain smoothing on click
-                if primary_clicked && is_hovered && self.terrain_smooth_mode {
+                if primary_clicked && is_hovered && self.active_tool == Tool::TerrainSmooth {
                     if let Some(pos) = click_pos {
                         let vp_x = pos.x - rect.left();
                         let vp_y = pos.y - rect.top();
@@ -3170,7 +3314,7 @@ impl eframe::App for AuroraBorealisApp {
                 }
 
                 // Terrain height editing on click
-                if primary_clicked && is_hovered && self.terrain_edit_mode {
+                if primary_clicked && is_hovered && self.active_tool == Tool::TerrainRaise {
                     if let Some(pos) = click_pos {
                         let vp_x = pos.x - rect.left();
                         let vp_y = pos.y - rect.top();
@@ -3296,6 +3440,7 @@ impl eframe::App for AuroraBorealisApp {
                                         ObjectType::Waypoint => "waypoint",
                                         ObjectType::Encounter => "encounter",
                                         ObjectType::SoundEmitter => "sound_emitter",
+                                        ObjectType::Light => "light",
                                     };
                                     let key = (obj_type_str.to_string(), marker.index);
 
@@ -3337,6 +3482,9 @@ impl eframe::App for AuroraBorealisApp {
                                             ObjectType::SoundEmitter => {
                                                 area.sound_emitters.get(marker.index).map(|s| (format!("Sound: {}", s.tag), s.to_property_bag()))
                                             }
+                                            ObjectType::Light => {
+                                                area.lights.get(marker.index).map(|l| (format!("Light: {}", l.tag), LightInstance::to_property_bag(l)))
+                                            }
                                         };
                                         if let Some((title, bag)) = bag {
                                             let full_bag = self.module.as_ref().and_then(|module| {
@@ -3351,7 +3499,7 @@ impl eframe::App for AuroraBorealisApp {
                                             self.selected_obj_info = Some(key);
 
                                             // Start 3D drag-to-move
-                                            if !ctrl_held && !self.walkmesh_wall_mode && !self.terrain_smooth_mode && !self.terrain_edit_mode {
+                                            if !ctrl_held && self.active_tool == Tool::Select {
                                                 if let Some(world) = self.viewport.pick_ground(vp_x, vp_y, vp_w, vp_h) {
                                                     let orig = match marker.obj_type {
                                                         ObjectType::Creature => area.creatures.get(marker.index).map(|o| (o.x, o.y, o.z, o.bearing)),
@@ -3361,6 +3509,7 @@ impl eframe::App for AuroraBorealisApp {
                                                         ObjectType::Waypoint => area.waypoints.get(marker.index).map(|o| (o.x, o.y, o.z, o.bearing)),
                                                         ObjectType::Encounter => area.encounters.get(marker.index).map(|o| (o.x, o.y, o.z, o.bearing)),
                                                         ObjectType::SoundEmitter => area.sound_emitters.get(marker.index).map(|o| (o.x, o.y, o.z, o.bearing)),
+                                                        ObjectType::Light => area.lights.get(marker.index).map(|o| (o.x, o.y, o.z, 0.0)),
                                                     };
                                                     if let Some((ox, oy, oz, ob)) = orig {
                                                         self.drag_state = Some(DragState {
@@ -3384,14 +3533,44 @@ impl eframe::App for AuroraBorealisApp {
                                     }
                                 }
                             } else {
-                                // Tile selection via ground pick
-                                if let Some(world) = self.viewport.pick_ground(vp_x, vp_y, vp_w, vp_h) {
-                                    if let Some(ref area) = self.current_area {
-                                        let tile_col = (world[0] / 10.0).floor() as usize;
-                                        let tile_row = (-world[2] / 10.0).floor() as usize;
-                                        if tile_col < area.width as usize && tile_row < area.height as usize {
-                                            self.selected_tile = Some((tile_col, tile_row));
-                                            self.status = format!("Selected tile ({}, {})", tile_col, tile_row);
+                                let ctrl_held = ctx.input(|i| i.modifiers.ctrl);
+                                // Click on empty ground — drag selected object, or select tile
+                                if let Some(ref info) = self.selected_obj_info {
+                                    if !ctrl_held && self.active_tool == Tool::Select {
+                                        if let Some(world) = self.viewport.pick_ground(vp_x, vp_y, vp_w, vp_h) {
+                                            if let Some(ref area) = self.current_area {
+                                                let orig = match info.0.as_str() {
+                                                    "creature" => area.creatures.get(info.1).map(|o| (o.x, o.y, o.z, o.bearing)),
+                                                    "door" => area.doors.get(info.1).map(|o| (o.x, o.y, o.z, o.bearing)),
+                                                    "placeable" => area.placeables.get(info.1).map(|o| (o.x, o.y, o.z, o.bearing)),
+                                                    "trigger" => area.triggers.get(info.1).map(|o| (o.x, o.y, o.z, o.bearing)),
+                                                    "waypoint" => area.waypoints.get(info.1).map(|o| (o.x, o.y, o.z, o.bearing)),
+                                                    "encounter" => area.encounters.get(info.1).map(|o| (o.x, o.y, o.z, o.bearing)),
+                                                    "sound_emitter" => area.sound_emitters.get(info.1).map(|o| (o.x, o.y, o.z, o.bearing)),
+                                                    _ => None,
+                                                };
+                                                if let Some((ox, oy, oz, ob)) = orig {
+                                                    self.drag_state = Some(DragState {
+                                                        obj_type: info.0.clone(),
+                                                        obj_idx: info.1,
+                                                        orig_x: ox, orig_y: oy, orig_z: oz, orig_bearing: ob,
+                                                        start_render_x: world[0],
+                                                        start_render_z: world[2],
+                                                    });
+                                                }
+                                            }
+                                        }
+                                    }
+                                } else {
+                                    // Tile selection via ground pick
+                                    if let Some(world) = self.viewport.pick_ground(vp_x, vp_y, vp_w, vp_h) {
+                                        if let Some(ref area) = self.current_area {
+                                            let tile_col = (world[0] / 10.0).floor() as usize;
+                                            let tile_row = (-world[2] / 10.0).floor() as usize;
+                                            if tile_col < area.width as usize && tile_row < area.height as usize {
+                                                self.selected_tile = Some((tile_col, tile_row));
+                                                self.status = format!("Selected tile ({}, {})", tile_col, tile_row);
+                                            }
                                         }
                                     }
                                 }
@@ -3426,9 +3605,8 @@ impl eframe::App for AuroraBorealisApp {
                                             "sound_emitter" => { if let Some(s) = area.sound_emitters.get_mut(drag.obj_idx) { s.x = new_x; s.y = new_y; } }
                                             _ => {}
                                         }
-                                        let area_clone = Arc::new(area.clone());
-                                        self.area_version = self.area_version.wrapping_add(1);
-                                        self.viewport.set_area(area_clone, self.area_version, target_format);
+                                        // Fast-path: update GPU instance buffer directly (no full scene rebuild)
+                                        self.viewport.set_object_transform(&drag.obj_type, drag.obj_idx, new_x, new_y, drag.orig_z, drag.orig_bearing);
                                     }
                                 }
                             }
@@ -3453,6 +3631,74 @@ impl eframe::App for AuroraBorealisApp {
                     }
                 }
 
+                // ── Space-bar hold-to-move (selected object follows cursor on ground) ──
+                let space_held = ctx.input(|i| i.keys_down.contains(&egui::Key::Space));
+                let space_released = ctx.input(|i| i.key_released(egui::Key::Space));
+                if space_released && self.space_move_active {
+                    self.space_move_active = false;
+                    // Commit position
+                    self.push_undo();
+                    if let Some(area) = self.current_area.as_mut() {
+                        let area = Arc::make_mut(area);
+                        let resref = area.resref.clone();
+                        if let Some(ref mut module) = self.module {
+                            module.update_area_git(&resref, area);
+                        }
+                        self.area_version = self.area_version.wrapping_add(1);
+                        self.viewport.set_area(Arc::new(area.clone()), self.area_version, target_format);
+                        self.status = "Moved with space".to_string();
+                    }
+                }
+                if space_held && is_hovered && !primary_down && self.drag_state.is_none()
+                    && !matches!(self.placement_state, PlacementState::Pending(..)) && self.active_tool == Tool::Select
+                {
+                    if let Some(ref info) = self.selected_obj_info {
+                        let cur_hover = ctx.input(|i| i.pointer.hover_pos());
+                        if let Some(pos) = cur_hover.filter(|p| rect.contains(*p)) {
+                            let vp_cx = pos.x - rect.left();
+                            let vp_cy = pos.y - rect.top();
+                            if let Some(world) = self.viewport.pick_ground(vp_cx, vp_cy, vp_w, vp_h) {
+                                let nwn_x = world[0];
+                                let nwn_y = -world[2];
+                                if let Some(area) = self.current_area.as_mut() {
+                                    let area = Arc::make_mut(area);
+                                    let bearing = match info.0.as_str() {
+                                        "creature" => area.creatures.get(info.1).map(|o| o.bearing),
+                                        "door" => area.doors.get(info.1).map(|o| o.bearing),
+                                        "placeable" => area.placeables.get(info.1).map(|o| o.bearing),
+                                        "trigger" => area.triggers.get(info.1).map(|o| o.bearing),
+                                        "waypoint" => area.waypoints.get(info.1).map(|o| o.bearing),
+                                        "encounter" => area.encounters.get(info.1).map(|o| o.bearing),
+                                        "sound_emitter" => area.sound_emitters.get(info.1).map(|o| o.bearing),
+                                        _ => None,
+                                    };
+                                    let z_pos = match info.0.as_str() {
+                                        "creature" => area.creatures.get(info.1).map(|o| o.z),
+                                        "door" => area.doors.get(info.1).map(|o| o.z),
+                                        "placeable" => area.placeables.get(info.1).map(|o| o.z),
+                                        _ => None,
+                                    };
+                                    if let Some(b) = bearing {
+                                        let z = z_pos.unwrap_or(0.0);
+                                        match info.0.as_str() {
+                                            "creature" => { if let Some(o) = area.creatures.get_mut(info.1) { o.x = nwn_x; o.y = nwn_y; } }
+                                            "door" => { if let Some(o) = area.doors.get_mut(info.1) { o.x = nwn_x; o.y = nwn_y; } }
+                                            "placeable" => { if let Some(o) = area.placeables.get_mut(info.1) { o.x = nwn_x; o.y = nwn_y; } }
+                                            "trigger" => { if let Some(o) = area.triggers.get_mut(info.1) { o.x = nwn_x; o.y = nwn_y; } }
+                                            "waypoint" => { if let Some(o) = area.waypoints.get_mut(info.1) { o.x = nwn_x; o.y = nwn_y; } }
+                                            "encounter" => { if let Some(o) = area.encounters.get_mut(info.1) { o.x = nwn_x; o.y = nwn_y; } }
+                                            "sound_emitter" => { if let Some(o) = area.sound_emitters.get_mut(info.1) { o.x = nwn_x; o.y = nwn_y; } }
+                                            _ => {}
+                                        }
+                                        self.viewport.set_object_transform(&info.0, info.1, nwn_x, nwn_y, z, b);
+                                        self.space_move_active = true;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
                 // Keyboard manipulation of selected object(s)
                 if is_hovered && self.selected_obj_info.is_some() && !matches!(self.placement_state, PlacementState::Pending(..)) {
                     let mut nudge_targets: Vec<(String, usize)> = self.selection_list.clone();
@@ -3472,8 +3718,9 @@ impl eframe::App for AuroraBorealisApp {
                         let down = i.keys_down.contains(&egui::Key::ArrowDown);
                         let q = i.keys_down.contains(&egui::Key::Q);
                         let e = i.keys_down.contains(&egui::Key::E);
+                        let r = i.keys_down.contains(&egui::Key::R);
                         let delete = i.key_pressed(egui::Key::Delete);
-                        (left, right, up, down, q, e, delete)
+                        (left, right, up, down, q, e, r, delete)
                     });
 
                     if keys.0 { nudge_x -= 1.0; }
@@ -3481,8 +3728,8 @@ impl eframe::App for AuroraBorealisApp {
                     if keys.2 { nudge_y += 1.0; }
                     if keys.3 { nudge_y -= 1.0; }
                     if keys.4 { rotate_delta -= 0.1; }
-                    if keys.5 { rotate_delta += 0.1; }
-                    if keys.6 { do_delete = true; }
+                    if keys.5 || keys.6 { rotate_delta += 0.1; }
+                    if keys.7 { do_delete = true; }
 
                     if nudge_x != 0.0 || nudge_y != 0.0 || rotate_delta != 0.0 || do_delete {
                         self.push_undo();
@@ -3519,42 +3766,45 @@ impl eframe::App for AuroraBorealisApp {
                                             if let Some(c) = area.creatures.get_mut(*i) {
                                                 c.x += nudge_x * speed; c.y += nudge_y * speed;
                                                 if do_snap { let (sx, sy) = snap_to_grid_pos(c.x, c.y, true, snap_val); c.x = sx; c.y = sy; }
-                                                c.bearing += rotate_delta; needs_update = true;
+                                                c.bearing = (c.bearing + rotate_delta).rem_euclid(std::f32::consts::TAU); needs_update = true;
+                                                self.viewport.set_object_transform(t, *i, c.x, c.y, c.z, c.bearing);
                                             }
                                         }
                                         "door" => {
                                             if let Some(d) = area.doors.get_mut(*i) {
                                                 d.x += nudge_x * speed; d.y += nudge_y * speed;
                                                 if do_snap { let (sx, sy) = snap_to_grid_pos(d.x, d.y, true, snap_val); d.x = sx; d.y = sy; }
-                                                d.bearing += rotate_delta; needs_update = true;
+                                                d.bearing = (d.bearing + rotate_delta).rem_euclid(std::f32::consts::TAU); needs_update = true;
+                                                self.viewport.set_object_transform(t, *i, d.x, d.y, d.z, d.bearing);
                                             }
                                         }
                                         "placeable" => {
                                             if let Some(p) = area.placeables.get_mut(*i) {
                                                 p.x += nudge_x * speed; p.y += nudge_y * speed;
                                                 if do_snap { let (sx, sy) = snap_to_grid_pos(p.x, p.y, true, snap_val); p.x = sx; p.y = sy; }
-                                                p.bearing += rotate_delta; needs_update = true;
+                                                p.bearing = (p.bearing + rotate_delta).rem_euclid(std::f32::consts::TAU); needs_update = true;
+                                                self.viewport.set_object_transform(t, *i, p.x, p.y, p.z, p.bearing);
                                             }
                                         }
                                         "trigger" => {
                                             if let Some(t) = area.triggers.get_mut(*i) {
                                                 t.x += nudge_x * speed; t.y += nudge_y * speed;
                                                 if do_snap { let (sx, sy) = snap_to_grid_pos(t.x, t.y, true, snap_val); t.x = sx; t.y = sy; }
-                                                t.bearing += rotate_delta; needs_update = true;
+                                                t.bearing = (t.bearing + rotate_delta).rem_euclid(std::f32::consts::TAU); needs_update = true;
                                             }
                                         }
                                         "waypoint" => {
                                             if let Some(w) = area.waypoints.get_mut(*i) {
                                                 w.x += nudge_x * speed; w.y += nudge_y * speed;
                                                 if do_snap { let (sx, sy) = snap_to_grid_pos(w.x, w.y, true, snap_val); w.x = sx; w.y = sy; }
-                                                w.bearing += rotate_delta; needs_update = true;
+                                                w.bearing = (w.bearing + rotate_delta).rem_euclid(std::f32::consts::TAU); needs_update = true;
                                             }
                                         }
                                         "encounter" => {
                                             if let Some(e) = area.encounters.get_mut(*i) {
                                                 e.x += nudge_x * speed; e.y += nudge_y * speed;
                                                 if do_snap { let (sx, sy) = snap_to_grid_pos(e.x, e.y, true, snap_val); e.x = sx; e.y = sy; }
-                                                e.bearing += rotate_delta; needs_update = true;
+                                                e.bearing = (e.bearing + rotate_delta).rem_euclid(std::f32::consts::TAU); needs_update = true;
                                             }
                                         }
                                         "sound_emitter" => {
@@ -3564,7 +3814,7 @@ impl eframe::App for AuroraBorealisApp {
                                                     let (sx, sy) = snap_to_grid_pos(s.x, s.y, true, self.snap_to_grid_value);
                                                     s.x = sx; s.y = sy;
                                                 }
-                                                s.bearing += rotate_delta;
+                                                s.bearing = (s.bearing + rotate_delta).rem_euclid(std::f32::consts::TAU);
                                             }
                                         }
                                         _ => {}
@@ -3580,6 +3830,18 @@ impl eframe::App for AuroraBorealisApp {
                             }
                         }
                     }
+                }
+
+                // Update green highlight on selected object
+                if let Some(ref info) = self.selected_obj_info {
+                    if let Some(ref area) = self.current_area {
+                        let highlight_pos = get_object_position(area, info);
+                        self.viewport.set_highlight_object(highlight_pos, 1.5);
+                    } else {
+                        self.viewport.set_highlight_object(None, 0.0);
+                    }
+                } else {
+                    self.viewport.set_highlight_object(None, 0.0);
                 }
 
                 let cb = egui_wgpu::Callback::new_paint_callback(rect, self.viewport.clone_arc());
@@ -3628,14 +3890,22 @@ impl eframe::App for AuroraBorealisApp {
             }
         });
 
-        // Cancel placement mode on Escape
-        if matches!(self.placement_state, PlacementState::Pending(..)) {
-            let esc = ctx.input(|i| i.key_pressed(egui::Key::Escape));
-            if esc {
+        // Escape cancels placement mode and resets tool to Select
+        let esc = ctx.input(|i| i.key_pressed(egui::Key::Escape));
+        if esc {
+            if matches!(self.placement_state, PlacementState::Pending(..)) {
                 self.placement_state = PlacementState::Inactive;
                 self.status = "Placement cancelled.".to_string();
             }
+            self.active_tool = Tool::Select;
         }
+
+        // Tool hotkeys 1-4
+        let pressed = |k| ctx.input(|i| i.key_pressed(k));
+        if pressed(egui::Key::Num1) { self.active_tool = Tool::Select; }
+        if pressed(egui::Key::Num2) { self.active_tool = Tool::TerrainRaise; }
+        if pressed(egui::Key::Num3) { self.active_tool = Tool::TerrainSmooth; }
+        if pressed(egui::Key::Num4) { self.active_tool = Tool::WalkmeshWall; }
 
         // Global keyboard shortcuts
         let ctrl_c = ctx.input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::C));
@@ -3670,6 +3940,14 @@ impl eframe::App for AuroraBorealisApp {
         });
 
         // ===================== POST-RENDER HANDLERS =====================
+        // Check NWSync result
+        if let Ok(mut r) = self.nwsync_result.lock() {
+            if let Some(msg) = r.take() {
+                self.status = msg;
+                self.nwsync_busy = false;
+            }
+        }
+
         // Handle module properties save
         if module_props_changed {
             if let Some(ref mut module) = self.module {
@@ -3994,19 +4272,28 @@ impl eframe::App for AuroraBorealisApp {
                     ui.horizontal(|ui| {
                         ui.label("ResRef:");
                         if !two_da_name.is_empty() && !self.new_object_blueprints.is_empty() {
-                            ui.text_edit_singleline(&mut self.new_object_filter);
-                            egui::ScrollArea::vertical().max_height(150.0).show(ui, |ui| {
-                                let filter = self.new_object_filter.to_lowercase();
-                                for (row_label, name) in &self.new_object_blueprints {
-                                    if !filter.is_empty() && !row_label.to_lowercase().contains(&filter) && !name.to_lowercase().contains(&filter) {
-                                        continue;
+                            let current = if self.new_object_resref.is_empty() {
+                                "Select...".to_string()
+                            } else {
+                                format!("{} ({})", self.new_object_resref, self.new_object_blueprints.iter()
+                                    .find(|(r, _)| r == &self.new_object_resref)
+                                    .map(|(_, n)| n.as_str())
+                                    .unwrap_or(""))
+                            };
+                            egui::ComboBox::from_id_salt("new_obj_resref")
+                                .selected_text(&current)
+                                .show_ui(ui, |ui| {
+                                    let filter = self.new_object_filter.to_lowercase();
+                                    for (row_label, name) in &self.new_object_blueprints {
+                                        if !filter.is_empty() && !row_label.to_lowercase().contains(&filter) && !name.to_lowercase().contains(&filter) {
+                                            continue;
+                                        }
+                                        let display = format!("{} ({})", name, row_label);
+                                        if ui.selectable_label(self.new_object_resref == *row_label, &display).clicked() {
+                                            self.new_object_resref = row_label.clone();
+                                        }
                                     }
-                                    let display = format!("{} ({})", name, row_label);
-                                    if ui.selectable_label(self.new_object_resref == *row_label, &display).clicked() {
-                                        self.new_object_resref = row_label.clone();
-                                    }
-                                }
-                            });
+                                });
                         } else {
                             ui.text_edit_singleline(&mut self.new_object_resref);
                         }
@@ -4134,45 +4421,96 @@ impl eframe::App for AuroraBorealisApp {
         // ===================== EDITOR WINDOWS =====================
         // Faction Editor
         if self.faction_editor_open {
-            let mut faction_list: Option<FactionList> = Some(self.faction_list.clone());
+            let mut faction_list: Option<FactionList> = None;
+            let mut do_save = false;
+            let mut do_close = false;
             egui::Window::new("Faction Editor")
                 .default_size([500.0, 400.0])
                 .open(&mut self.faction_editor_open)
                 .show(ctx, |ui| {
                     let erf = self.module.as_ref().and_then(|m| m.erf.as_ref());
-                    crate::faction_editor::show_faction_editor(ui, erf, &mut faction_list);
+                    let _ = crate::faction_editor::show_faction_editor(ui, erf, &mut faction_list);
+                    ui.separator();
+                    ui.horizontal(|ui| {
+                        if ui.button("Save").clicked() {
+                            do_save = true;
+                        }
+                        if ui.button("Close").clicked() {
+                            do_close = true;
+                        }
+                    });
                 });
-            if let Some(fl) = faction_list {
-                self.faction_list = fl;
+            if do_close {
+                self.faction_editor_open = false;
+            }
+            if let Some(fl) = &faction_list {
+                self.faction_list = fl.clone();
+                if do_save || !self.faction_editor_open {
+                    let gff = fl.to_gff();
+                    let data = gff.to_bytes();
+                    if let Some(ref mut module) = self.module {
+                        module.update_fac(data);
+                        self.status = "Faction data saved to module.".to_string();
+                    }
+                }
             }
         }
         // Journal Editor
         if self.journal_editor_open {
             let mut journal = self.module.as_ref().and_then(|m| {
-                let data = m.erf.as_ref()?.get("journal", nwn_gamemodel::resource_types::JRL)?;
+                let erf = m.erf.as_ref()?;
+                let data = erf.get("journal", nwn_gamemodel::resource_types::JRL)
+                    .or_else(|| erf.get("Journal", nwn_gamemodel::resource_types::JRL))
+                    .or_else(|| erf.get("module", nwn_gamemodel::resource_types::JRL))
+                    .or_else(|| erf.get("Module", nwn_gamemodel::resource_types::JRL))?;
                 let gff = nwn_gff::GffFile::from_bytes(&data).ok()?;
                 nwn_gamemodel::Journal::from_gff(&gff).ok()
             });
+            let mut do_save = false;
+            let mut do_close = false;
             egui::Window::new("Journal Editor")
                 .default_size([500.0, 400.0])
                 .open(&mut self.journal_editor_open)
                 .show(ctx, |ui| {
-                    crate::journal_editor::show_journal_editor(ui, &mut journal);
+                    let modified = crate::journal_editor::show_journal_editor(ui, &mut journal);
+                    ui.separator();
+                    ui.horizontal(|ui| {
+                        if ui.add_enabled(modified, egui::Button::new("Save")).clicked() {
+                            do_save = true;
+                        }
+                        if ui.button("Close").clicked() {
+                            do_close = true;
+                        }
+                    });
                 });
+            if do_close {
+                self.journal_editor_open = false;
+            }
+            if (do_save || !self.journal_editor_open) && self.module.is_some() {
+                if let Some(j) = &mut journal {
+                    let gff = j.to_gff();
+                    let data = gff.to_bytes();
+                    self.module.as_mut().unwrap().update_jrl(data);
+                    self.status = "Journal data saved to module.".to_string();
+                }
+            }
         }
         // Encounter Editor
         if self.encounter_editor_open {
             let mut do_save = false;
+            let mut enc_selected: Option<usize> = None;
+            std::mem::swap(&mut enc_selected, &mut self.encounter_editor_selected);
             egui::Window::new("Encounter Editor")
                 .default_size([600.0, 450.0])
                 .open(&mut self.encounter_editor_open)
                 .show(ctx, |ui| {
                     if let Some(ref mut area) = self.current_area {
-                        crate::encounter_editor::show_encounter_editor(ui, &mut Arc::make_mut(area).encounters, &mut do_save);
+                        crate::encounter_editor::show_encounter_editor(ui, &mut Arc::make_mut(area).encounters, &mut do_save, &mut enc_selected);
                     } else {
                         ui.label("No area loaded.");
                     }
                 });
+            self.encounter_editor_selected = enc_selected;
             if do_save {
                 if let Some(ref area) = self.current_area {
                     let resref = area.resref.clone();
@@ -4259,26 +4597,18 @@ impl eframe::App for AuroraBorealisApp {
                                 }
                             }
                             if self.icons.icon_button(ui, "eye-target", "Appearance Picker", 20.0).clicked() {
-                                let appearances = self.module.as_ref().and_then(|m| m.erf.as_ref()).and_then(|erf| {
-                                    erf.get("appearance", nwn_gamemodel::resource_types::TWO_DA).and_then(|data| {
-                                        let text = String::from_utf8(data.clone()).ok()?;
-                                        let mut entries = Vec::new();
-                                        for line in text.lines() {
-                                            let trimmed = line.trim();
-                                            if trimmed.is_empty() || trimmed.starts_with('#') || trimmed.starts_with("2DA V2") { continue; }
-                                            let parts: Vec<&str> = trimmed.split(|c| c == '\t' || c == ' ').filter(|s| !s.is_empty()).collect();
-                                            if parts.len() >= 2 {
-                                                if let Ok(id) = parts[0].parse::<i32>() {
-                                                    if id > 0 {
-                                                        let label = if parts.len() > 1 { parts[1].to_string() } else { String::new() };
-                                                        let model = if parts.len() > 2 { parts[2].to_string() } else { String::new() };
-                                                        entries.push(AppearanceEntry { id, label, model });
-                                                    }
-                                                }
-                                            }
+                                let appearances = self.module.as_ref().and_then(|m| {
+                                    let two_da = m.resource_manager.get_2da("appearance")?;
+                                    let mut entries = Vec::new();
+                                    for i in 0..two_da.row_count() {
+                                        let id = i as i32;
+                                        if id > 0 {
+                                            let label = two_da.get_cell_by_label(i, "Label").unwrap_or("").to_string();
+                                            let model = two_da.get_cell_by_label(i, "Model").unwrap_or("").to_string();
+                                            entries.push(AppearanceEntry { id, label, model });
                                         }
-                                        Some(entries)
-                                    })
+                                    }
+                                    Some(entries)
                                 }).unwrap_or_default();
                                 self.appearance_picker = Some(AppearancePickerState {
                                     obj_type: obj_type.clone(),
@@ -4367,14 +4697,14 @@ impl AuroraBorealisApp {
         {
             let path = _p;
             match nwn_gamemodel::Module::open(path) {
-                Ok(module) => {
+                Ok(mut module) => {
                     let area_count = module.num_areas();
                     let module_name = module.name.clone();
+                    // Load hak 2DAs into resource manager for blueprint palette
+                    module.load_hak_2das();
                     // Store module data for model loading
-                    self.module_data = std::fs::read(path).ok();
-                    if let Some(ref data) = self.module_data {
-                        self.viewport.set_module_erf(Some(data.clone()));
-                    }
+                    let data = std::fs::read(path).ok();
+                    self.viewport.set_module_erf(data);
                     self.viewport.set_hak_info(
                         Some(std::path::Path::new(path).parent().unwrap_or(std::path::Path::new(".")).to_path_buf()),
                         module.haks.clone(),
@@ -4386,6 +4716,7 @@ impl AuroraBorealisApp {
                     self.selected_object = None;
                     self.selected_obj_info = None;
                     self.selection_list.clear();
+                    self.new_object_blueprints.clear();
                     self.status = format!("Loaded module '{}' with {} areas.", module_name, area_count);
                 }
                 Err(nwn_gamemodel::ModelError::MissingHaks(haks)) => {
@@ -4406,11 +4737,12 @@ impl AuroraBorealisApp {
     #[allow(dead_code)]
     fn load_module_from_bytes(&mut self, data: &[u8]) {
         match nwn_gamemodel::Module::from_bytes(data) {
-            Ok(module) => {
+            Ok(mut module) => {
                 let area_count = module.num_areas();
                 let module_name = module.name.clone();
-                self.module_data = Some(data.to_vec());
+                module.load_hak_2das();
                 self.viewport.set_module_erf(Some(data.to_vec()));
+
                 self.module = Some(module);
                 self.current_area = None;
                 self.open_areas.clear();
@@ -4419,6 +4751,7 @@ impl AuroraBorealisApp {
                 self.selected_obj_info = None;
                 self.undo_stack.clear();
                 self.redo_stack.clear();
+                self.new_object_blueprints.clear();
                 self.status = format!("Loaded module '{}' with {} areas.", module_name, area_count);
             }
             Err(nwn_gamemodel::ModelError::MissingHaks(haks)) => {
@@ -4605,7 +4938,7 @@ impl AuroraBorealisApp {
     fn push_undo(&mut self) {
         if let Some(ref area) = self.current_area {
             self.undo_stack.push(Arc::new(area.as_ref().clone()));
-            if self.undo_stack.len() > 50 {
+            if self.undo_stack.len() > 20 {
                 self.undo_stack.remove(0);
             }
             self.redo_stack.clear();
@@ -4715,6 +5048,7 @@ impl AuroraBorealisApp {
             show_waypoints: self.show_waypoints,
             show_encounters: self.show_encounters,
             show_sound_emitters: self.show_sound_emitters,
+            show_lights: self.show_lights,
         };
         self.viewport.set_visibility_filter(filter);
         if let Some(ref area) = self.current_area {
@@ -5162,6 +5496,7 @@ fn git_struct_id(obj_type: &str) -> u32 {
         "waypoint" => 8,
         "encounter" => 9,
         "sound_emitter" => 10,
+        "light" => 11,
         _ => 0,
     }
 }
@@ -5175,6 +5510,7 @@ fn git_list_name(obj_type: &str) -> &'static str {
         "waypoint" => "WaypointList",
         "encounter" => "Encounter_List",
         "sound_emitter" => "SoundList",
+        "light" => "LightList",
         _ => "",
     }
 }
@@ -5195,6 +5531,7 @@ fn select_single_object(
         "waypoint" => area.waypoints.get(idx).map(|w| (format!("Waypoint: {}", w.tag), w.to_property_bag())),
         "encounter" => area.encounters.get(idx).map(|e| (format!("Encounter: {}", e.name), e.to_property_bag())),
         "sound_emitter" => area.sound_emitters.get(idx).map(|s| (format!("Sound: {}", s.tag), s.to_property_bag())),
+        "light" => area.lights.get(idx).map(|l| (format!("Light: {}", l.tag), LightInstance::to_property_bag(l))),
         _ => None,
     };
     if let Some((title, bag)) = bag {
@@ -5209,6 +5546,22 @@ fn select_single_object(
         *selected_object = Some(SelectedObject { title, bag: full_bag.unwrap_or(bag) });
         *selected_obj_info = Some((obj_type.to_string(), idx));
     }
+}
+
+/// Returns the world position (renderer space) of a selected object, or None.
+fn get_object_position(area: &nwn_gamemodel::Area, info: &(String, usize)) -> Option<[f32; 3]> {
+    let pos = match info.0.as_str() {
+        "creature" => area.creatures.get(info.1).map(|c| (c.x, c.y, c.z)),
+        "door" => area.doors.get(info.1).map(|d| (d.x, d.y, d.z)),
+        "placeable" => area.placeables.get(info.1).map(|p| (p.x, p.y, p.z)),
+        "trigger" => area.triggers.get(info.1).map(|t| (t.x, t.y, t.z)),
+        "waypoint" => area.waypoints.get(info.1).map(|w| (w.x, w.y, w.z)),
+        "encounter" => area.encounters.get(info.1).map(|e| (e.x, e.y, e.z)),
+        "sound_emitter" => area.sound_emitters.get(info.1).map(|s| (s.x, s.y, s.z)),
+        "light" => area.lights.get(info.1).map(|l| (l.x, l.y, l.z)),
+        _ => None,
+    };
+    pos.map(|(x, y, z)| [x, z, -y])
 }
 
 fn save_bag_to_git(module: &mut nwn_gamemodel::Module, area_resref: &str, obj_type: &str, idx: usize, bag: &PropertyBag) -> bool {
@@ -5290,6 +5643,11 @@ fn do_find_replace(
 pub fn run_native() {
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default().with_inner_size([1400.0, 900.0]),
+        wgpu_options: egui_wgpu::WgpuConfiguration {
+            desired_maximum_frame_latency: Some(3),
+            present_mode: wgpu::PresentMode::AutoNoVsync,
+            ..Default::default()
+        },
         ..Default::default()
     };
     if let Err(e) = eframe::run_native(

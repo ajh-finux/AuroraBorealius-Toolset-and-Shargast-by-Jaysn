@@ -15,14 +15,29 @@ pub fn show_faction_editor(ui: &mut egui::Ui, erf: Option<&nwn_erf::ErfFile>, li
 
     // Load faction data once
     if list.is_none() {
-        *list = erf.and_then(|erf| {
+        if let Some(erf) = erf {
             let fac = erf.get("faction", nwn_gamemodel::resource_types::FAC)
                 .or_else(|| erf.get("Faction", nwn_gamemodel::resource_types::FAC))
                 .or_else(|| erf.get("factions", nwn_gamemodel::resource_types::FAC))
-                .or_else(|| erf.get("Factions", nwn_gamemodel::resource_types::FAC))?;
-            let gff = nwn_gff::GffFile::from_bytes(&fac).ok()?;
-            FactionList::from_gff(&gff).ok()
-        });
+                .or_else(|| erf.get("Factions", nwn_gamemodel::resource_types::FAC))
+                .or_else(|| erf.get("repute", nwn_gamemodel::resource_types::FAC))
+                .or_else(|| erf.get("Repute", nwn_gamemodel::resource_types::FAC));
+            if let Some(data) = fac {
+                if let Ok(gff) = nwn_gff::GffFile::from_bytes(&data) {
+                    if let Ok(fl) = FactionList::from_gff(&gff) {
+                        *list = Some(fl);
+                    } else {
+                        ui.colored_label(egui::Color32::RED, "Failed to parse faction GFF.");
+                    }
+                } else {
+                    ui.colored_label(egui::Color32::RED, "Failed to parse faction GFF file.");
+                }
+            } else {
+                ui.label("No faction resource (faction.fac) found in ERF.");
+            }
+        } else {
+            ui.colored_label(egui::Color32::RED, "No ERF data available.");
+        }
     }
 
     let mut modified = false;

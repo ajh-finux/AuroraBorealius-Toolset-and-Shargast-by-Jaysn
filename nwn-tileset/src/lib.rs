@@ -71,11 +71,47 @@ pub fn game_data_dir() -> Option<std::path::PathBuf> {
 
 /// Global cache for game data (KEY/BIF) resources — avoids re-reading on disk misses.
 /// Key is format `"{resref_lower}:{restype}"`, caches the raw bytes once loaded.
-static GAME_DATA_CACHE: std::sync::OnceLock<Mutex<HashMap<String, Option<Vec<u8>>>>> =
+/// Clears entirely when total cached bytes exceed the limit (~256 MB).
+struct BoundedGameDataCache {
+    map: HashMap<String, Option<Vec<u8>>>,
+    total_bytes: usize,
+    max_bytes: usize,
+}
+
+impl BoundedGameDataCache {
+    fn new(max_bytes: usize) -> Self {
+        Self { map: HashMap::new(), total_bytes: 0, max_bytes }
+    }
+
+    fn get(&self, key: &str) -> Option<&Option<Vec<u8>>> {
+        self.map.get(key)
+    }
+
+    fn insert(&mut self, key: String, value: Option<Vec<u8>>) {
+        let size = value.as_ref().map(|v| v.len()).unwrap_or(0);
+        // If the key already exists, subtract its old size first
+        if let Some(old_val) = self.map.get(&key) {
+            if let Some(v) = old_val {
+                self.total_bytes = self.total_bytes.saturating_sub(v.len());
+            }
+        }
+        // Clear entire cache if adding this would exceed the limit
+        if self.total_bytes + size > self.max_bytes {
+            self.map.clear();
+            self.total_bytes = 0;
+        }
+        self.total_bytes += size;
+        self.map.insert(key, value);
+    }
+}
+
+static GAME_DATA_CACHE: std::sync::OnceLock<Mutex<BoundedGameDataCache>> =
     std::sync::OnceLock::new();
 
-fn game_data_cache() -> &'static Mutex<HashMap<String, Option<Vec<u8>>>> {
-    GAME_DATA_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+const GAME_DATA_CACHE_MAX_BYTES: usize = 256 * 1024 * 1024; // 256 MB
+
+fn game_data_cache() -> &'static Mutex<BoundedGameDataCache> {
+    GAME_DATA_CACHE.get_or_init(|| Mutex::new(BoundedGameDataCache::new(GAME_DATA_CACHE_MAX_BYTES)))
 }
 
 fn cache_key(resref: &ResRef) -> String {
@@ -300,6 +336,16 @@ pub fn load_model_meshes_from_data(model_name: &str, data: &[u8]) -> Result<Opti
 
     let mut groups: Vec<TexGroup> = Vec::new();
 
+    // First pass: check if any primitive in this model has a texture reference.
+    // If at least one does, then None-textured primitives are truly vertex-colored.
+    // If none do, they may be creature models whose texture name was filtered out
+    // by normalize_texture_name (e.g. c_basilisk texture0 = "c_basilisk" matching a node name).
+    let any_textured = baked.meshes.iter().flat_map(|m| &m.primitives).any(|prim| {
+        prim.texture_names.first().is_some()
+            || prim.material.and_then(|mi| baked.materials.get(mi))
+                .is_some_and(|mat| !mat.textures.is_empty())
+    });
+
     for mesh in &baked.meshes {
         // Skip AABB walkmesh/collision geometry
         if let Some(node) = baked.nodes.get(mesh.source_node) {
@@ -316,6 +362,11 @@ pub fn load_model_meshes_from_data(model_name: &str, data: &[u8]) -> Result<Opti
                         .and_then(|mat| mat.textures.first().map(|t| t.name.clone()))
                 })
             });
+            // NWN convention: "None" means vertex colors only, no texture
+            let mut tex_name = tex_name.filter(|n| n.to_ascii_lowercase() != "none");
+            if tex_name.is_none() && !any_textured {
+                tex_name = Some(model_name.to_string());
+            }
 
             // Find or create group for this texture
             let gidx = groups.iter().position(|g| g.texture_name == tex_name);
@@ -533,6 +584,13 @@ pub fn decode_texture_data(res_type: u16, data: &[u8]) -> Option<TextureData> {
                 return Some(tex);
             }
         }
+        6 => {
+            if let Ok(plt) = nwnrs_types::plt::PltTexture::read_from_texture_bytes(data) {
+                if let Ok(rgba) = plt.render_rgba8(&nwnrs_types::plt::PltRenderSpec::default()) {
+                    return Some(TextureData { width: plt.width, height: plt.height, rgba });
+                }
+            }
+        }
         _ => {}
     }
     None
@@ -544,7 +602,7 @@ fn load_texture_by_name(name: &str, lookup: &dyn Fn(&nwnrs_types::resman::ResRef
         .replace(".dds", "").replace(".tga", "").replace(".bmp", "")
         .replace(" ", "_").replace("-", "_");
 
-    for res_type in &[8u16, 3u16, 1u16] {
+    for res_type in &[8u16, 3u16, 1u16, 6u16] {
         let resref = nwnrs_types::resman::ResRef::new(name_lower.clone(), nwnrs_types::resman::ResType(*res_type)).ok()?;
         if let Some(data) = lookup(&resref) {
             if let Some(tex) = decode_texture_data(*res_type, &data) {
@@ -613,7 +671,7 @@ fn load_texture_from_erf(texture_name: &str, erf: &nwn_erf::ErfFile) -> Option<T
         .replace(".dds", "").replace(".tga", "").replace(".bmp", "")
         .replace(" ", "_").replace("-", "_");
 
-    for &res_type in &[8u16, 3u16, 1u16] {
+    for &res_type in &[8u16, 3u16, 1u16, 6u16] {
         if let Some(data) = erf.get(&name, res_type) {
             if let Some(tex) = decode_texture_data(res_type, &data) {
                 return Some(tex);
@@ -802,7 +860,7 @@ pub fn parse_2da_value(text: &str, row: i32, column_label: &str) -> Option<Strin
     let mut first_meta = None;
     for line in &mut lines {
         let trimmed = line.trim();
-        if trimmed.is_empty() || trimmed.starts_with('#') { continue; }
+        if trimmed.is_empty() || trimmed.starts_with('#') || trimmed.starts_with("//") { continue; }
         headers = trimmed.split(|c| c == '\t' || c == ' ').filter(|s| !s.is_empty()).collect();
         first_meta = Some(trimmed);
         break;
@@ -816,7 +874,7 @@ pub fn parse_2da_value(text: &str, row: i32, column_label: &str) -> Option<Strin
     let target = format!("{}", row);
     for line in lines {
         let trimmed = line.trim();
-        if trimmed.is_empty() || trimmed.starts_with('#') { continue; }
+        if trimmed.is_empty() || trimmed.starts_with('#') || trimmed.starts_with("//") { continue; }
         let parts: Vec<&str> = trimmed.split(|c| c == '\t' || c == ' ').filter(|s| !s.is_empty()).collect();
         if parts.is_empty() { continue; }
         if parts[0] == target {
@@ -839,7 +897,7 @@ fn parse_2da_all_rows(text: &str, column_label: &str, results: &mut Vec<(String,
     let mut first_meta = None;
     for line in &mut lines {
         let trimmed = line.trim();
-        if trimmed.is_empty() || trimmed.starts_with('#') { continue; }
+        if trimmed.is_empty() || trimmed.starts_with('#') || trimmed.starts_with("//") { continue; }
         headers = trimmed.split(|c| c == '\t' || c == ' ').filter(|s| !s.is_empty()).collect();
         first_meta = Some(trimmed);
         break;
@@ -852,7 +910,7 @@ fn parse_2da_all_rows(text: &str, column_label: &str, results: &mut Vec<(String,
 
     for line in lines {
         let trimmed = line.trim();
-        if trimmed.is_empty() || trimmed.starts_with('#') { continue; }
+        if trimmed.is_empty() || trimmed.starts_with('#') || trimmed.starts_with("//") { continue; }
         let parts: Vec<&str> = trimmed.split(|c| c == '\t' || c == ' ').filter(|s| !s.is_empty()).collect();
         if parts.is_empty() { continue; }
         let row_label = parts[0];
@@ -968,6 +1026,13 @@ impl HakIndex {
     /// Returns all hak names that contain the given resource, in priority order.
     pub fn find_haks(&self, resref: &str, restype: u16) -> Option<&[String]> {
         self.lookup.get(&(resref.to_lowercase(), restype)).map(|v| v.as_slice())
+    }
+
+    /// Returns all unique (resref, restype) pairs known to the hak index.
+    pub fn all_resources(&self) -> Vec<(String, u16)> {
+        let mut v: Vec<(String, u16)> = self.lookup.keys().map(|(r, t)| (r.clone(), *t)).collect();
+        v.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+        v
     }
 
     /// Try to load a resource from a specific hak file, searching all known paths.

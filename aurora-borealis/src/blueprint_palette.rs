@@ -58,8 +58,8 @@ pub fn show_blueprint_palette(ui: &mut egui::Ui, rm: &ResourceManager, on_place:
             });
         });
 
-    section_with_search(ui, "Creatures", rm, "creatures", "creature", "Label", "Name", on_place);
+    section_with_search(ui, "Creatures", rm, "appearance", "creature", "Label", "Name", on_place);
     section_with_search(ui, "Placeables", rm, "placeables", "placeable", "Label", "Name", on_place);
-    section_with_search(ui, "Doors", rm, "doors", "door", "Label", "Name", on_place);
-    section_with_search(ui, "Items", rm, "items", "item", "Label", "Name", on_place);
+    section_with_search(ui, "Doors", rm, "doortypes", "door", "Label", "Name", on_place);
+    section_with_search(ui, "Items", rm, "baseitems", "item", "Label", "Name", on_place);
 }

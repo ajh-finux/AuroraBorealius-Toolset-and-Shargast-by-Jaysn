@@ -6,9 +6,8 @@ pub fn show_encounter_editor(
     ui: &mut egui::Ui,
     area_encounters: &mut Vec<EncounterInstance>,
     on_save: &mut bool,
+    selected_idx: &mut Option<usize>,
 ) {
-    let mut selected_idx = None;
-
     egui::SidePanel::left("encounter_list")
         .resizable(true)
         .default_width(220.0)
@@ -52,8 +51,8 @@ pub fn show_encounter_editor(
                     enc.tag.clone()
                 };
                 ui.horizontal(|ui| {
-                    if ui.selectable_label(selected_idx == Some(i), &label).clicked() {
-                        selected_idx = Some(i);
+                    if ui.selectable_label(*selected_idx == Some(i), &label).clicked() {
+                        *selected_idx = Some(i);
                     }
                     if ui.button("🗑").clicked() {
                         delete_idx = Some(i);
@@ -68,8 +67,8 @@ pub fn show_encounter_editor(
 
     egui::CentralPanel::default().show_inside(ui, |ui| {
         if let Some(idx) = selected_idx {
-            if idx < area_encounters.len() {
-                let enc = &mut area_encounters[idx];
+            if *idx < area_encounters.len() {
+                let enc = &mut area_encounters[*idx];
                 egui::ScrollArea::vertical().show(ui, |ui| {
                     ui.heading(format!("Encounter: {}", enc.tag));
                     ui.separator();
