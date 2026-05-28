@@ -26,12 +26,22 @@ struct GroupResources {
     texture_slot: usize,
 }
 
+struct SpriteInfo {
+    x: f32, y: f32, z: f32,
+}
+
+struct SpriteBatch {
+    texture_slot: usize,
+    start_instance: u32,
+    num_instances: u32,
+}
+
 pub struct ViewportState {
     pub camera: OrbitCamera,
     pub area_version: u64,
     pub markers: Vec<MarkerInfo>,
     pub tile_count: usize,
-    color_format: wgpu::TextureFormat,
+    pub color_format: wgpu::TextureFormat,
     marker_idx_count: u32,
     pub draw_calls: usize,
     pub group_count: usize,
@@ -93,6 +103,14 @@ pub struct ViewportState {
     fog_clip_dist: f32,
     ambient_color: [f32; 3],
     diffuse_color: [f32; 3],
+
+    // Sprite / billboard icons
+    sprites: Vec<SpriteInfo>,
+    sprite_batches: Vec<SpriteBatch>,
+    sprite_quad_vbuf: wgpu::Buffer,
+    sprite_quad_ibuf: wgpu::Buffer,
+    sprite_instance_buf: wgpu::Buffer,
+    show_sprites: bool,
 }
 
 fn load_texture(name: &str, module_erf: Option<&nwn_erf::ErfFile>, hak_index: Option<&nwn_tileset::HakIndex>, mod_path: Option<&Path>, _hak_names: &[String]) -> Option<(u32, u32, Vec<u8>)> {
@@ -249,6 +267,76 @@ impl ViewportState {
         let draw_calls = instanced.instance_data.iter().filter(|v| !v.is_empty()).count() + 1;
         let group_count = instanced.instance_data.len();
 
+        // --- Sprite / billboard icon setup ---
+        let sprite_icon_names: Vec<Option<&str>> = markers_result.markers.iter()
+            .map(|m| tile_renderer::object_type_icon(m.obj_type))
+            .collect();
+        // Deduplicate icon names, preserving order
+        let mut sprite_icon_set: Vec<&str> = Vec::new();
+        for icon in sprite_icon_names.iter().flatten() {
+            if !sprite_icon_set.contains(icon) {
+                sprite_icon_set.push(icon);
+            }
+        }
+        // Load icon textures from game data
+        let sprite_icon_slot: std::collections::HashMap<&str, usize> = sprite_icon_set.iter().enumerate()
+            .map(|(i, name)| (*name, i))
+            .collect();
+        let sprite_icon_tex_data: Vec<Option<(u32, u32, Vec<u8>)>> = sprite_icon_set.iter()
+            .map(|name| match nwn_tileset::load_texture_data(name) {
+                Ok(Some(d)) => Some((d.width, d.height, d.rgba)),
+                _ => None,
+            })
+            .collect();
+        // Build sprite info list + batches
+        let mut sprites: Vec<SpriteInfo> = Vec::new();
+        let mut sprite_batches: Vec<SpriteBatch> = Vec::new();
+        {
+            // Group sprite indices by icon
+            let mut by_icon: std::collections::HashMap<&str, Vec<usize>> = std::collections::HashMap::new();
+            for (mi, icon) in sprite_icon_names.iter().enumerate() {
+                if let Some(name) = icon {
+                    let idx = sprites.len();
+                    let m = &markers_result.markers[mi];
+                    sprites.push(SpriteInfo { x: m.x, y: m.y, z: m.z });
+                    by_icon.entry(name).or_default().push(idx);
+                }
+            }
+            let mut start = 0u32;
+            for (name, indices) in &by_icon {
+                let slot = sprite_icon_slot.get(name).copied().unwrap_or(0);
+                sprite_batches.push(SpriteBatch {
+                    texture_slot: slot,
+                    start_instance: start,
+                    num_instances: indices.len() as u32,
+                });
+                start += indices.len() as u32;
+            }
+        }
+        let total_sprites = sprites.len();
+        // Unit quad for billboards
+        let sprite_quad_vbuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("nwn3d_sprite_quad_vbuf"),
+            contents: bytemuck::cast_slice(&[
+                -0.5f32, -0.5f32, 0.0f32,  0.0, 0.0, 1.0,  0.0, 1.0,  1.0, 1.0, 1.0, 1.0,
+                 0.5f32, -0.5f32, 0.0f32,  0.0, 0.0, 1.0,  1.0, 1.0,  1.0, 1.0, 1.0, 1.0,
+                 0.5f32,  0.5f32, 0.0f32,  0.0, 0.0, 1.0,  1.0, 0.0,  1.0, 1.0, 1.0, 1.0,
+                -0.5f32,  0.5f32, 0.0f32,  0.0, 0.0, 1.0,  0.0, 0.0,  1.0, 1.0, 1.0, 1.0,
+            ]),
+            usage: wgpu::BufferUsages::VERTEX,
+        });
+        let sprite_quad_ibuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("nwn3d_sprite_quad_ibuf"),
+            contents: bytemuck::cast_slice(&[0u32, 1, 2, 0, 2, 3]),
+            usage: wgpu::BufferUsages::INDEX,
+        });
+        let sprite_instance_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("nwn3d_sprite_instance_buf"),
+            size: (total_sprites.max(1) as u64) * 64, // 64 bytes per InstanceData
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
         // Collect unique texture names from models
         let mut tex_names: Vec<String> = Vec::new();
         for m in &instanced.models {
@@ -362,6 +450,42 @@ impl ViewportState {
             bind_group: None,
             pending: None,
         });
+
+        // Append sprite icon texture slots (after fallback [0] + tile textures)
+        let sprite_slot_start = texture_slots.len();
+        for (i, name) in sprite_icon_set.iter().enumerate() {
+            let (w, h) = sprite_icon_tex_data[i].as_ref().map(|d| (d.0, d.1)).unwrap_or((2, 2));
+            let tex = device.create_texture(&wgpu::TextureDescriptor {
+                label: Some(&format!("nwn3d_sprite_tex_{name}")),
+                size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Rgba8UnormSrgb,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                view_formats: &[],
+            });
+            texture_slots.push(TextureSlot {
+                view: tex.create_view(&wgpu::TextureViewDescriptor::default()),
+                sampler: device.create_sampler(&wgpu::SamplerDescriptor {
+                    label: Some("nwn3d_sprite_sampler"),
+                    address_mode_u: wgpu::AddressMode::ClampToEdge,
+                    address_mode_v: wgpu::AddressMode::ClampToEdge,
+                    address_mode_w: wgpu::AddressMode::ClampToEdge,
+                    mag_filter: wgpu::FilterMode::Linear,
+                    min_filter: wgpu::FilterMode::Linear,
+                    mipmap_filter: wgpu::FilterMode::Linear,
+                    ..Default::default()
+                }),
+                texture: tex,
+                bind_group: None,
+                pending: sprite_icon_tex_data[i].clone(),
+            });
+        }
+        // Fix up sprite batch texture slots
+        for batch in &mut sprite_batches {
+            batch.texture_slot = sprite_slot_start + batch.texture_slot;
+        }
 
         let uniform_bind_group_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -649,6 +773,13 @@ impl ViewportState {
                 area.sun_diffuse_color[1] as f32 / 255.0,
                 area.sun_diffuse_color[2] as f32 / 255.0,
             ],
+
+            sprites,
+            sprite_batches,
+            sprite_quad_vbuf,
+            sprite_quad_ibuf,
+            sprite_instance_buf,
+            show_sprites: true,
         }
     }
 
@@ -773,6 +904,25 @@ impl ViewportState {
         queue.write_buffer(&self.uniform_buf, 128, bytemuck::cast_slice(&self.diffuse_color));
     }
 
+    pub fn update_sprite_instances(&self, queue: &wgpu::Queue) {
+        if !self.show_sprites || self.sprites.is_empty() {
+            return;
+        }
+        let sprite_size = 0.8;
+        let (right, up_vec) = self.camera.right_up();
+
+        let mut instances = Vec::with_capacity(self.sprites.len());
+        for sp in &self.sprites {
+            instances.push(tile_renderer::InstanceData {
+                row0: [right[0] * sprite_size, right[1] * sprite_size, right[2] * sprite_size, 0.0],
+                row1: [up_vec[0] * sprite_size, up_vec[1] * sprite_size, up_vec[2] * sprite_size, 0.0],
+                row2: [0.0, 0.0, 1.0, 0.0],
+                row3: [sp.x, sp.y, sp.z, 1.0],
+            });
+        }
+        queue.write_buffer(&self.sprite_instance_buf, 0, bytemuck::cast_slice(&instances));
+    }
+
     pub fn render_3d(&self, render_pass: &mut wgpu::RenderPass) {
         render_pass.set_pipeline(&self.pipeline);
         render_pass.set_bind_group(0, &self.uniform_bind_group, &[]);
@@ -828,6 +978,25 @@ impl ViewportState {
                 render_pass.set_vertex_buffer(1, self.default_instance_buf.slice(..));
                 render_pass.set_index_buffer(mibuf.slice(..), wgpu::IndexFormat::Uint32);
                 render_pass.draw_indexed(0..self.marker_idx_count, 0, 0..1);
+            }
+        }
+
+        // Render sprite billboards (camera-facing icon quads, LessEqual depth, one draw per batch)
+        if self.show_sprites && !self.sprite_batches.is_empty() {
+            let ibuf = &self.sprite_quad_ibuf;
+            let vbuf = &self.sprite_quad_vbuf;
+            for batch in &self.sprite_batches {
+                if let Some(bg) = self.texture_slots[batch.texture_slot].bind_group.as_ref() {
+                    render_pass.set_pipeline(&self.marker_pipeline);
+                    render_pass.set_bind_group(0, &self.uniform_bind_group, &[]);
+                    render_pass.set_bind_group(1, bg, &[]);
+                    render_pass.set_vertex_buffer(0, vbuf.slice(..));
+                    render_pass.set_vertex_buffer(1, self.sprite_instance_buf.slice(
+                        batch.start_instance as u64 * 64..(batch.start_instance + batch.num_instances) as u64 * 64,
+                    ));
+                    render_pass.set_index_buffer(ibuf.slice(..), wgpu::IndexFormat::Uint32);
+                    render_pass.draw_indexed(0..6, 0, 0..batch.num_instances);
+                }
             }
         }
 
@@ -1064,6 +1233,8 @@ pub struct WgpuViewport {
     module_erf_bytes: Arc<Mutex<Option<Arc<Vec<u8>>>>>,
     mod_path: Arc<Mutex<Option<std::path::PathBuf>>>,
     hak_names: Arc<Mutex<Vec<String>>>,
+    device: Arc<Mutex<Option<wgpu::Device>>>,
+    queue: Arc<Mutex<Option<wgpu::Queue>>>,
 }
 
 impl WgpuViewport {
@@ -1075,6 +1246,8 @@ impl WgpuViewport {
             module_erf_bytes: Arc::new(Mutex::new(None)),
             mod_path: Arc::new(Mutex::new(None)),
             hak_names: Arc::new(Mutex::new(Vec::new())),
+            device: Arc::new(Mutex::new(None)),
+            queue: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -1086,6 +1259,8 @@ impl WgpuViewport {
             module_erf_bytes: Arc::clone(&self.module_erf_bytes),
             mod_path: Arc::clone(&self.mod_path),
             hak_names: Arc::clone(&self.hak_names),
+            device: Arc::clone(&self.device),
+            queue: Arc::clone(&self.queue),
         }
     }
 
@@ -1190,6 +1365,23 @@ impl WgpuViewport {
                 state.show_walkmesh = show;
             }
         }
+    }
+
+    pub fn set_show_sprites(&self, show: bool) {
+        if let Ok(mut guard) = self.inner.lock() {
+            if let Some(ref mut state) = *guard {
+                state.show_sprites = show;
+            }
+        }
+    }
+
+    pub fn get_show_sprites(&self) -> bool {
+        if let Ok(guard) = self.inner.lock() {
+            if let Some(ref state) = *guard {
+                return state.show_sprites;
+            }
+        }
+        true
     }
 
     pub fn set_show_paint(&self, show: bool) {
@@ -1301,6 +1493,129 @@ impl WgpuViewport {
         }
         None
     }
+
+    /// Capture the current viewport at a given resolution, returning RGBA pixels.
+    /// Returns `None` if the viewport hasn't been initialized yet.
+    pub fn capture_frame(&self, width: u32, height: u32) -> Option<Vec<u8>> {
+        let device_guard = self.device.lock().ok()?;
+        let device = device_guard.as_ref()?;
+        let queue_guard = self.queue.lock().ok()?;
+        let queue = queue_guard.as_ref()?;
+        let mut guard = self.inner.lock().ok()?;
+        let state = guard.as_mut()?;
+
+        let fmt = state.color_format;
+
+        // Temporary color + depth targets at capture size
+        let color_tex = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("nwn3d_capture_color"),
+            size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: fmt,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let color_view = color_tex.create_view(&wgpu::TextureViewDescriptor::default());
+
+        let depth_tex = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("nwn3d_capture_depth"),
+            size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Depth32Float,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        });
+        let depth_view = depth_tex.create_view(&wgpu::TextureViewDescriptor::default());
+
+        state.update_uniforms(queue, (width, height));
+
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("nwn3d_capture_encoder"),
+        });
+        {
+            let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("nwn3d_capture_pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &color_view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(state.clear_color),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &depth_view,
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(1.0),
+                        store: wgpu::StoreOp::Store,
+                    }),
+                    stencil_ops: None,
+                }),
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+            state.render_3d(&mut rpass);
+        }
+
+        let bytes_per_row = width * 4;
+        let align = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
+        let padded = ((bytes_per_row + align - 1) / align) * align;
+
+        let staging = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("nwn3d_capture_staging"),
+            size: (padded as u64) * height as u64,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+
+        encoder.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo {
+                texture: &color_tex,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyBufferInfo {
+                buffer: &staging,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(padded),
+                    rows_per_image: Some(height),
+                },
+            },
+            wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+        );
+
+        let cmd_buf = encoder.finish();
+        queue.submit(std::iter::once(cmd_buf));
+        device.poll(wgpu::Maintain::Wait);
+
+        let slice = staging.slice(..);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |r| { let _ = tx.send(r); });
+        device.poll(wgpu::Maintain::Wait);
+
+        match rx.recv().ok() {
+            Some(Ok(())) => {
+                let mapped = slice.get_mapped_range();
+                if padded == bytes_per_row {
+                    Some(mapped.to_vec())
+                } else {
+                    let mut out = Vec::with_capacity((bytes_per_row * height) as usize);
+                    for row in 0..height {
+                        let off = row as usize * padded as usize;
+                        out.extend_from_slice(&mapped[off..off + bytes_per_row as usize]);
+                    }
+                    Some(out)
+                }
+            }
+            _ => None,
+        }
+    }
 }
 
 unsafe impl Send for WgpuViewport {}
@@ -1315,6 +1630,10 @@ impl CallbackTrait for WgpuViewport {
         _egui_encoder: &mut wgpu::CommandEncoder,
         _callback_resources: &mut CallbackResources,
     ) -> Vec<wgpu::CommandBuffer> {
+        // Store device/queue for capture_frame usage
+        if let Ok(mut d) = self.device.lock() { *d = Some(device.clone()); }
+        if let Ok(mut q) = self.queue.lock() { *q = Some(queue.clone()); }
+
         // Handle pending area load (called from update thread)
         if let Ok(mut pending_guard) = self.pending.lock() {
             if let Some(pending) = pending_guard.take() {
@@ -1375,6 +1694,7 @@ impl CallbackTrait for WgpuViewport {
         state.ensure_textures(device, queue);
         let size = (screen_descriptor.size_in_pixels[0], screen_descriptor.size_in_pixels[1]);
         state.update_uniforms(queue, size);
+        state.update_sprite_instances(queue);
         state.ensure_scene_textures(device, size.0.max(1), size.1.max(1));
 
         // Alternate buffer each frame to avoid write/read race on the offscreen texture

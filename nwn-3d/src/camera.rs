@@ -19,6 +19,16 @@ impl OrbitCamera {
         }
     }
 
+    pub fn right_up(&self) -> ([f32; 3], [f32; 3]) {
+        let (sin_t, cos_t) = self.theta.sin_cos();
+        let (sin_p, cos_p) = self.phi.sin_cos();
+        let forward = [-cos_p * sin_t, -sin_p, -cos_p * cos_t];
+        let world_up = [0.0, 1.0, 0.0];
+        let right = cross(forward, world_up);
+        let up = cross(right, forward);
+        (right, up)
+    }
+
     pub fn eye(&self) -> [f32; 3] {
         let (sin_t, cos_t) = self.theta.sin_cos();
         let (sin_p, cos_p) = self.phi.sin_cos();

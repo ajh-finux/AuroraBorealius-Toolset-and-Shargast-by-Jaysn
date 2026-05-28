@@ -31,6 +31,7 @@ use crate::texture_browser::{TextureBrowserState, show_texture_browser};
 use crate::tileset_browser::{TilesetBrowserState, show_tileset_browser};
 use crate::area_geometry_editor::{GeometryEditorState, show_geometry_editor};
 
+mod icons;
 mod inspector;
 mod script_editor;
 mod conversation_editor;
@@ -189,6 +190,7 @@ struct AuroraBorealisApp {
     graph_view_state: GraphViewState,
     height_map_open: bool,
     height_map_state: HeightMapState,
+    show_sprites: bool,
     show_walkmesh: bool,
     show_walkmesh_edges: bool,
     show_paint: bool,
@@ -267,6 +269,7 @@ struct AuroraBorealisApp {
     new_object_y: f32,
     new_object_z: f32,
     new_object_bearing: f32,
+    icons: icons::Icons,
 }
 
 #[derive(Debug, Clone)]
@@ -737,7 +740,6 @@ fn save_item_list(module: Option<&mut nwn_gamemodel::Module>, area_resref: &str,
 
 impl AuroraBorealisApp {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
-        let _ = cc; // adapter/surface created by wgpu render state
         let viewport = nwn_3d::WgpuViewport::new();
         let mut recent_files: Vec<String> = load_recent_files();
         recent_files.retain(|f| std::path::Path::new(f).exists());
@@ -789,6 +791,7 @@ impl AuroraBorealisApp {
             graph_view_state: GraphViewState::default(),
             height_map_open: false,
             height_map_state: HeightMapState::default(),
+            show_sprites: true,
             show_walkmesh: false,
             show_walkmesh_edges: false,
             show_fog: false,
@@ -867,6 +870,7 @@ impl AuroraBorealisApp {
             new_object_y: 0.0,
             new_object_z: 0.0,
             new_object_bearing: 0.0,
+            icons: icons::Icons::new(&cc.egui_ctx),
         }
     }
 }
@@ -1051,6 +1055,9 @@ impl eframe::App for AuroraBorealisApp {
                     let mut pt = self.show_paint;
                     ui.checkbox(&mut pt, "Show Paint Overlay");
                     if pt != self.show_paint { self.show_paint = pt; self.viewport.set_show_paint(pt); }
+                    let mut ss = self.show_sprites;
+                    ui.checkbox(&mut ss, "Show Sprites");
+                    if ss != self.show_sprites { self.show_sprites = ss; self.viewport.set_show_sprites(ss); }
                     let mut filter_changed = false;
                     ui.menu_button("Show Object Markers", |ui| {
                         let mut sc = self.show_creatures;
@@ -1208,7 +1215,7 @@ impl eframe::App for AuroraBorealisApp {
                 // ---- Camera bookmarks ----
                 if self.current_area.is_some() {
                     ui.separator();
-                    if ui.button("+ Bookmark").clicked() {
+                    if self.icons.icon_button(ui, "bookmark", "Add Camera Bookmark", 20.0).clicked() {
                         let idx = self.camera_bookmarks.len() + 1;
                         if let Some(cam) = self.viewport.camera_state() {
                             self.camera_bookmarks.push(CameraBookmark {
@@ -1252,7 +1259,7 @@ impl eframe::App for AuroraBorealisApp {
                 }
                 // ---- Right side: Undo/Redo ----
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.button("Redo").clicked() {
+                    if self.icons.icon_button(ui, "forward-field", "Redo", 20.0).clicked() {
                         if let Some(snapshot) = self.redo_stack.pop() {
                             if let Some(ref current) = self.current_area {
                                 self.undo_stack.push(current.clone());
@@ -1266,7 +1273,7 @@ impl eframe::App for AuroraBorealisApp {
                             self.status = "Redo".to_string();
                         }
                     }
-                    if ui.button("Undo").clicked() {
+                    if self.icons.icon_button(ui, "return-arrow", "Undo", 20.0).clicked() {
                         if let Some(snapshot) = self.undo_stack.pop() {
                             if let Some(ref current) = self.current_area {
                                 self.redo_stack.push(current.clone());
@@ -1574,11 +1581,11 @@ impl eframe::App for AuroraBorealisApp {
                                     .map(|s| format!(" (x{})", s))
                                     .unwrap_or_default();
                                 ui.horizontal(|ui| {
-                                    if ui.button("✏").clicked() {
+                                    if self.icons.icon_button(ui, "pencil", "Edit Item", 16.0).clicked() {
                                         inv.editing_item = Some(i);
                                     }
                                     ui.label(format!("{}{}", res, extra));
-                                    if ui.button("🗑").clicked() {
+                                    if self.icons.icon_button(ui, "trash-can", "Remove Item", 16.0).clicked() {
                                         remove_idx = Some(i);
                                     }
                                 });
@@ -2936,7 +2943,7 @@ impl eframe::App for AuroraBorealisApp {
                                 let name_to_switch = name.clone();
                                 self.switch_to_area(&name_to_switch, target_format);
                             }
-                            if ui.button("×").on_hover_text("Close tab").clicked() {
+                            if self.icons.icon_button(ui, "cross-mark", "Close tab", 14.0).clicked() {
                                 self.close_area_tab(i);
                                 if self.current_area.is_none() && !self.open_areas.is_empty() {
                                     let next = self.open_areas[self.active_area_idx].clone();
@@ -2958,7 +2965,7 @@ impl eframe::App for AuroraBorealisApp {
                 ui.horizontal(|ui| {
                     ui.heading("Areas");
                     if self.module.is_some() {
-                        if ui.button("+").on_hover_text("New Area").clicked() {
+                        if self.icons.icon_button(ui, "new-shoot", "New Area", 20.0).clicked() {
                             self.new_area_open = true;
                         }
                     }
@@ -2977,10 +2984,10 @@ impl eframe::App for AuroraBorealisApp {
                                     self.switch_to_area(name, target_format);
                                 }
                                 if selected {
-                                    if ui.button("🗑").on_hover_text("Delete Area").clicked() {
+                                    if self.icons.icon_button(ui, "trash-can", "Delete Area", 16.0).clicked() {
                                         delete_name = Some(name.clone());
                                     }
-                                    if ui.button("⚙").on_hover_text("Area Properties").clicked() {
+                                    if self.icons.icon_button(ui, "cog", "Area Properties", 16.0).clicked() {
                                         if let Some(ref area) = self.current_area {
                                             self.area_props_resref = area.resref.clone();
                                             self.area_props_name = area.name.clone();
@@ -4234,12 +4241,12 @@ impl eframe::App for AuroraBorealisApp {
                             });
                             ui.separator();
                         }
-                        if ui.button("🗑 Delete").clicked() {
+                        if self.icons.icon_button(ui, "trash-can", "Delete Object", 20.0).clicked() {
                             delete_requested = true;
                         }
                         ui.separator();
                         if let Some((ref obj_type, obj_idx)) = self.selected_obj_info {
-                            if ui.button("📋 Local Variables").clicked() {
+                            if self.icons.icon_button(ui, "stack", "Local Variables", 20.0).clicked() {
                                 if let Some(ref module) = self.module {
                                     if let Some(ref area) = self.current_area {
                                         let vars = load_local_vars(module, &area.resref, obj_type, obj_idx);
@@ -4251,7 +4258,7 @@ impl eframe::App for AuroraBorealisApp {
                                     }
                                 }
                             }
-                            if ui.button("🎨 Appearance Picker").clicked() {
+                            if self.icons.icon_button(ui, "eye-target", "Appearance Picker", 20.0).clicked() {
                                 let appearances = self.module.as_ref().and_then(|m| m.erf.as_ref()).and_then(|erf| {
                                     erf.get("appearance", nwn_gamemodel::resource_types::TWO_DA).and_then(|data| {
                                         let text = String::from_utf8(data.clone()).ok()?;
@@ -4280,13 +4287,13 @@ impl eframe::App for AuroraBorealisApp {
                                     appearances,
                                 });
                             }
-                            if ui.button("💬 Comment").clicked() {
+                            if self.icons.icon_button(ui, "pencil", "Comment", 20.0).clicked() {
                                 let resref = self.current_area.as_ref().map(|a| a.resref.clone()).unwrap_or_default();
                                 let comment = self.module.as_ref().map(|m| load_object_comment(m, &resref, obj_type, obj_idx)).unwrap_or_default();
                                 self.object_comment_edit = Some((obj_type.clone(), obj_idx, comment));
                             }
                             if obj_type == "creature" || obj_type == "placeable" {
-                                if ui.button("📦 Inventory").clicked() {
+                                if self.icons.icon_button(ui, "chest", "Inventory", 20.0).clicked() {
                                     let resref = self.current_area.as_ref().map(|a| a.resref.clone()).unwrap_or_default();
                                     let items = load_item_list(self.module.as_ref(), &resref, obj_type, obj_idx);
                                     self.inventory_editor = Some(InventoryEditorState {

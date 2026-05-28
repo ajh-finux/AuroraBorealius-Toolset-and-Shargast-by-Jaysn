@@ -415,6 +415,20 @@ pub struct MarkersResult {
     pub markers: Vec<MarkerInfo>,
 }
 
+/// Returns the game-icon resref to display as a billboard sprite for each object type.
+/// Returns `None` when no suitable icon exists (geometry-only marker).
+pub fn object_type_icon(obj_type: ObjectType) -> Option<&'static str> {
+    match obj_type {
+        ObjectType::Waypoint => Some("po_hu_f_01_h"),
+        ObjectType::Door => Some("do_hide"),
+        ObjectType::Creature => Some("po_hu_m_01_h"),
+        ObjectType::Placeable => Some("iit_chest"),
+        ObjectType::Trigger => None,
+        ObjectType::Encounter => None,
+        ObjectType::SoundEmitter => None,
+    }
+}
+
 pub fn build_object_markers(area: &Area, filter: VisibilityFilter) -> MarkersResult {
     let mut vertices = Vec::new();
     let mut indices = Vec::new();
