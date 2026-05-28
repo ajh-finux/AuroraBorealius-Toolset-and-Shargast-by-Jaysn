@@ -647,38 +647,65 @@ pub struct TriggerInstance {
     pub y: f32,
     pub z: f32,
     pub bearing: f32,
+    pub geometry: Vec<[f32; 3]>,
 }
 
 impl TriggerInstance {
     pub fn to_gff_struct(&self) -> nwn_gff::Struct {
-        nwn_gff::Struct {
-            id: 7,
-            fields: vec![
-                resref_field("TemplateResRef", &self.resref),
-                string_field("Tag", &self.tag),
-                float_field("XPosition", self.x),
-                float_field("YPosition", self.y),
-                float_field("ZPosition", self.z),
-                float_field("XOrientation", self.bearing.sin()),
-                float_field("YOrientation", self.bearing.cos()),
-            ],
+        let mut fields = vec![
+            resref_field("TemplateResRef", &self.resref),
+            string_field("Tag", &self.tag),
+            float_field("XPosition", self.x),
+            float_field("YPosition", self.y),
+            float_field("ZPosition", self.z),
+            float_field("XOrientation", self.bearing.sin()),
+            float_field("YOrientation", self.bearing.cos()),
+        ];
+        if !self.geometry.is_empty() {
+            fields.push(make_field("Geometry",
+                nwn_gff::FieldValue::List(nwn_gff::list_from_vec(self.geometry.iter().map(|pt| {
+                    nwn_gff::Struct {
+                        id: 7,
+                        fields: vec![
+                            float_field("X", pt[0]),
+                            float_field("Y", pt[1]),
+                            float_field("Z", pt[2]),
+                        ],
+                    }
+                }).collect())),
+            ));
         }
+        nwn_gff::Struct { id: 7, fields }
     }
 
     pub fn to_property_bag(&self) -> crate::PropertyBag {
-        crate::PropertyBag {
-            properties: vec![
-                Property { label: "TemplateResRef".into(), value: PropertyValue::ResRef(self.resref.clone()), field_type: 11, category: String::new(), description: String::new() },
-                Property { label: "Tag".into(), value: PropertyValue::CExoString(self.tag.clone()), field_type: 10, category: String::new(), description: String::new() },
-                Property { label: "XPosition".into(), value: PropertyValue::Float(self.x), field_type: 8, category: String::new(), description: String::new() },
-                Property { label: "YPosition".into(), value: PropertyValue::Float(self.y), field_type: 8, category: String::new(), description: String::new() },
-                Property { label: "ZPosition".into(), value: PropertyValue::Float(self.z), field_type: 8, category: String::new(), description: String::new() },
-                Property { label: "Bearing".into(), value: PropertyValue::Float(self.bearing), field_type: 8, category: String::new(), description: String::new() },
-            ],
+        let mut props = vec![
+            Property { label: "TemplateResRef".into(), value: PropertyValue::ResRef(self.resref.clone()), field_type: 11, category: String::new(), description: String::new() },
+            Property { label: "Tag".into(), value: PropertyValue::CExoString(self.tag.clone()), field_type: 10, category: String::new(), description: String::new() },
+            Property { label: "XPosition".into(), value: PropertyValue::Float(self.x), field_type: 8, category: String::new(), description: String::new() },
+            Property { label: "YPosition".into(), value: PropertyValue::Float(self.y), field_type: 8, category: String::new(), description: String::new() },
+            Property { label: "ZPosition".into(), value: PropertyValue::Float(self.z), field_type: 8, category: String::new(), description: String::new() },
+            Property { label: "Bearing".into(), value: PropertyValue::Float(self.bearing), field_type: 8, category: String::new(), description: String::new() },
+        ];
+        for (i, pt) in self.geometry.iter().enumerate() {
+            props.push(Property { label: format!("Geometry_{}_X", i), value: PropertyValue::Float(pt[0]), field_type: 8, category: "Geometry".into(), description: String::new() });
+            props.push(Property { label: format!("Geometry_{}_Y", i), value: PropertyValue::Float(pt[1]), field_type: 8, category: "Geometry".into(), description: String::new() });
+            props.push(Property { label: format!("Geometry_{}_Z", i), value: PropertyValue::Float(pt[2]), field_type: 8, category: "Geometry".into(), description: String::new() });
         }
+        crate::PropertyBag { properties: props }
     }
 
     pub fn from_property_bag(bag: &crate::PropertyBag) -> Self {
+        let mut geometry = Vec::new();
+        for i in 0.. {
+            let x = bag.get_float(&format!("Geometry_{}_X", i));
+            let y = bag.get_float(&format!("Geometry_{}_Y", i));
+            let z = bag.get_float(&format!("Geometry_{}_Z", i));
+            match (x, y, z) {
+                (Some(x), Some(y), Some(z)) => geometry.push([x, y, z]),
+                _ => break,
+            }
+        }
         Self {
             resref: bag.get_string("TemplateResRef").unwrap_or("").to_string(),
             tag: bag.get_string("Tag").unwrap_or("").to_string(),
@@ -686,10 +713,22 @@ impl TriggerInstance {
             y: bag.get_float("YPosition").unwrap_or(0.0),
             z: bag.get_float("ZPosition").unwrap_or(0.0),
             bearing: bag.get_float("Bearing").unwrap_or(0.0),
+            geometry,
         }
     }
 
     fn from_gff_struct(s: &nwn_gff::Struct) -> Self {
+        let geometry = s.find("Geometry")
+            .and_then(|v| if let nwn_gff::FieldValue::List(list) = v { Some(list) } else { None })
+            .map(|list| {
+                list.iter().filter_map(|entry| {
+                    let x = gff_float(entry, "X", "XPosition");
+                    let y = gff_float(entry, "Y", "YPosition");
+                    let z = gff_float(entry, "Z", "ZPosition");
+                    Some([x, y, z])
+                }).collect()
+            })
+            .unwrap_or_default();
         Self {
             resref: gff_resref_from_struct(s),
             tag: s.find("Tag").and_then(|v| if let nwn_gff::FieldValue::String(s) = v { Some(s.clone()) } else { None }).unwrap_or_default(),
@@ -697,6 +736,7 @@ impl TriggerInstance {
             y: gff_float(s, "YPosition", "Y"),
             z: gff_float(s, "ZPosition", "Z"),
             bearing: gff_bearing(s),
+            geometry,
         }
     }
 }

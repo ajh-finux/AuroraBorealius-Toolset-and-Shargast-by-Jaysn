@@ -19,6 +19,8 @@ use crate::blueprint_palette::show_blueprint_palette;
 use crate::item_editor::show_item_browser;
 use crate::two_da_editor::{TwoDaEditorState, show_two_da_editor};
 use crate::texture_browser::{TextureBrowserState, show_texture_browser};
+use crate::tileset_browser::{TilesetBrowserState, show_tileset_browser};
+use crate::area_geometry_editor::{GeometryEditorState, show_geometry_editor};
 
 mod inspector;
 mod script_editor;
@@ -31,6 +33,8 @@ mod journal_editor;
 mod two_da_editor;
 mod encounter_editor;
 mod texture_browser;
+mod tileset_browser;
+mod area_geometry_editor;
 
 // ── Platform-specific file dialog helpers ──────────────────────────────
 #[cfg(not(target_arch = "wasm32"))]
@@ -128,6 +132,8 @@ struct AuroraBorealisApp {
     clear_override: Option<[u8; 3]>,
     show_resource_viewer: bool,
     texture_browser: TextureBrowserState,
+    tileset_browser: TilesetBrowserState,
+    geometry_editor: GeometryEditorState,
     show_blueprint_palette: bool,
     show_sky_override: bool,
     nwn_process_handle: Option<std::process::Child>,
@@ -192,6 +198,14 @@ struct AuroraBorealisApp {
     encounter_editor_open: bool,
     env_settings_open: bool,
     transition_editor_open: bool,
+    module_tree_open: bool,
+    find_replace_open: bool,
+    find_replace_state: FindReplaceState,
+    search_term: String,
+    search_results: Vec<String>,
+    sound_browser_open: bool,
+    store_editor_open: bool,
+    id_whois_open: bool,
     env_sun_fog_amount: u8,
     env_sun_fog_color: [u8; 3],
     env_moon_fog_amount: u8,
@@ -264,6 +278,23 @@ struct AppearanceEntry {
     id: i32,
     label: String,
     model: String,
+}
+
+struct FindReplaceState {
+    find_text: String,
+    replace_text: String,
+    results: Vec<FindResult>,
+    show_results: bool,
+}
+
+struct FindResult {
+    script_name: String,
+    line_number: usize,
+    line_text: String,
+}
+
+impl Default for FindReplaceState {
+    fn default() -> Self { Self { find_text: String::new(), replace_text: String::new(), results: Vec::new(), show_results: false } }
 }
 
 struct GraphViewState {
@@ -701,6 +732,8 @@ impl AuroraBorealisApp {
             clear_override: None,
             show_resource_viewer: false,
             texture_browser: TextureBrowserState::default(),
+            tileset_browser: TilesetBrowserState::default(),
+            geometry_editor: GeometryEditorState::default(),
             show_blueprint_palette: false,
             show_sky_override: false,
             nwn_process_handle: None,
@@ -760,6 +793,14 @@ impl AuroraBorealisApp {
             encounter_editor_open: false,
             env_settings_open: false,
             transition_editor_open: false,
+            module_tree_open: false,
+            find_replace_open: false,
+            find_replace_state: FindReplaceState::default(),
+            search_term: String::new(),
+            search_results: Vec::new(),
+            sound_browser_open: false,
+            store_editor_open: false,
+            id_whois_open: false,
             env_sun_fog_amount: 0,
             env_sun_fog_color: [0, 0, 0],
             env_moon_fog_amount: 0,
@@ -913,6 +954,7 @@ impl eframe::App for AuroraBorealisApp {
                     ui.checkbox(&mut self.show_minimap, "Minimap Overlay");
                     ui.checkbox(&mut self.graph_view_open, "Graph Area View");
                     ui.checkbox(&mut self.height_map_open, "Height Map View");
+                    ui.checkbox(&mut self.module_tree_open, "Module Tree View");
                     ui.checkbox(&mut self.show_contents_panel, "Contents Panel");
                     ui.separator();
                     let mut ww = self.walkmesh_wall_mode;
@@ -1089,8 +1131,36 @@ impl eframe::App for AuroraBorealisApp {
                         self.texture_browser.open = true;
                         ui.close_menu();
                     }
+                    if ui.button("Visual Tileset Browser").clicked() {
+                        self.tileset_browser.open = true;
+                        ui.close_menu();
+                    }
+                    if self.module.is_some() {
+                        if ui.button("Sound Browser").clicked() {
+                            self.sound_browser_open = true;
+                            ui.close_menu();
+                        }
+                    }
+                    if self.module.is_some() {
+                        if ui.button("Store Editor").clicked() {
+                            self.store_editor_open = true;
+                            ui.close_menu();
+                        }
+                    }
+                    if self.module.is_some() {
+                        if ui.button("ID Whois Utility").clicked() {
+                            self.id_whois_open = true;
+                            ui.close_menu();
+                        }
+                    }
+                    if self.current_area.is_some() {
+                        if ui.button("Area Geometry Editor").clicked() {
+                            self.geometry_editor.open = true;
+                            ui.close_menu();
+                        }
+                    }
                     if ui.button("Find/Replace in Scripts...").clicked() {
-                        self.status = "Find/Replace feature coming soon.".to_string();
+                        self.find_replace_open = true;
                         ui.close_menu();
                     }
                     if self.module.is_some() {
@@ -2095,6 +2165,437 @@ impl eframe::App for AuroraBorealisApp {
             }
         }
 
+        // ===================== MODULE TREE VIEW =====================
+        if self.module_tree_open {
+            let mut open = true;
+            egui::Window::new("Module Tree View")
+                .default_size([350.0, 600.0])
+                .open(&mut open)
+                .show(ctx, |ui| {
+                    if let Some(ref module) = self.module {
+                        egui::ScrollArea::both().show(ui, |ui| {
+                            // Areas
+                            let area_names = module.area_names();
+                            egui::CollapsingHeader::new(format!("Areas ({})", area_names.len()))
+                                .default_open(true)
+                                .show(ui, |ui| {
+                                    for name in area_names {
+                                        let git_key = name.trim().to_lowercase();
+                                        let counts = module.raw_git.get(&git_key).and_then(|d| {
+                                            nwn_gff::GffFile::from_bytes(d).ok()
+                                        }).map(|gff| {
+                                            let cats = ["Creature_List", "Door_List", "Placeable_List", "Trigger_List", "Waypoint_List", "Encounter_List", "SoundEmitter_List"];
+                                            let names = ["creatures", "doors", "placeables", "triggers", "waypoints", "encounters", "sounds"];
+                                            let mut parts = Vec::new();
+                                            for (i, cat) in cats.iter().enumerate() {
+                                                let count = gff.root().find(cat).and_then(|fv| match fv { nwn_gff::FieldValue::List(l) => Some(l.len()), _ => None }).unwrap_or(0);
+                                                if count > 0 { parts.push(format!("{}{}", count, &names[i][..1])); }
+                                            }
+                                            parts.join(" ")
+                                        }).unwrap_or_default();
+                                        if ui.selectable_label(false, format!("  {}  [{}]", name, counts)).clicked() {
+                                            // We can't switch areas here easily due to borrows, just show a status
+                                            self.status = format!("Double-click area '{}' in area list to switch.", name);
+                                        }
+                                    }
+                                });
+                            // Scripts
+                            let scripts: Vec<String> = module.erf.as_ref().map(|erf| {
+                                erf.resources().iter().filter(|r| r.restype == resource_types::NSS).map(|r| format!("{}.nss", r.resref)).collect()
+                            }).unwrap_or_default();
+                            egui::CollapsingHeader::new(format!("Scripts ({})", scripts.len()))
+                                .default_open(false)
+                                .show(ui, |ui| {
+                                    for s in &scripts {
+                                        if ui.selectable_label(false, format!("  {}", s)).clicked() {
+                                            self.status = format!("Open '{}' in Script Editor via Tools menu.", s);
+                                        }
+                                    }
+                                });
+                            // Conversations
+                            let convos: Vec<String> = module.erf.as_ref().map(|erf| {
+                                erf.resources().iter().filter(|r| r.restype == resource_types::DLG).map(|r| format!("{}.dlg", r.resref)).collect()
+                            }).unwrap_or_default();
+                            egui::CollapsingHeader::new(format!("Conversations ({})", convos.len()))
+                                .default_open(false)
+                                .show(ui, |ui| {
+                                    for c in &convos {
+                                        ui.label(format!("  {}", c));
+                                    }
+                                });
+                            // Blueprints grouped by type
+                            let blueprint_types = [
+                                (resource_types::UTC, "Creatures (UTC)"),
+                                (resource_types::UTD, "Doors (UTD)"),
+                                (resource_types::UTP, "Placeables (UTP)"),
+                                (resource_types::UTT, "Triggers (UTT)"),
+                                (resource_types::UTW, "Waypoints (UTW)"),
+                                (resource_types::UTE, "Encounters (UTE)"),
+                                (resource_types::UTS, "Sounds (UTS)"),
+                                (resource_types::UTI, "Items (UTI)"),
+                                (resource_types::UTM, "Stores (UTM)"),
+                            ];
+                            for &(restype, header) in &blueprint_types {
+                                let items: Vec<String> = module.erf.as_ref().map(|erf| {
+                                    erf.resources().iter().filter(|r| r.restype == restype).map(|r| r.resref.clone()).collect()
+                                }).unwrap_or_default();
+                                if items.is_empty() { continue; }
+                                egui::CollapsingHeader::new(format!("{} ({})", header, items.len()))
+                                    .default_open(false)
+                                    .show(ui, |ui| {
+                                        for item in &items {
+                                            ui.label(format!("  {}", item));
+                                        }
+                                    });
+                            }
+                            // 2DAs
+                            let twodas: Vec<String> = module.erf.as_ref().map(|erf| {
+                                erf.resources().iter().filter(|r| r.restype == resource_types::TWO_DA).map(|r| r.resref.clone()).collect()
+                            }).unwrap_or_default();
+                            egui::CollapsingHeader::new(format!("2DAs ({})", twodas.len()))
+                                .default_open(false)
+                                .show(ui, |ui| {
+                                    for t in &twodas {
+                                        ui.label(format!("  {}", t));
+                                    }
+                                });
+                        });
+                    } else {
+                        ui.label("No module loaded.");
+                    }
+                });
+            if !open {
+                self.module_tree_open = false;
+            }
+        }
+
+        // ===================== FIND/REPLACE IN SCRIPTS =====================
+        if self.find_replace_open {
+            let mut open = true;
+            egui::Window::new("Find/Replace in Scripts")
+                .default_size([600.0, 400.0])
+                .open(&mut open)
+                .show(ctx, |ui| {
+                    let fr = &mut self.find_replace_state;
+                    ui.horizontal(|ui| {
+                        ui.label("Find:");
+                        ui.text_edit_singleline(&mut fr.find_text);
+                        if ui.button("Search").clicked() && !fr.find_text.is_empty() {
+                            fr.results.clear();
+                            if let Some(ref module) = self.module {
+                                if let Some(ref erf) = module.erf {
+                                    for res in erf.resources() {
+                                        if res.restype != resource_types::NSS { continue; }
+                                        if let Some(data) = erf.get(&res.resref, resource_types::NSS) {
+                                            if let Ok(text) = String::from_utf8(data.clone()) {
+                                                for (ln, line) in text.lines().enumerate() {
+                                                    if line.to_lowercase().contains(&fr.find_text.to_lowercase()) {
+                                                        fr.results.push(FindResult {
+                                                            script_name: res.resref.clone(),
+                                                            line_number: ln + 1,
+                                                            line_text: line.to_string(),
+                                                        });
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            fr.show_results = true;
+                        }
+                    });
+                    if !fr.replace_text.is_empty() {
+                        ui.horizontal(|ui| {
+                            ui.label("Replace:");
+                            ui.text_edit_singleline(&mut fr.replace_text);
+                            if ui.button("Replace All").clicked() && !fr.find_text.is_empty() {
+                                if let Some(ref mut module) = self.module {
+                                    let find_lower = fr.find_text.to_lowercase();
+                                    let mut count = 0;
+                                    let new_resources: Vec<(String, u16, Vec<u8>)> = module.erf.as_ref().map(|erf| {
+                                        erf.resources().iter().filter_map(|r| {
+                                            if r.restype != resource_types::NSS { return None; }
+                                            let data = erf.get(&r.resref, resource_types::NSS)?;
+                                            let text = String::from_utf8(data.clone()).ok()?;
+                                            if !text.to_lowercase().contains(&find_lower) { return None; }
+                                            let new_text = text.replace(&fr.find_text, &fr.replace_text);
+                                            count += 1;
+                                            Some((r.resref.clone(), r.restype, new_text.into_bytes()))
+                                        }).collect()
+                                    }).unwrap_or_default();
+                                    for (resref, _restype, data) in new_resources {
+                                        module.update_script(&resref, &String::from_utf8_lossy(&data));
+                                    }
+                                    fr.show_results = false;
+                                    fr.results.clear();
+                                    self.status = format!("Replaced {} occurrence(s) in {} script(s).", count, count);
+                                }
+                            }
+                        });
+                    }
+                    ui.separator();
+                    if fr.show_results {
+                        ui.label(format!("{} match(es)", fr.results.len()));
+                        egui::ScrollArea::both().show(ui, |ui| {
+                            egui::Grid::new("find_results").striped(true).show(ui, |ui| {
+                                for r in &fr.results {
+                                    ui.label(&r.script_name);
+                                    ui.label(r.line_number.to_string());
+                                    ui.label(&r.line_text);
+                                    ui.end_row();
+                                }
+                            });
+                        });
+                    } else if self.module.is_some() {
+                        ui.label("Enter search text and click 'Search'.");
+                    } else {
+                        ui.label("No module loaded.");
+                    }
+                });
+            if !open {
+                self.find_replace_open = false;
+            }
+        }
+
+        // ===================== SOUND BROWSER =====================
+        if self.sound_browser_open {
+            let mut open = true;
+            let audio_types = [resource_types::WAV];
+            egui::Window::new("Sound Browser")
+                .default_size([400.0, 500.0])
+                .open(&mut open)
+                .show(ctx, |ui| {
+                    if let Some(ref module) = self.module {
+                        if let Some(ref erf) = module.erf {
+                            let resources = erf.resources();
+                            let sounds: Vec<&nwn_erf::ErfResource> = resources.iter().filter(|r| audio_types.contains(&r.restype)).collect();
+                            if sounds.is_empty() {
+                                ui.label("No audio resources found in module.");
+                                return;
+                            }
+                            ui.label(format!("{} audio resources", sounds.len()));
+                            ui.separator();
+                            egui::ScrollArea::vertical().show(ui, |ui| {
+                                for res in &sounds {
+                                    let ext = if res.restype == resource_types::WAV { "wav" } else { "bmu" };
+                                    let label = format!("{}.{}", res.resref, ext);
+                                    ui.horizontal(|ui| {
+                                        ui.label(&label);
+                                        if ui.button("▶ Play").clicked() {
+                                            if let Some(data) = erf.get(&res.resref, res.restype) {
+                                                let tmp_path = format!("/tmp/opencode/{}.{}", res.resref, ext);
+                                                let _ = std::fs::write(&tmp_path, &data);
+                                                // Try aplay, fallback to ffplay
+                                                let result = std::process::Command::new("aplay")
+                                                    .arg(&tmp_path).arg("-q").spawn();
+                                                if result.is_err() {
+                                                    let _ = std::process::Command::new("ffplay")
+                                                        .arg(&tmp_path).arg("-nodisp").arg("-autoexit").arg("-loglevel").arg("quiet").spawn();
+                                                }
+                                            }
+                                        }
+                                        if ui.button("Export...").clicked() {
+                                            if let Some(data) = erf.get(&res.resref, res.restype) {
+                                                let ext = "wav";
+                                                if let Some(path) = pick_save_path_filtered(&format!("{}.{}", res.resref, ext), "Audio", &[ext]) {
+                                                    let _ = std::fs::write(&path, &data);
+                                                }
+                                            }
+                                        }
+                                    });
+                                }
+                            });
+                        } else {
+                            ui.label("No ERF loaded.");
+                        }
+                    } else {
+                        ui.label("No module loaded.");
+                    }
+                });
+            if !open {
+                self.sound_browser_open = false;
+            }
+        }
+
+        // ===================== STORE EDITOR =====================
+        if self.store_editor_open {
+            let mut open = true;
+            let mut open_bag_editor: Option<(String, u16, PropertyBag)> = None;
+            egui::Window::new("Store Editor")
+                .default_size([500.0, 400.0])
+                .open(&mut open)
+                .show(ctx, |ui| {
+                    if let Some(ref module) = self.module {
+                        if let Some(ref erf) = module.erf {
+                            let resources = erf.resources();
+                            let store_res: Vec<&nwn_erf::ErfResource> = resources.iter().filter(|r| r.restype == resource_types::UTM).collect();
+                            if store_res.is_empty() {
+                                ui.label("No store blueprints (UTM) found.");
+                                return;
+                            }
+                            ui.label(format!("{} store(s)", store_res.len()));
+                            ui.separator();
+                            egui::ScrollArea::vertical().show(ui, |ui| {
+                                for store in &store_res {
+                                    let data = erf.get(&store.resref, resource_types::UTM);
+                                    let bag = data.and_then(|d| nwn_gff::GffFile::from_bytes(&d).ok()).map(|gff| PropertyBag::from_gff_struct(gff.root()));
+                                    let store_name = bag.as_ref().and_then(|b| b.get_string("StoreName")).unwrap_or(&store.resref).to_string();
+                                    if ui.button(format!("{} ({})", store_name, store.resref)).clicked() {
+                                        if let Some(b) = bag {
+                                            open_bag_editor = Some((store.resref.clone(), resource_types::UTM, b));
+                                        }
+                                    }
+                                }
+                            });
+                        }
+                    } else {
+                        ui.label("No module loaded.");
+                    }
+                });
+            if !open {
+                self.store_editor_open = false;
+            }
+        }
+
+        // ===================== ID WHOIS UTILITY =====================
+        if self.id_whois_open {
+            let mut open = true;
+            egui::Window::new("ID Whois Utility")
+                .default_size([500.0, 500.0])
+                .open(&mut open)
+                .show(ctx, |ui| {
+                    if let Some(ref module) = self.module {
+                        ui.label("Enter a ResRef to find where it is used across the module:");
+                        ui.text_edit_singleline(&mut self.search_term);
+                        if ui.button("Search").clicked() || ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                            self.search_results.clear();
+                            let term = self.search_term.to_lowercase();
+                            if term.is_empty() { return; }
+                            let area_names = module.area_names();
+
+                            // Search in loaded area names/refs
+                            for aname in area_names {
+                                if aname.to_lowercase().contains(&term) {
+                                    self.search_results.push(format!("Area ResRef: {}", aname));
+                                }
+                                if let Some(area) = module.get_area(aname) {
+                                    if area.tag.to_lowercase().contains(&term) {
+                                        self.search_results.push(format!("Area '{}' (tag: {})", aname, area.tag));
+                                    }
+                                    if area.name.to_lowercase().contains(&term) {
+                                        self.search_results.push(format!("Area '{}' (name: {})", aname, area.name));
+                                    }
+                                    // Check object resrefs and tags
+                                    for c in &area.creatures {
+                                        if c.resref.to_lowercase().contains(&term) || c.tag.to_lowercase().contains(&term) {
+                                            self.search_results.push(format!("Area {} / Creature '{}' (tag: {})", aname, c.resref, c.tag));
+                                        }
+                                    }
+                                    for d in &area.doors {
+                                        if d.resref.to_lowercase().contains(&term) || d.tag.to_lowercase().contains(&term) {
+                                            self.search_results.push(format!("Area {} / Door '{}' (tag: {})", aname, d.resref, d.tag));
+                                        }
+                                    }
+                                    for p in &area.placeables {
+                                        if p.resref.to_lowercase().contains(&term) || p.tag.to_lowercase().contains(&term) {
+                                            self.search_results.push(format!("Area {} / Placeable '{}' (tag: {})", aname, p.resref, p.tag));
+                                        }
+                                    }
+                                    for t in &area.triggers {
+                                        if t.resref.to_lowercase().contains(&term) || t.tag.to_lowercase().contains(&term) {
+                                            self.search_results.push(format!("Area {} / Trigger '{}' (tag: {})", aname, t.resref, t.tag));
+                                        }
+                                    }
+                                    for w in &area.waypoints {
+                                        if w.tag.to_lowercase().contains(&term) {
+                                            self.search_results.push(format!("Area {} / Waypoint '{}' (tag: {})", aname, w.resref, w.tag));
+                                        }
+                                    }
+                                    for e in &area.encounters {
+                                        if e.tag.to_lowercase().contains(&term) {
+                                            self.search_results.push(format!("Area {} / Encounter (tag: {})", aname, e.tag));
+                                        }
+                                    }
+                                    for s in &area.sound_emitters {
+                                        if s.tag.to_lowercase().contains(&term) {
+                                            self.search_results.push(format!("Area {} / Sound Emitter (tag: {})", aname, s.tag));
+                                        }
+                                    }
+                                }
+                            }
+
+                            // Search ERF resource names
+                            if let Some(ref erf) = module.erf {
+                                for res in erf.resources() {
+                                    let resref_lower = res.resref.to_lowercase();
+                                    if resref_lower.contains(&term) {
+                                        let ext = resource_types::type_to_ext(res.restype).unwrap_or("?");
+                                        self.search_results.push(format!("Resource: {}.{}", res.resref, ext));
+                                    }
+                                    // Search script contents
+                                    if res.restype == resource_types::NSS {
+                                        if let Some(data) = erf.get(&res.resref, resource_types::NSS) {
+                                            if let Ok(content) = String::from_utf8(data) {
+                                                for (lineno, line) in content.lines().enumerate() {
+                                                    if line.to_lowercase().contains(&term) {
+                                                        self.search_results.push(format!("Script {}:{} — {}", res.resref, lineno + 1, line.trim()));
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        ui.separator();
+                        ui.label(format!("{} result(s)", self.search_results.len()));
+                        ui.separator();
+                        egui::ScrollArea::vertical().show(ui, |ui| {
+                            for result in &self.search_results {
+                                ui.label(result);
+                            }
+                        });
+                    } else {
+                        ui.label("No module loaded.");
+                    }
+                });
+            if !open {
+                self.id_whois_open = false;
+            }
+        }
+
+        // Area Geometry Editor
+        if self.geometry_editor.open {
+            show_geometry_editor(&mut self.geometry_editor, ctx, self.current_area.as_ref());
+            // Apply geometry changes from editor
+            if let Some((typ, idx, new_geom)) = self.geometry_editor.commit.take() {
+                self.push_undo();
+                if let Some(ref mut module) = self.module {
+                    if let Some(area) = self.current_area.as_mut() {
+                        let area = Arc::make_mut(area);
+                        match typ.as_str() {
+                            "trigger" => {
+                                if idx < area.triggers.len() {
+                                    area.triggers[idx].geometry = new_geom;
+                                    module.update_area_git(&area.resref, area);
+                                }
+                            }
+                            "encounter" => {
+                                if idx < area.encounters.len() {
+                                    area.encounters[idx].geometry = new_geom;
+                                    module.update_area_git(&area.resref, area);
+                                }
+                            }
+                            _ => {}
+                        }
+                        self.area_version = self.area_version.wrapping_add(1);
+                        self.viewport.set_area(Arc::new(area.clone()), self.area_version, target_format);
+                    }
+                }
+            }
+        }
+
         // Sky color override window
         if self.show_sky_override || self.clear_override_enabled {
             egui::Window::new("Sky Color Override")
@@ -2183,6 +2684,11 @@ impl eframe::App for AuroraBorealisApp {
         // Texture Browser window
         if self.texture_browser.open {
             show_texture_browser(ctx, &mut self.texture_browser, &self.module);
+        }
+
+        // Tileset Browser window
+        if self.tileset_browser.open {
+            show_tileset_browser(&mut self.tileset_browser, ctx, self.module.as_ref());
         }
 
         // Resource Viewer window
@@ -3370,6 +3876,7 @@ impl eframe::App for AuroraBorealisApp {
                                             resref: resref.clone(), tag,
                                             x: self.new_object_x, y: self.new_object_y,
                                             z: self.new_object_z, bearing: self.new_object_bearing,
+                                            geometry: Vec::new(),
                                         });
                                     }
                                     "waypoint" => {

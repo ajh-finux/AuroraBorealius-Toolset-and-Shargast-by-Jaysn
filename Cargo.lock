@@ -582,6 +582,7 @@ dependencies = [
  "nwn-gff",
  "nwn-lib-rs",
  "nwn-script",
+ "nwn-tileset",
  "nwn-tlk",
  "nwnrs-types",
  "rayon",

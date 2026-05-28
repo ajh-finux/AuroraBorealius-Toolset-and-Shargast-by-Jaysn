@@ -24,6 +24,7 @@ nwn-gamemodel = { path = "../nwn-gamemodel" }
 nwn-tlk = { path = "../nwn-tlk" }
 nwn-script = { path = "../nwn-script" }
 nwn-2da = { path = "../nwn-2da" }
+nwn-tileset = { path = "../nwn-tileset" }
 nwn-3d = { path = "../nwn-3d" }
 nwnrs-types = { version = "0.0.1", default-features = false, features = ["set", "key", "mdl", "dds", "tga", "checksums", "compressedbuf"] }
 image = "0.25"
