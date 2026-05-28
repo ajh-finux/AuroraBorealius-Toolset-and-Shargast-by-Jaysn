@@ -156,6 +156,8 @@ struct AuroraBorealisApp {
     #[allow(dead_code)]
     area_list_cache: Vec<(String, String)>,
     show_minimap: bool,
+    graph_view_open: bool,
+    graph_view_state: GraphViewState,
     show_walkmesh: bool,
     show_walkmesh_edges: bool,
     show_paint: bool,
@@ -259,6 +261,62 @@ struct AppearanceEntry {
     id: i32,
     label: String,
     model: String,
+}
+
+struct GraphViewState {
+    pan_x: f32,
+    pan_y: f32,
+    zoom: f32,
+    filter_creatures: bool,
+    filter_doors: bool,
+    filter_placeables: bool,
+    filter_triggers: bool,
+    filter_waypoints: bool,
+    filter_encounters: bool,
+    filter_sound_emitters: bool,
+}
+
+impl Default for GraphViewState {
+    fn default() -> Self {
+        Self {
+            pan_x: 0.0,
+            pan_y: 0.0,
+            zoom: 8.0,
+            filter_creatures: true,
+            filter_doors: true,
+            filter_placeables: true,
+            filter_triggers: true,
+            filter_waypoints: true,
+            filter_encounters: true,
+            filter_sound_emitters: true,
+        }
+    }
+}
+
+trait GraphLabel {
+    fn graph_label(&self) -> String;
+}
+
+impl GraphLabel for nwn_gamemodel::CreatureInstance {
+    fn graph_label(&self) -> String { format!("{} ({})", self.resref, self.tag) }
+}
+impl GraphLabel for nwn_gamemodel::DoorInstance {
+    fn graph_label(&self) -> String { format!("{} ({})", self.resref, self.tag) }
+}
+impl GraphLabel for nwn_gamemodel::PlaceableInstance {
+    fn graph_label(&self) -> String { format!("{} ({})", self.resref, self.tag) }
+}
+impl GraphLabel for nwn_gamemodel::TriggerInstance {
+    fn graph_label(&self) -> String { format!("Trigger ({})", self.tag) }
+}
+impl GraphLabel for nwn_gamemodel::WayPointInstance {
+    fn graph_label(&self) -> String { format!("Waypoint ({})", self.tag) }
+}
+impl GraphLabel for nwn_gamemodel::EncounterInstance {
+    fn graph_label(&self) -> String { format!("{} ({})", self.name, self.tag) }
+}
+impl GraphLabel for nwn_gamemodel::SoundEmitterInstance {
+    fn graph_label(&self) -> String { format!("Sound: {}", self.tag) }
 }
 
 fn load_local_vars(module: &nwn_gamemodel::Module, area_resref: &str, obj_type: &str, obj_idx: usize) -> Vec<LocalVar> {
@@ -640,6 +698,8 @@ impl AuroraBorealisApp {
             tlk_file: None,
             area_list_cache: Vec::new(),
             show_minimap: false,
+            graph_view_open: false,
+            graph_view_state: GraphViewState::default(),
             show_walkmesh: false,
             show_walkmesh_edges: false,
             show_fog: false,
@@ -823,6 +883,7 @@ impl eframe::App for AuroraBorealisApp {
                     ui.checkbox(&mut self.show_sky_override, "Sky Color Override");
                     ui.checkbox(&mut self.show_navigator, "Navigator Panel");
                     ui.checkbox(&mut self.show_minimap, "Minimap Overlay");
+                    ui.checkbox(&mut self.graph_view_open, "Graph Area View");
                     ui.checkbox(&mut self.show_contents_panel, "Contents Panel");
                     ui.separator();
                     let mut ww = self.walkmesh_wall_mode;
@@ -1438,6 +1499,254 @@ impl eframe::App for AuroraBorealisApp {
                 });
             if close {
                 self.inventory_editor = None;
+            }
+        }
+
+        // ===================== GRAPH AREA VIEW =====================
+        if self.graph_view_open {
+            let mut open = true;
+            // Clone area for read-only use inside the window closure
+            let area_clone = self.current_area.clone();
+            let mut out_selection: Option<(String, usize)> = None;
+            let mut out_select_tile: Option<(usize, usize)> = None;
+            let mut area_update: Option<(String, String, usize, f32, f32)> = None;
+            egui::Window::new("Graph Area View")
+                .default_size([500.0, 400.0])
+                .open(&mut open)
+                .show(ctx, |ui| {
+                    if let Some(ref area) = area_clone {
+                        ui.horizontal(|ui| {
+                            ui.label(format!("Area: {}  {}x{}", area.resref, area.width, area.height));
+                            if ui.button("Reset View").clicked() {
+                                self.graph_view_state.pan_x = 0.0;
+                                self.graph_view_state.pan_y = 0.0;
+                                self.graph_view_state.zoom = 8.0;
+                            }
+                        });
+                        ui.horizontal_wrapped(|ui| {
+                            ui.checkbox(&mut self.graph_view_state.filter_creatures, "Creatures");
+                            ui.checkbox(&mut self.graph_view_state.filter_doors, "Doors");
+                            ui.checkbox(&mut self.graph_view_state.filter_placeables, "Placeables");
+                            ui.checkbox(&mut self.graph_view_state.filter_triggers, "Triggers");
+                            ui.checkbox(&mut self.graph_view_state.filter_waypoints, "Waypoints");
+                            ui.checkbox(&mut self.graph_view_state.filter_encounters, "Encounters");
+                            ui.checkbox(&mut self.graph_view_state.filter_sound_emitters, "Sound");
+                        });
+                        ui.separator();
+                        let (resp, painter) = ui.allocate_painter(ui.available_size(), egui::Sense::click_and_drag());
+                        let rect = resp.rect;
+                        let aw = area.width as f32 * 10.0;
+                        let ah = area.height as f32 * 10.0;
+                        let zoom = self.graph_view_state.zoom.max(1.0);
+                        let cx = rect.center().x + self.graph_view_state.pan_x;
+                        let cy = rect.center().y + self.graph_view_state.pan_y;
+                        let to_screen = |wx: f32, wy: f32| -> egui::Pos2 {
+                            egui::pos2(
+                                cx + (wx - aw / 2.0) * zoom,
+                                cy - (wy - ah / 2.0) * zoom,
+                            )
+                        };
+                        let to_world = |sx: f32, sy: f32| -> (f32, f32) {
+                            let wx = (sx - cx) / zoom + aw / 2.0;
+                            let wy = -(sy - cy) / zoom + ah / 2.0;
+                            (wx, wy)
+                        };
+                        // Draw tiles
+                        let tile_start_col = ((rect.left() - cx) / zoom + aw / 2.0 / 10.0).floor() as i32 - 1;
+                        let tile_end_col = ((rect.right() - cx) / zoom + aw / 2.0 / 10.0).ceil() as i32 + 1;
+                        let tile_start_row = (-(rect.bottom() - cy) / zoom + ah / 2.0 / 10.0).floor() as i32 - 1;
+                        let tile_end_row = (-(rect.top() - cy) / zoom + ah / 2.0 / 10.0).ceil() as i32 + 1;
+                        for row in tile_start_row.max(0)..tile_end_row.min(area.height as i32) {
+                            for col in tile_start_col.max(0)..tile_end_col.min(area.width as i32) {
+                                let idx = (row as usize) * area.width as usize + (col as usize);
+                                let color = area.tiles.get(idx).map(|t| {
+                                    let id = t.id as u32;
+                                    let r = ((id * 137 + 53) % 200 + 55) as u8;
+                                    let g = ((id * 251 + 97) % 200 + 55) as u8;
+                                    let b = ((id * 199 + 173) % 200 + 55) as u8;
+                                    egui::Color32::from_rgb(r, g, b)
+                                }).unwrap_or(egui::Color32::from_gray(40));
+                                let p0 = to_screen(col as f32 * 10.0, row as f32 * 10.0);
+                                let p1 = to_screen((col + 1) as f32 * 10.0, (row + 1) as f32 * 10.0);
+                                let t_rect = egui::Rect::from_min_max(
+                                    egui::pos2(p0.x.min(p1.x), p0.y.min(p1.y)),
+                                    egui::pos2(p0.x.max(p1.x), p0.y.max(p1.y)),
+                                );
+                                painter.rect_filled(t_rect, 0.0, color);
+                                painter.rect_stroke(t_rect, 0.0, egui::Stroke::new(0.5, egui::Color32::from_gray(60)), egui::StrokeKind::Outside);
+                            }
+                        }
+                        let selected = self.selected_obj_info.clone();
+                        macro_rules! draw_objects {
+                            ($list:expr, $typ:expr, $color:expr) => {{
+                                for (i, obj) in $list.iter().enumerate() {
+                                    let sp = to_screen(obj.x, obj.y);
+                                    if !rect.contains(sp) { continue; }
+                                    let is_sel = selected.as_ref().map_or(false, |(t, idx)| t == $typ && *idx == i);
+                                    let radius = if is_sel { 6.0 } else { 4.0 };
+                                    let fill = if is_sel { egui::Color32::WHITE } else { $color };
+                                    painter.circle_filled(sp, radius, fill);
+                                    if is_sel {
+                                        painter.circle_stroke(sp, radius + 2.0, egui::Stroke::new(2.0, egui::Color32::WHITE));
+                                    }
+                                    if zoom > 12.0 {
+                                        let label_pos = egui::pos2(sp.x + 6.0, sp.y - 4.0);
+                                        painter.text(label_pos, egui::Align2::LEFT_CENTER, &obj.graph_label(), egui::FontId::proportional(10.0), egui::Color32::WHITE);
+                                    }
+                                }
+                            }};
+                        }
+                        macro_rules! hit_test_objects {
+                            ($list:expr, $typ:expr, $hp:expr, $closest:expr) => {
+                                for (i, obj) in $list.iter().enumerate() {
+                                    let sp = to_screen(obj.x, obj.y);
+                                    let dist = $hp.distance(sp);
+                                    if dist < 12.0 {
+                                        if $closest.as_ref().map_or(true, |(_, _, d)| dist < *d) {
+                                            $closest = Some(($typ.to_string(), i, dist));
+                                        }
+                                    }
+                                }
+                            };
+                        }
+                        if self.graph_view_state.filter_creatures {
+                            draw_objects!(area.creatures, "creature", egui::Color32::RED);
+                        }
+                        if self.graph_view_state.filter_doors {
+                            draw_objects!(area.doors, "door", egui::Color32::YELLOW);
+                        }
+                        if self.graph_view_state.filter_placeables {
+                            draw_objects!(area.placeables, "placeable", egui::Color32::BLUE);
+                        }
+                        if self.graph_view_state.filter_triggers {
+                            draw_objects!(area.triggers, "trigger", egui::Color32::GREEN);
+                        }
+                        if self.graph_view_state.filter_waypoints {
+                            draw_objects!(area.waypoints, "waypoint", egui::Color32::WHITE);
+                        }
+                        if self.graph_view_state.filter_encounters {
+                            draw_objects!(area.encounters, "encounter", egui::Color32::from_rgb(255, 128, 0));
+                        }
+                        if self.graph_view_state.filter_sound_emitters {
+                            draw_objects!(area.sound_emitters, "sound_emitter", egui::Color32::CYAN);
+                        }
+                        // Input handling
+                        let hover_pos = resp.hover_pos();
+                        let clicked = resp.clicked();
+                        let drag_delta = resp.drag_delta();
+                        let scroll = ui.input(|i| i.raw_scroll_delta);
+                        if resp.hovered() && scroll.y != 0.0 {
+                            let old_zoom = self.graph_view_state.zoom;
+                            self.graph_view_state.zoom = (self.graph_view_state.zoom * (1.0 + scroll.y * 0.002)).clamp(1.0, 100.0);
+                            if let Some(hp) = hover_pos {
+                                let factor = self.graph_view_state.zoom / old_zoom;
+                                let mx = hp.x - cx;
+                                let my = hp.y - cy;
+                                self.graph_view_state.pan_x = self.graph_view_state.pan_x * factor - mx * (factor - 1.0);
+                                self.graph_view_state.pan_y = self.graph_view_state.pan_y * factor - my * (factor - 1.0);
+                            }
+                        }
+                        if resp.dragged_by(egui::PointerButton::Secondary) || resp.dragged_by(egui::PointerButton::Middle) {
+                            self.graph_view_state.pan_x += drag_delta.x;
+                            self.graph_view_state.pan_y += drag_delta.y;
+                        }
+                        if clicked {
+                            if let Some(hp) = hover_pos {
+                                let mut closest: Option<(String, usize, f32)> = None;
+                                if self.graph_view_state.filter_creatures {
+                                    hit_test_objects!(area.creatures, "creature", hp, closest);
+                                }
+                                if self.graph_view_state.filter_doors {
+                                    hit_test_objects!(area.doors, "door", hp, closest);
+                                }
+                                if self.graph_view_state.filter_placeables {
+                                    hit_test_objects!(area.placeables, "placeable", hp, closest);
+                                }
+                                if self.graph_view_state.filter_triggers {
+                                    hit_test_objects!(area.triggers, "trigger", hp, closest);
+                                }
+                                if self.graph_view_state.filter_waypoints {
+                                    hit_test_objects!(area.waypoints, "waypoint", hp, closest);
+                                }
+                                if self.graph_view_state.filter_encounters {
+                                    hit_test_objects!(area.encounters, "encounter", hp, closest);
+                                }
+                                if self.graph_view_state.filter_sound_emitters {
+                                    hit_test_objects!(area.sound_emitters, "sound_emitter", hp, closest);
+                                }
+                                if let Some((typ, idx, _)) = closest {
+                                    out_selection = Some((typ, idx));
+                                } else {
+                                    let (wx, wy) = to_world(hp.x, hp.y);
+                                    let col = (wx / 10.0).floor() as usize;
+                                    let row = (wy / 10.0).floor() as usize;
+                                    if col < area.width as usize && row < area.height as usize {
+                                        out_select_tile = Some((col, row));
+                                    }
+                                }
+                            }
+                        }
+                        // Drag object to move (left-click drag on selected object)
+                        if resp.dragged_by(egui::PointerButton::Primary) && resp.hovered() && self.selected_obj_info.is_some() {
+                            if let Some(hp) = hover_pos {
+                                if let Some((ref obj_type, obj_idx)) = self.selected_obj_info.clone() {
+                                    let (wx, wy) = to_world(hp.x, hp.y);
+                                    let (nx, ny) = snap_to_grid_pos(wx, wy, true, 10.0);
+                                    area_update = Some((obj_type.clone(), area.resref.clone(), obj_idx, nx, ny));
+                                }
+                            }
+                        }
+                    } else {
+                        ui.label("No area loaded.");
+                    }
+                });
+            if !open {
+                self.graph_view_open = false;
+            }
+            // Apply selection changes outside closure
+            if let Some((ref typ, idx)) = out_selection {
+                if let Some(ref area) = self.current_area {
+                    let bag = match typ.as_str() {
+                        "creature" => area.creatures.get(idx).map(|c| c.to_property_bag()),
+                        "door" => area.doors.get(idx).map(|d| d.to_property_bag()),
+                        "placeable" => area.placeables.get(idx).map(|p| p.to_property_bag()),
+                        "trigger" => area.triggers.get(idx).map(|t| t.to_property_bag()),
+                        "waypoint" => area.waypoints.get(idx).map(|w| w.to_property_bag()),
+                        "encounter" => area.encounters.get(idx).map(|e| e.to_property_bag()),
+                        "sound_emitter" => area.sound_emitters.get(idx).map(|s| s.to_property_bag()),
+                        _ => None,
+                    };
+                    if let Some(bag) = bag {
+                        self.selected_object = Some(SelectedObject { title: format!("{} #{}", typ, idx), bag });
+                        self.selected_obj_info = Some((typ.clone(), idx));
+                        self.selection_list.clear();
+                        self.status = format!("Selected {} #{}", typ, idx);
+                    }
+                }
+            }
+            if let Some((col, row)) = out_select_tile {
+                self.selected_tile = Some((col, row));
+                self.status = format!("Selected tile ({}, {})", col, row);
+            }
+            // Apply drag-move updates outside closure
+            if let Some((obj_type, area_resref, obj_idx, nx, ny)) = area_update {
+                if let Some(ref mut area) = self.current_area {
+                    let area_mut = Arc::make_mut(area);
+                    match obj_type.as_str() {
+                        "creature" => if let Some(obj) = area_mut.creatures.get_mut(obj_idx) { obj.x = nx; obj.y = ny; }
+                        "door" => if let Some(obj) = area_mut.doors.get_mut(obj_idx) { obj.x = nx; obj.y = ny; }
+                        "placeable" => if let Some(obj) = area_mut.placeables.get_mut(obj_idx) { obj.x = nx; obj.y = ny; }
+                        "trigger" => if let Some(obj) = area_mut.triggers.get_mut(obj_idx) { obj.x = nx; obj.y = ny; }
+                        "waypoint" => if let Some(obj) = area_mut.waypoints.get_mut(obj_idx) { obj.x = nx; obj.y = ny; }
+                        "encounter" => if let Some(obj) = area_mut.encounters.get_mut(obj_idx) { obj.x = nx; obj.y = ny; }
+                        "sound_emitter" => if let Some(obj) = area_mut.sound_emitters.get_mut(obj_idx) { obj.x = nx; obj.y = ny; }
+                        _ => {}
+                    }
+                    if let Some(ref mut module) = self.module {
+                        module.update_area_git(&area_resref, area);
+                    }
+                    self.area_version = self.area_version.wrapping_add(1);
+                }
             }
         }
 
