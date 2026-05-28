@@ -158,6 +158,8 @@ struct AuroraBorealisApp {
     show_minimap: bool,
     graph_view_open: bool,
     graph_view_state: GraphViewState,
+    height_map_open: bool,
+    height_map_state: HeightMapState,
     show_walkmesh: bool,
     show_walkmesh_edges: bool,
     show_paint: bool,
@@ -189,6 +191,7 @@ struct AuroraBorealisApp {
     journal_editor_open: bool,
     encounter_editor_open: bool,
     env_settings_open: bool,
+    transition_editor_open: bool,
     env_sun_fog_amount: u8,
     env_sun_fog_color: [u8; 3],
     env_moon_fog_amount: u8,
@@ -289,6 +292,28 @@ impl Default for GraphViewState {
             filter_waypoints: true,
             filter_encounters: true,
             filter_sound_emitters: true,
+        }
+    }
+}
+
+struct HeightMapState {
+    pan_x: f32,
+    pan_y: f32,
+    zoom: f32,
+    brush_size: i32,
+    brush_amount: i32,
+    show_heights: bool,
+}
+
+impl Default for HeightMapState {
+    fn default() -> Self {
+        Self {
+            pan_x: 0.0,
+            pan_y: 0.0,
+            zoom: 20.0,
+            brush_size: 1,
+            brush_amount: 1,
+            show_heights: false,
         }
     }
 }
@@ -700,6 +725,8 @@ impl AuroraBorealisApp {
             show_minimap: false,
             graph_view_open: false,
             graph_view_state: GraphViewState::default(),
+            height_map_open: false,
+            height_map_state: HeightMapState::default(),
             show_walkmesh: false,
             show_walkmesh_edges: false,
             show_fog: false,
@@ -732,6 +759,7 @@ impl AuroraBorealisApp {
             journal_editor_open: false,
             encounter_editor_open: false,
             env_settings_open: false,
+            transition_editor_open: false,
             env_sun_fog_amount: 0,
             env_sun_fog_color: [0, 0, 0],
             env_moon_fog_amount: 0,
@@ -884,6 +912,7 @@ impl eframe::App for AuroraBorealisApp {
                     ui.checkbox(&mut self.show_navigator, "Navigator Panel");
                     ui.checkbox(&mut self.show_minimap, "Minimap Overlay");
                     ui.checkbox(&mut self.graph_view_open, "Graph Area View");
+                    ui.checkbox(&mut self.height_map_open, "Height Map View");
                     ui.checkbox(&mut self.show_contents_panel, "Contents Panel");
                     ui.separator();
                     let mut ww = self.walkmesh_wall_mode;
@@ -1063,6 +1092,13 @@ impl eframe::App for AuroraBorealisApp {
                     if ui.button("Find/Replace in Scripts...").clicked() {
                         self.status = "Find/Replace feature coming soon.".to_string();
                         ui.close_menu();
+                    }
+                    if self.module.is_some() {
+                        if ui.button("Area Transition Editor...").clicked() {
+                            self.transition_editor_open = true;
+                            self.status = "Scanned transitions. Open the Transition Editor window.".to_string();
+                            ui.close_menu();
+                        }
                     }
                 });
                 // ---- Camera bookmarks ----
@@ -1747,6 +1783,315 @@ impl eframe::App for AuroraBorealisApp {
                     }
                     self.area_version = self.area_version.wrapping_add(1);
                 }
+            }
+        }
+
+        // ===================== HEIGHT MAP VIEW =====================
+        if self.height_map_open {
+            let mut open = true;
+            let mut area_modified = false;
+            egui::Window::new("Height Map")
+                .default_size([500.0, 400.0])
+                .open(&mut open)
+                .show(ctx, |ui| {
+                    let hms = &mut self.height_map_state;
+                    ui.horizontal(|ui| {
+                        ui.label("Brush:");
+                        ui.add(egui::Slider::new(&mut hms.brush_size, 1..=10).text("Size"));
+                        ui.add(egui::Slider::new(&mut hms.brush_amount, 1..=50).text("Amount"));
+                    });
+                    ui.horizontal(|ui| {
+                        if ui.button("Reset View").clicked() {
+                            hms.pan_x = 0.0;
+                            hms.pan_y = 0.0;
+                            hms.zoom = 20.0;
+                        }
+                        ui.checkbox(&mut hms.show_heights, "Show Values");
+                        ui.label("Left-click: raise  Shift+click: lower");
+                    });
+                    ui.separator();
+                    if let Some(ref area) = self.current_area.clone() {
+                        let (resp, painter) = ui.allocate_painter(ui.available_size(), egui::Sense::click_and_drag());
+                        let rect = resp.rect;
+                        let aw = area.width as f32;
+                        let ah = area.height as f32;
+                        let zoom = hms.zoom.max(2.0);
+                        let tile_px = zoom;
+                        let cx = rect.center().x + hms.pan_x;
+                        let cy = rect.center().y + hms.pan_y;
+                        let to_screen = |col: f32, row: f32| -> egui::Pos2 {
+                            egui::pos2(
+                                cx + (col - aw / 2.0) * tile_px,
+                                cy + (row - ah / 2.0) * tile_px,
+                            )
+                        };
+                        let to_grid = |sx: f32, sy: f32| -> (i32, i32) {
+                            let col = ((sx - cx) / tile_px + aw / 2.0).floor() as i32;
+                            let row = ((sy - cy) / tile_px + ah / 2.0).floor() as i32;
+                            (col, row)
+                        };
+                        let col_start = ((rect.left() - cx) / tile_px + aw / 2.0).floor() as i32 - 1;
+                        let col_end = ((rect.right() - cx) / tile_px + aw / 2.0).ceil() as i32 + 1;
+                        let row_start = ((rect.top() - cy) / tile_px + ah / 2.0).floor() as i32 - 1;
+                        let row_end = ((rect.bottom() - cy) / tile_px + ah / 2.0).ceil() as i32 + 1;
+                        for row in row_start.max(0)..row_end.min(area.height as i32) {
+                            for col in col_start.max(0)..col_end.min(area.width as i32) {
+                                let idx = (row as usize) * area.width as usize + (col as usize);
+                                let height = area.tiles.get(idx).map(|t| t.height).unwrap_or(0);
+                                // Color gradient: 0=blue, 64=green, 128=yellow, 192=orange, 255=red
+                                let (r, g, b) = height_to_color(height);
+                                let p0 = to_screen(col as f32, row as f32);
+                                let p1 = to_screen((col + 1) as f32, (row + 1) as f32);
+                                let t_rect = egui::Rect::from_min_max(p0, p1);
+                                painter.rect_filled(t_rect, 0.0, egui::Color32::from_rgb(r, g, b));
+                                painter.rect_stroke(t_rect, 0.0, egui::Stroke::new(0.5, egui::Color32::from_gray(40)), egui::StrokeKind::Outside);
+                                if hms.show_heights && zoom > 8.0 {
+                                    let center = t_rect.center();
+                                    painter.text(center, egui::Align2::CENTER_CENTER, &format!("{}", height), egui::FontId::proportional(8.0), egui::Color32::WHITE);
+                                }
+                            }
+                        }
+                        // Handle click to raise/lower
+                        let clicked = resp.clicked();
+                        let dragged = resp.dragged_by(egui::PointerButton::Primary);
+                        let scroll = ui.input(|i| i.raw_scroll_delta);
+                        if resp.hovered() && scroll.y != 0.0 {
+                            hms.zoom = (hms.zoom * (1.0 + scroll.y * 0.003)).clamp(2.0, 200.0);
+                        }
+                        if resp.dragged_by(egui::PointerButton::Secondary) || resp.dragged_by(egui::PointerButton::Middle) {
+                            hms.pan_x += resp.drag_delta().x;
+                            hms.pan_y += resp.drag_delta().y;
+                        }
+                        if (clicked || dragged) && resp.hovered() {
+                            if let Some(hp) = resp.hover_pos() {
+                                let (gcol, grow) = to_grid(hp.x, hp.y);
+                                let half = hms.brush_size / 2;
+                                let shift = ui.input(|i| i.modifiers.shift);
+                                let amount = if shift { -hms.brush_amount } else { hms.brush_amount };
+                                self.push_undo();
+                                if let Some(ref mut area_mut) = self.current_area {
+                                    let area_mut = Arc::make_mut(area_mut);
+                                    for dr in -half..=half {
+                                        for dc in -half..=half {
+                                            let r = grow + dr;
+                                            let c = gcol + dc;
+                                            if r >= 0 && r < area_mut.height && c >= 0 && c < area_mut.width {
+                                                let idx = (r as usize) * area_mut.width as usize + (c as usize);
+                                                let new_h = (area_mut.tiles[idx].height + amount).clamp(0, 255);
+                                                area_mut.tiles[idx].height = new_h;
+                                            }
+                                        }
+                                    }
+                                    area_modified = true;
+                                }
+                            }
+                        }
+                    } else {
+                        ui.label("No area loaded.");
+                    }
+                });
+            if !open {
+                self.height_map_open = false;
+            }
+            if area_modified {
+                if let Some(ref area) = self.current_area {
+                    let resref = area.resref.clone();
+                    if let Some(ref mut module) = self.module {
+                        module.update_area_are(&resref, area);
+                    }
+                    self.area_version = self.area_version.wrapping_add(1);
+                    self.viewport.set_area(area.clone(), self.area_version, target_format);
+                    self.status = "Height map edited.".to_string();
+                }
+            }
+        }
+
+        // ===================== AREA TRANSITION EDITOR =====================
+        if self.transition_editor_open {
+            let mut open = true;
+            let mut saved_any = false;
+            let mut save_results: Vec<(String, String, String, String)> = Vec::new();
+            egui::Window::new("Area Transition Editor")
+                .default_size([700.0, 500.0])
+                .open(&mut open)
+                .show(ctx, |ui| {
+                    if let Some(ref module) = self.module {
+                        ui.label("Objects with transitions (doors/triggers that link to another area).");
+                        ui.separator();
+                        let area_names = module.area_names();
+                        if area_names.is_empty() {
+                            ui.label("No areas in module.");
+                            return;
+                        }
+                        egui::ScrollArea::both().show(ui, |ui| {
+                            for area_resref in area_names {
+                                let git_key = area_resref.trim().to_lowercase();
+                                let git_data = module.raw_git.get(&git_key);
+                                let gff = git_data.and_then(|d| nwn_gff::GffFile::from_bytes(d).ok());
+                                if gff.is_none() { continue; }
+                                let gff = gff.unwrap();
+                                let mut has_any = false;
+                                // Check Door_List for transitions
+                                if let Some(door_list) = gff.root().find("Door_List").and_then(|fv| match fv { nwn_gff::FieldValue::List(l) => Some(l), _ => None }) {
+                                    for (i, door) in door_list.iter().enumerate() {
+                                        let is_transition = door.find("Transition").and_then(|fv| match fv { nwn_gff::FieldValue::Int(v) => Some(*v != 0), _ => None }).unwrap_or(false);
+                                        if !is_transition { continue; }
+                                        has_any = true;
+                                        let tag = door.find("Tag").and_then(|fv| match fv { nwn_gff::FieldValue::String(s) => Some(s.clone()), _ => None }).unwrap_or_default();
+                                        let dest_area = door.find("TransitionDestin").and_then(|fv| match fv { nwn_gff::FieldValue::ResRef(s) => Some(s.clone()), nwn_gff::FieldValue::String(s) => Some(s.clone()), _ => None }).unwrap_or_default();
+                                        let dest_tag = door.find("TransitionDestinTag").and_then(|fv| match fv { nwn_gff::FieldValue::String(s) => Some(s.clone()), _ => None }).unwrap_or_default();
+                                        let header = format!("Door \"{}\" -> {} ({})", tag, dest_area, dest_tag);
+                                        let id = egui::Id::new(("trans_door", area_resref.clone(), i));
+                                        egui::CollapsingHeader::new(header)
+                                            .id_salt(id)
+                                            .default_open(false)
+                                            .show(ui, |ui| {
+                                                ui.horizontal(|ui| {
+                                                    ui.label("Destination Area:");
+                                                    let area_combo_id = egui::Id::new(("trans_area_combo", area_resref.clone(), i));
+                                                    egui::ComboBox::from_id_salt(area_combo_id)
+                                                        .selected_text(&dest_area)
+                                                        .show_ui(ui, |ui| {
+                                                            for an in area_names {
+                                                                if ui.selectable_label(false, an).clicked() && an != &dest_area {
+                                                                    save_results.push((area_resref.clone(), "Door_List".to_string(), i.to_string(), format!("TransitionDestin:{}", an)));
+                                                                }
+                                                            }
+                                                        });
+                                                });
+                                                ui.horizontal(|ui| {
+                                                    ui.label("To Waypoint:");
+                                                    let new_tag = &mut dest_tag.clone();
+                                                    if ui.text_edit_singleline(new_tag).changed() {
+                                                    }
+                                                    if ui.button("Save Waypoint").clicked() {
+                                                        let val = new_tag.clone();
+                                                        save_results.push((area_resref.clone(), "Door_List".to_string(), i.to_string(), format!("TransitionDestinTag:{}", val)));
+                                                    }
+                                                });
+                                            });
+                                    }
+                                }
+                                // Check Trigger_List for transitions
+                                if let Some(trigger_list) = gff.root().find("Trigger_List").and_then(|fv| match fv { nwn_gff::FieldValue::List(l) => Some(l), _ => None }) {
+                                    for (i, trigger) in trigger_list.iter().enumerate() {
+                                        let transition = trigger.find("Transition").and_then(|fv| match fv { nwn_gff::FieldValue::Int(v) => Some(*v != 0), _ => None }).unwrap_or(false);
+                                        let has_destin = trigger.find("TransitionDestin").is_some();
+                                        if !transition && !has_destin { continue; }
+                                        has_any = true;
+                                        let tag = trigger.find("Tag").and_then(|fv| match fv { nwn_gff::FieldValue::String(s) => Some(s.clone()), _ => None }).unwrap_or_default();
+                                        let dest_area = trigger.find("TransitionDestin").and_then(|fv| match fv { nwn_gff::FieldValue::ResRef(s) => Some(s.clone()), nwn_gff::FieldValue::String(s) => Some(s.clone()), _ => None }).unwrap_or_default();
+                                        let dest_tag = trigger.find("TransitionDestinTag").and_then(|fv| match fv { nwn_gff::FieldValue::String(s) => Some(s.clone()), _ => None }).unwrap_or_default();
+                                        let header = format!("Trigger \"{}\" -> {} ({})", tag, dest_area, dest_tag);
+                                        let id = egui::Id::new(("trans_trigger", area_resref.clone(), i));
+                                        egui::CollapsingHeader::new(header)
+                                            .id_salt(id)
+                                            .default_open(false)
+                                            .show(ui, |ui| {
+                                                ui.horizontal(|ui| {
+                                                    ui.label("Destination Area:");
+                                                    let area_combo_id = egui::Id::new(("trans_trig_combo", area_resref.clone(), i));
+                                                    egui::ComboBox::from_id_salt(area_combo_id)
+                                                        .selected_text(&dest_area)
+                                                        .show_ui(ui, |ui| {
+                                                            for an in area_names {
+                                                                if ui.selectable_label(false, an).clicked() && an != &dest_area {
+                                                                    save_results.push((area_resref.clone(), "Trigger_List".to_string(), i.to_string(), format!("TransitionDestin:{}", an)));
+                                                                }
+                                                            }
+                                                        });
+                                                });
+                                                ui.horizontal(|ui| {
+                                                    ui.label("To Waypoint:");
+                                                    let new_tag = &mut dest_tag.clone();
+                                                    ui.text_edit_singleline(new_tag);
+                                                    if ui.button("Save Waypoint").clicked() {
+                                                        let val = new_tag.clone();
+                                                        save_results.push((area_resref.clone(), "Trigger_List".to_string(), i.to_string(), format!("TransitionDestinTag:{}", val)));
+                                                    }
+                                                });
+                                            });
+                                    }
+                                }
+                                if has_any {
+                                    ui.separator();
+                                }
+                            }
+                        });
+                    } else {
+                        ui.label("No module loaded.");
+                    }
+                });
+            if !open {
+                self.transition_editor_open = false;
+            }
+            // Apply saves outside closure
+            for (area_resref, list_name, idx_str, action) in save_results {
+                let idx: usize = match idx_str.parse() { Ok(i) => i, Err(_) => continue };
+                let git_key = area_resref.trim().to_lowercase();
+                let data = match self.module.as_ref().and_then(|m| m.raw_git.get(&git_key)) {
+                    Some(d) => d.clone(),
+                    None => continue,
+                };
+                let mut gff = match nwn_gff::GffFile::from_bytes(&data) { Ok(g) => g, Err(_) => continue };
+                let list_fv = match gff.root_mut().find_mut(&list_name) {
+                    Some(fv) => fv,
+                    None => continue,
+                };
+                let list = match list_fv {
+                    nwn_gff::FieldValue::List(l) => l,
+                    _ => continue,
+                };
+                let obj_struct = match list.get_mut(idx) {
+                    Some(s) => s,
+                    None => continue,
+                };
+                let parts: Vec<&str> = action.splitn(2, ':').collect();
+                if parts.len() != 2 { continue; }
+                let field_name = parts[0];
+                let field_value = parts[1];
+                let new_field_value = if field_name == "TransitionDestin" { nwn_gff::FieldValue::ResRef(field_value.to_string()) }
+                                 else { nwn_gff::FieldValue::String(field_value.to_string()) };
+                // Look for existing field and update, or push new
+                let mut found = false;
+                for f in obj_struct.fields.iter_mut() {
+                    let label_str: String = f.label.to_string();
+                    if label_str == field_name {
+                        f.value = new_field_value;
+                        found = true;
+                        break;
+                    }
+                }
+                if !found {
+                    use std::str::FromStr;
+                    let fss: nwn_lib_rs::parsing::FixedSizeString<16> = FromStr::from_str(field_name).unwrap_or_default();
+                    obj_struct.fields.push(nwn_gff::Field { label: std::rc::Rc::new(fss), value: if field_name == "TransitionDestin" { nwn_gff::FieldValue::ResRef(field_value.to_string()) } else { nwn_gff::FieldValue::String(field_value.to_string()) } });
+                }
+                let new_data = gff.to_bytes();
+                if let Some(ref mut module) = self.module {
+                    module.raw_git.insert(git_key.to_string(), new_data);
+                    module.modified = true;
+                }
+                saved_any = true;
+            }
+            if saved_any {
+                // Reload current area if it's the one we edited
+                if let Some(ref area) = self.current_area {
+                    let key = area.resref.trim().to_lowercase();
+                    if let Some(ref mut module) = self.module {
+                        if let Some(git_data) = module.raw_git.get(&key) {
+                            if let Ok(git_gff) = nwn_gff::GffFile::from_bytes(git_data) {
+                                let area_resref = area.resref.clone();
+                                let area_mut = Arc::make_mut(self.current_area.as_mut().unwrap());
+                                nwn_gamemodel::reload_from_git(area_mut, &git_gff);
+                                module.update_area_git(&area_resref, area_mut);
+                            }
+                        }
+                    }
+                    self.area_version = self.area_version.wrapping_add(1);
+                    self.viewport.set_area(self.current_area.clone().unwrap(), self.area_version, target_format);
+                }
+                self.status = "Transition(s) saved.".to_string();
             }
         }
 
@@ -3959,6 +4304,25 @@ fn add_recent_file(files: &mut Vec<String>, path: &str) {
         files.truncate(10);
     }
     save_recent_files(files);
+}
+
+fn height_to_color(height: i32) -> (u8, u8, u8) {
+    let h = height.clamp(0, 255) as f32 / 255.0;
+    // Blue (0,0,128) -> Cyan (0,128,255) -> Green (0,255,0) -> Yellow (255,255,0) -> Red (255,0,0)
+    let (r, g, b) = if h < 0.25 {
+        let t = h / 0.25;
+        (0, (128.0 + t * 127.0) as u8, (128.0 + t * 127.0) as u8)
+    } else if h < 0.5 {
+        let t = (h - 0.25) / 0.25;
+        (0, 255, (255.0 * (1.0 - t)) as u8)
+    } else if h < 0.75 {
+        let t = (h - 0.5) / 0.25;
+        ((255.0 * t) as u8, 255, 0)
+    } else {
+        let t = (h - 0.75) / 0.25;
+        (255, (255.0 * (1.0 - t)) as u8, 0)
+    };
+    (r, g, b)
 }
 
 fn export_minimap_png(area: &nwn_gamemodel::Area, path: &str) -> Result<(), String> {
