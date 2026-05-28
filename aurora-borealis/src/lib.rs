@@ -169,6 +169,15 @@ struct AuroraBorealisApp {
     water_level: i32,
     show_water: bool,
     module_props_popup: bool,
+    module_description_edit: String,
+    area_props_popup: bool,
+    area_props_resref: String,
+    area_props_name: String,
+    area_props_tag: String,
+    area_props_tileset: String,
+    local_var_editor: Option<LocalVarEditorState>,
+    appearance_picker: Option<AppearancePickerState>,
+    object_comment_edit: Option<(String, usize, String)>,
     placement_state: PlacementState,
     manip_mode: ManipMode,
     manip_nudge_speed: f32,
@@ -210,6 +219,288 @@ struct AuroraBorealisApp {
     new_object_y: f32,
     new_object_z: f32,
     new_object_bearing: f32,
+}
+
+#[derive(Debug, Clone)]
+struct LocalVarEditorState {
+    obj_type: String,
+    obj_idx: usize,
+    vars: Vec<LocalVar>,
+}
+
+#[derive(Debug, Clone)]
+struct AppearancePickerState {
+    obj_type: String,
+    obj_idx: usize,
+    filter: String,
+    appearances: Vec<AppearanceEntry>,
+}
+
+#[derive(Debug, Clone)]
+struct LocalVar {
+    name: String,
+    var_type: String,
+    value: String,
+}
+
+#[derive(Debug, Clone)]
+struct AppearanceEntry {
+    id: i32,
+    label: String,
+    model: String,
+}
+
+fn load_local_vars(module: &nwn_gamemodel::Module, area_resref: &str, obj_type: &str, obj_idx: usize) -> Vec<LocalVar> {
+    let git_key = area_resref.trim().to_lowercase();
+    let git_data = module.raw_git.get(&git_key);
+    let git_gff = git_data.and_then(|d| nwn_gff::GffFile::from_bytes(d).ok());
+    let fv_list_name = git_list_name(obj_type);
+    git_gff.as_ref().and_then(|gff| {
+        let list_fv = gff.root().find(fv_list_name)?;
+        let list = match list_fv {
+            nwn_gff::FieldValue::List(l) => l,
+            _ => return None,
+        };
+        let obj_struct = list.get(obj_idx)?;
+        let vt_fv = obj_struct.find("VarTable")?;
+        let vt_list = match vt_fv {
+            nwn_gff::FieldValue::List(l) => l,
+            _ => return None,
+        };
+        let mut vars = Vec::new();
+        for entry in vt_list.iter() {
+            let name = entry.find("Name").and_then(|fv| match fv {
+                nwn_gff::FieldValue::String(s) => Some(s.clone()),
+                nwn_gff::FieldValue::ResRef(s) => Some(s.clone()),
+                _ => None,
+            }).unwrap_or_default();
+            let vtype = entry.find("Type").and_then(|fv| match fv {
+                nwn_gff::FieldValue::Char(c) => Some(*c),
+                nwn_gff::FieldValue::Byte(b) => Some(*b as i8),
+                _ => None,
+            }).unwrap_or(0);
+            let type_str = match vtype {
+                1 => "int",
+                2 => "float",
+                3 => "string",
+                4 => "object",
+                _ => "int",
+            };
+            let val = match vtype {
+                1 => entry.find("Value").and_then(|fv| match fv { nwn_gff::FieldValue::Int(i) => Some(i.to_string()), _ => None }).unwrap_or_else(|| "0".into()),
+                2 => entry.find("Value").and_then(|fv| match fv { nwn_gff::FieldValue::Float(f) => Some(f.to_string()), _ => None }).unwrap_or_else(|| "0.0".into()),
+                3 => entry.find("Value").and_then(|fv| match fv { nwn_gff::FieldValue::String(s) => Some(s.clone()), _ => None }).unwrap_or_default(),
+                _ => entry.find("Value").and_then(|fv| match fv { nwn_gff::FieldValue::Int(i) => Some(i.to_string()), _ => None }).unwrap_or_else(|| "0".into()),
+            };
+            vars.push(LocalVar { name, var_type: type_str.to_string(), value: val });
+        }
+        Some(vars)
+    }).unwrap_or_default()
+}
+
+fn save_local_vars_to_git(module: &mut nwn_gamemodel::Module, area_resref: &str, obj_type: &str, obj_idx: usize, vars: &[LocalVar]) {
+    use nwn_gamemodel::{PropertyBag, PropertyValue, Property};
+    let git_key = area_resref.trim().to_lowercase();
+    let data = match module.raw_git.get(&git_key) {
+        Some(d) => d.clone(),
+        None => return,
+    };
+    let mut gff = match nwn_gff::GffFile::from_bytes(&data) {
+        Ok(g) => g,
+        Err(_) => return,
+    };
+    let fv_list_name = git_list_name(obj_type);
+    let struct_id = git_struct_id(obj_type);
+    let bag = {
+        // Build a bag from the existing struct + our modifications
+        // We need to serialize the target struct to bytes, re-parse, then build bag
+        // But we can't clone Struct. Instead, serialize the whole GFF, re-parse,
+        // extract the struct reference, build bag, then write back.
+        let gff_bytes = gff.to_bytes();
+        let gff_copy = match nwn_gff::GffFile::from_bytes(&gff_bytes) {
+            Ok(g) => g,
+            Err(_) => return,
+        };
+        let list_fv = match gff_copy.root().find(fv_list_name) {
+            Some(l) => l,
+            None => return,
+        };
+        let list = match list_fv {
+            nwn_gff::FieldValue::List(l) => l,
+            _ => return,
+        };
+        let obj_struct = match list.get(obj_idx) {
+            Some(s) => s,
+            None => return,
+        };
+        let mut bag = PropertyBag::from_gff_struct(obj_struct);
+        bag.properties.retain(|p| p.label != "VarTable");
+
+        let mut vt_items: Vec<Box<PropertyBag>> = Vec::new();
+        for v in vars {
+            let mut entry = PropertyBag::new();
+            entry.properties.push(Property { label: "Name".into(), value: PropertyValue::CExoString(v.name.clone()), field_type: 10, category: String::new(), description: String::new() });
+            let (vtype_int, val_pv) = match v.var_type.as_str() {
+                "float" => (2i8, v.value.parse::<f32>().map(PropertyValue::Float).unwrap_or(PropertyValue::Float(0.0))),
+                "string" => (3i8, PropertyValue::CExoString(v.value.clone())),
+                "object" => (4i8, PropertyValue::CExoString(v.value.clone())),
+                _ => (1i8, v.value.parse::<i32>().map(PropertyValue::Int).unwrap_or(PropertyValue::Int(0))),
+            };
+            let type_field_type = match vtype_int { 2 => 8, 3 => 10, 4 => 10, _ => 5 };
+            entry.properties.push(Property { label: "Type".into(), value: PropertyValue::Char(vtype_int), field_type: 1, category: String::new(), description: String::new() });
+            entry.properties.push(Property { label: "Value".into(), value: val_pv, field_type: type_field_type, category: String::new(), description: String::new() });
+            vt_items.push(Box::new(entry));
+        }
+        bag.properties.push(Property { label: "VarTable".into(), value: PropertyValue::List(vt_items), field_type: 15, category: String::new(), description: String::new() });
+        bag
+    };
+    let new_struct = bag.to_gff_struct(struct_id);
+    match gff.root_mut().find_mut(fv_list_name) {
+        Some(nwn_gff::FieldValue::List(list)) => {
+            if obj_idx < list.len() {
+                list[obj_idx] = new_struct;
+            }
+        }
+        _ => return,
+    }
+    module.raw_git.insert(git_key, gff.to_bytes());
+    module.modified = true;
+}
+
+fn load_object_comment(module: &nwn_gamemodel::Module, area_resref: &str, obj_type: &str, obj_idx: usize) -> String {
+    let git_key = area_resref.trim().to_lowercase();
+    let git_data = module.raw_git.get(&git_key);
+    let git_gff = git_data.and_then(|d| nwn_gff::GffFile::from_bytes(d).ok());
+    let fv_list_name = git_list_name(obj_type);
+    git_gff.as_ref().and_then(|gff| {
+        let list_fv = gff.root().find(fv_list_name)?;
+        let list = match list_fv {
+            nwn_gff::FieldValue::List(l) => l,
+            _ => return None,
+        };
+        let obj_struct = list.get(obj_idx)?;
+        obj_struct.find("Comment").and_then(|fv| match fv {
+            nwn_gff::FieldValue::String(s) => Some(s.clone()),
+            nwn_gff::FieldValue::ResRef(s) => Some(s.clone()),
+            _ => None,
+        })
+    }).unwrap_or_default()
+}
+
+fn save_object_comment(module: &mut nwn_gamemodel::Module, area_resref: &str, obj_type: &str, obj_idx: usize, comment: &str) {
+    use nwn_gamemodel::{PropertyBag, PropertyValue, Property};
+    let git_key = area_resref.trim().to_lowercase();
+    let data = match module.raw_git.get(&git_key) {
+        Some(d) => d.clone(),
+        None => return,
+    };
+    let mut gff = match nwn_gff::GffFile::from_bytes(&data) {
+        Ok(g) => g,
+        Err(_) => return,
+    };
+    let fv_list_name = git_list_name(obj_type);
+    let struct_id = git_struct_id(obj_type);
+    let bag = {
+        let gff_bytes = gff.to_bytes();
+        let gff_copy = match nwn_gff::GffFile::from_bytes(&gff_bytes) {
+            Ok(g) => g,
+            Err(_) => return,
+        };
+        let list_fv = match gff_copy.root().find(fv_list_name) {
+            Some(l) => l,
+            None => return,
+        };
+        let list = match list_fv {
+            nwn_gff::FieldValue::List(l) => l,
+            _ => return,
+        };
+        let obj_struct = match list.get(obj_idx) {
+            Some(s) => s,
+            None => return,
+        };
+        let mut bag = PropertyBag::from_gff_struct(obj_struct);
+        let mut found = false;
+        for p in bag.properties.iter_mut() {
+            if p.label == "Comment" {
+                p.value = PropertyValue::CExoString(comment.to_string());
+                found = true;
+                break;
+            }
+        }
+        if !found {
+            bag.properties.push(Property { label: "Comment".into(), value: PropertyValue::CExoString(comment.to_string()), field_type: 10, category: String::new(), description: String::new() });
+        }
+        bag
+    };
+    let new_struct = bag.to_gff_struct(struct_id);
+    match gff.root_mut().find_mut(fv_list_name) {
+        Some(nwn_gff::FieldValue::List(list)) => {
+            if obj_idx < list.len() {
+                list[obj_idx] = new_struct;
+            }
+        }
+        _ => return,
+    }
+    module.raw_git.insert(git_key, gff.to_bytes());
+    module.modified = true;
+}
+
+fn set_object_appearance(module: &mut nwn_gamemodel::Module, area_resref: &str, obj_type: &str, obj_idx: usize, appearance_id: i32) {
+    use nwn_gamemodel::{PropertyBag, PropertyValue, Property};
+    let git_key = area_resref.trim().to_lowercase();
+    let data = match module.raw_git.get(&git_key) {
+        Some(d) => d.clone(),
+        None => return,
+    };
+    let mut gff = match nwn_gff::GffFile::from_bytes(&data) {
+        Ok(g) => g,
+        Err(_) => return,
+    };
+    let fv_list_name = git_list_name(obj_type);
+    let struct_id = git_struct_id(obj_type);
+    let bag = {
+        let gff_bytes = gff.to_bytes();
+        let gff_copy = match nwn_gff::GffFile::from_bytes(&gff_bytes) {
+            Ok(g) => g,
+            Err(_) => return,
+        };
+        let list_fv = match gff_copy.root().find(fv_list_name) {
+            Some(l) => l,
+            None => return,
+        };
+        let list = match list_fv {
+            nwn_gff::FieldValue::List(l) => l,
+            _ => return,
+        };
+        let obj_struct = match list.get(obj_idx) {
+            Some(s) => s,
+            None => return,
+        };
+        let mut bag = PropertyBag::from_gff_struct(obj_struct);
+        let mut found = false;
+        for p in bag.properties.iter_mut() {
+            if p.label == "Appearance" {
+                p.value = PropertyValue::Int(appearance_id);
+                found = true;
+                break;
+            }
+        }
+        if !found {
+            bag.properties.push(Property { label: "Appearance".into(), value: PropertyValue::Int(appearance_id), field_type: 5, category: String::new(), description: String::new() });
+        }
+        bag
+    };
+    let new_struct = bag.to_gff_struct(struct_id);
+    match gff.root_mut().find_mut(fv_list_name) {
+        Some(nwn_gff::FieldValue::List(list)) => {
+            if obj_idx < list.len() {
+                list[obj_idx] = new_struct;
+            }
+        }
+        _ => return,
+    }
+    module.raw_git.insert(git_key, gff.to_bytes());
+    module.modified = true;
 }
 
 impl AuroraBorealisApp {
@@ -273,6 +564,15 @@ impl AuroraBorealisApp {
             water_level: 0,
             show_water: false,
             module_props_popup: false,
+            module_description_edit: String::new(),
+            area_props_popup: false,
+            area_props_resref: String::new(),
+            area_props_name: String::new(),
+            area_props_tag: String::new(),
+            area_props_tileset: String::new(),
+            local_var_editor: None,
+            appearance_picker: None,
+            object_comment_edit: None,
             placement_state: PlacementState::Inactive,
             manip_mode: ManipMode::None,
             manip_nudge_speed: 0.5,
@@ -362,6 +662,7 @@ impl eframe::App for AuroraBorealisApp {
                             self.module_name_edit = module.name.clone();
                             self.module_tag_edit = module.tag.clone();
                             self.module_entry_edit = module.entry_area.clone();
+                            self.module_description_edit = module.description.clone();
                             self.module_props_popup = true;
                         }
                         ui.close_menu();
@@ -700,25 +1001,233 @@ impl eframe::App for AuroraBorealisApp {
         // Module properties popup
         if self.module_props_popup {
             egui::Window::new("Module Properties")
-                .default_size([300.0, 200.0])
+                .default_size([400.0, 300.0])
                 .show(ctx, |ui| {
-                    ui.horizontal(|ui| {
+                    egui::Grid::new("module_props_grid").num_columns(2).show(ui, |ui| {
                         ui.label("Name:");
                         ui.text_edit_singleline(&mut self.module_name_edit);
-                    });
-                    ui.horizontal(|ui| {
+                        ui.end_row();
+
                         ui.label("Tag:");
                         ui.text_edit_singleline(&mut self.module_tag_edit);
-                    });
-                    ui.horizontal(|ui| {
+                        ui.end_row();
+
                         ui.label("Entry Area:");
                         ui.text_edit_singleline(&mut self.module_entry_edit);
+                        ui.end_row();
+
+                        ui.label("Description:");
+                        ui.text_edit_multiline(&mut self.module_description_edit);
+                        ui.end_row();
                     });
                     if ui.button("Save").clicked() {
                         module_props_changed = true;
                         self.module_props_popup = false;
                     }
                 });
+        }
+
+        // Area properties popup
+        if self.area_props_popup {
+            let mut changed = false;
+            egui::Window::new("Area Properties")
+                .default_size([400.0, 350.0])
+                .show(ctx, |ui| {
+                    egui::Grid::new("area_props_grid").num_columns(2).show(ui, |ui| {
+                        ui.label("ResRef (read-only):");
+                        ui.label(&self.area_props_resref);
+                        ui.end_row();
+
+                        ui.label("Tileset (read-only):");
+                        ui.label(&self.area_props_tileset);
+                        ui.end_row();
+
+                        ui.label("Name:");
+                        changed |= ui.text_edit_singleline(&mut self.area_props_name).changed();
+                        ui.end_row();
+
+                        ui.label("Tag:");
+                        changed |= ui.text_edit_singleline(&mut self.area_props_tag).changed();
+                        ui.end_row();
+                    });
+                    ui.separator();
+                    ui.heading("Lighting");
+                    if let Some(ref mut area) = self.current_area {
+                        let area_mut = Arc::make_mut(area);
+                        egui::Grid::new("area_lighting_grid").num_columns(2).show(ui, |ui| {
+                            ui.label("Sun Ambient:");
+                            changed |= ui.color_edit_button_srgb(&mut area_mut.sun_ambient_color).changed();
+                            ui.end_row();
+                            ui.label("Sun Diffuse:");
+                            changed |= ui.color_edit_button_srgb(&mut area_mut.sun_diffuse_color).changed();
+                            ui.end_row();
+                            ui.label("Sun Fog Amount:");
+                            changed |= ui.add(egui::Slider::new(&mut area_mut.sun_fog_amount, 0..=255)).changed();
+                            ui.end_row();
+                            ui.label("Sun Fog Color:");
+                            changed |= ui.color_edit_button_srgb(&mut area_mut.sun_fog_color).changed();
+                            ui.end_row();
+                            ui.label("Moon Ambient:");
+                            changed |= ui.color_edit_button_srgb(&mut area_mut.moon_ambient_color).changed();
+                            ui.end_row();
+                            ui.label("Moon Diffuse:");
+                            changed |= ui.color_edit_button_srgb(&mut area_mut.moon_diffuse_color).changed();
+                            ui.end_row();
+                            ui.label("Moon Fog Amount:");
+                            changed |= ui.add(egui::Slider::new(&mut area_mut.moon_fog_amount, 0..=255)).changed();
+                            ui.end_row();
+                            ui.label("Moon Fog Color:");
+                            changed |= ui.color_edit_button_srgb(&mut area_mut.moon_fog_color).changed();
+                            ui.end_row();
+                            ui.label("Fog Clip Distance:");
+                            changed |= ui.add(egui::Slider::new(&mut area_mut.fog_clip_dist, 0.0..=500.0)).changed();
+                            ui.end_row();
+                        });
+                    }
+                    if changed {
+                        if let Some(ref mut area) = self.current_area {
+                            if area.name != self.area_props_name || area.tag != self.area_props_tag {
+                                let area_mut = Arc::make_mut(area);
+                                area_mut.name = self.area_props_name.clone();
+                                area_mut.tag = self.area_props_tag.clone();
+                            }
+                            let resref = area.resref.clone();
+                            if let Some(ref mut module) = self.module {
+                                module.update_area_are(&resref, area);
+                            }
+                            self.area_version = self.area_version.wrapping_add(1);
+                            self.viewport.set_area(area.clone(), self.area_version, target_format);
+                        }
+                    }
+                    if ui.button("Close").clicked() {
+                        self.area_props_popup = false;
+                    }
+                });
+        }
+
+        // Local Variables editor
+        if let Some(ref mut lve) = self.local_var_editor {
+            let mut close = false;
+            egui::Window::new("Local Variables")
+                .default_size([500.0, 300.0])
+                .show(ctx, |ui| {
+                    egui::ScrollArea::both().show(ui, |ui| {
+                        let mut ops: Vec<(usize, &str)> = Vec::new();
+                        egui::Grid::new("local_vars_grid").num_columns(5).striped(true).show(ui, |ui| {
+                            ui.label("Name"); ui.label("Type"); ui.label("Value"); ui.label(""); ui.label("");
+                            ui.end_row();
+                            let len = lve.vars.len();
+                            for i in 0..len {
+                                {
+                                    let v = &mut lve.vars[i];
+                                    ui.text_edit_singleline(&mut v.name);
+                                    egui::ComboBox::from_id_salt(("var_type", i))
+                                        .selected_text(&v.var_type.clone())
+                                        .show_ui(ui, |ui| {
+                                            ui.selectable_value(&mut v.var_type, "int".to_string(), "int");
+                                            ui.selectable_value(&mut v.var_type, "float".to_string(), "float");
+                                            ui.selectable_value(&mut v.var_type, "string".to_string(), "string");
+                                            ui.selectable_value(&mut v.var_type, "object".to_string(), "object");
+                                        });
+                                    ui.text_edit_singleline(&mut v.value);
+                                }
+                                if ui.button("+").clicked() {
+                                    ops.push((i, "insert"));
+                                }
+                                if ui.button("−").clicked() {
+                                    ops.push((i, "remove"));
+                                }
+                                ui.end_row();
+                            }
+                        });
+                        for op in ops.iter().rev() {
+                            match op.1 {
+                                "insert" => lve.vars.insert(op.0 + 1, LocalVar { name: String::new(), var_type: "int".to_string(), value: "0".to_string() }),
+                                "remove" => { lve.vars.remove(op.0); }
+                                _ => {}
+                            }
+                        }
+                        if ui.button("+ Add Variable").clicked() {
+                            lve.vars.push(LocalVar { name: String::new(), var_type: "int".to_string(), value: "0".to_string() });
+                        }
+                    });
+                    ui.separator();
+                    if ui.button("Save").clicked() {
+                        if let (Some(area), Some(ref mut module)) = (self.current_area.as_ref(), self.module.as_mut()) {
+                            save_local_vars_to_git(module, &area.resref, &lve.obj_type, lve.obj_idx, &lve.vars);
+                        }
+                        close = true;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        close = true;
+                    }
+                });
+            if close {
+                self.local_var_editor = None;
+            }
+        }
+
+        // Appearance picker
+        if let Some(ref mut ap) = self.appearance_picker {
+            let mut close = false;
+            egui::Window::new("Appearance Picker")
+                .default_size([500.0, 400.0])
+                .show(ctx, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label("Filter:");
+                        ui.text_edit_singleline(&mut ap.filter);
+                    });
+                    ui.separator();
+                    egui::ScrollArea::both().show(ui, |ui| {
+                        egui::Grid::new("appearance_grid").num_columns(2).striped(true).show(ui, |ui| {
+                            for entry in &ap.appearances {
+                                if !ap.filter.is_empty() && !entry.label.to_lowercase().contains(&ap.filter.to_lowercase()) && !entry.model.to_lowercase().contains(&ap.filter.to_lowercase()) {
+                                    continue;
+                                }
+                                if ui.selectable_label(false, &entry.label).clicked() {
+                                    let area_resref = self.current_area.as_ref().map(|a| a.resref.clone()).unwrap_or_default();
+                                    if let Some(ref mut module) = self.module {
+                                        set_object_appearance(module, &area_resref, &ap.obj_type, ap.obj_idx, entry.id);
+                                    }
+                                    self.status = format!("Appearance set to {} ({})", entry.label, entry.id);
+                                    close = true;
+                                }
+                                ui.label(&entry.model);
+                                ui.end_row();
+                            }
+                        });
+                    });
+                    if ui.button("Cancel").clicked() {
+                        close = true;
+                    }
+                });
+            if close {
+                self.appearance_picker = None;
+            }
+        }
+
+        // Object comment editor
+        if let Some(ref mut comment_state) = self.object_comment_edit {
+            let mut close = false;
+            let (ref obj_type, obj_idx, ref mut comment) = *comment_state;
+            egui::Window::new(format!("Comment - {} #{}", obj_type, obj_idx))
+                .default_size([400.0, 200.0])
+                .show(ctx, |ui| {
+                    ui.label("Edit object comment/notes:");
+                    ui.text_edit_multiline(comment);
+                    if ui.button("Save").clicked() {
+                        if let Some(ref mut module) = self.module {
+                            save_object_comment(module, &self.current_area.as_ref().map(|a| a.resref.clone()).unwrap_or_default(), obj_type, obj_idx, comment);
+                        }
+                        close = true;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        close = true;
+                    }
+                });
+            if close {
+                self.object_comment_edit = None;
+            }
         }
 
         // Sky color override window
@@ -1063,6 +1572,15 @@ impl eframe::App for AuroraBorealisApp {
                                 if selected {
                                     if ui.button("🗑").on_hover_text("Delete Area").clicked() {
                                         delete_name = Some(name.clone());
+                                    }
+                                    if ui.button("⚙").on_hover_text("Area Properties").clicked() {
+                                        if let Some(ref area) = self.current_area {
+                                            self.area_props_resref = area.resref.clone();
+                                            self.area_props_name = area.name.clone();
+                                            self.area_props_tag = area.tag.clone();
+                                            self.area_props_tileset = area.tileset.clone();
+                                            self.area_props_popup = true;
+                                        }
                                     }
                                 }
                             });
@@ -1668,6 +2186,7 @@ impl eframe::App for AuroraBorealisApp {
                 module.name = self.module_name_edit.clone();
                 module.tag = self.module_tag_edit.clone();
                 module.entry_area = self.module_entry_edit.clone();
+                module.description = self.module_description_edit.clone();
                 module.modified = true;
                 self.status = "Module properties updated.".to_string();
             }
@@ -2151,6 +2670,55 @@ impl eframe::App for AuroraBorealisApp {
                         }
                         if ui.button("🗑 Delete").clicked() {
                             delete_requested = true;
+                        }
+                        ui.separator();
+                        if let Some((ref obj_type, obj_idx)) = self.selected_obj_info {
+                            if ui.button("📋 Local Variables").clicked() {
+                                if let Some(ref module) = self.module {
+                                    if let Some(ref area) = self.current_area {
+                                        let vars = load_local_vars(module, &area.resref, obj_type, obj_idx);
+                                        self.local_var_editor = Some(LocalVarEditorState {
+                                            obj_type: obj_type.clone(),
+                                            obj_idx,
+                                            vars,
+                                        });
+                                    }
+                                }
+                            }
+                            if ui.button("🎨 Appearance Picker").clicked() {
+                                let appearances = self.module.as_ref().and_then(|m| m.erf.as_ref()).and_then(|erf| {
+                                    erf.get("appearance", nwn_gamemodel::resource_types::TWO_DA).and_then(|data| {
+                                        let text = String::from_utf8(data.clone()).ok()?;
+                                        let mut entries = Vec::new();
+                                        for line in text.lines() {
+                                            let trimmed = line.trim();
+                                            if trimmed.is_empty() || trimmed.starts_with('#') || trimmed.starts_with("2DA V2") { continue; }
+                                            let parts: Vec<&str> = trimmed.split(|c| c == '\t' || c == ' ').filter(|s| !s.is_empty()).collect();
+                                            if parts.len() >= 2 {
+                                                if let Ok(id) = parts[0].parse::<i32>() {
+                                                    if id > 0 {
+                                                        let label = if parts.len() > 1 { parts[1].to_string() } else { String::new() };
+                                                        let model = if parts.len() > 2 { parts[2].to_string() } else { String::new() };
+                                                        entries.push(AppearanceEntry { id, label, model });
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        Some(entries)
+                                    })
+                                }).unwrap_or_default();
+                                self.appearance_picker = Some(AppearancePickerState {
+                                    obj_type: obj_type.clone(),
+                                    obj_idx,
+                                    filter: String::new(),
+                                    appearances,
+                                });
+                            }
+                            if ui.button("💬 Comment").clicked() {
+                                let resref = self.current_area.as_ref().map(|a| a.resref.clone()).unwrap_or_default();
+                                let comment = self.module.as_ref().map(|m| load_object_comment(m, &resref, obj_type, obj_idx)).unwrap_or_default();
+                                self.object_comment_edit = Some((obj_type.clone(), obj_idx, comment));
+                            }
                         }
                         ui.separator();
                     }
