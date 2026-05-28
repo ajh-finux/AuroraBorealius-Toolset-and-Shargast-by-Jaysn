@@ -66,7 +66,7 @@ fn tile_instance_transform(col: usize, row: usize, height: f32, orientation: u8)
         row0: [c, 0.0, -s, 0.0],
         row1: [0.0, 1.0, 0.0, 0.0],
         row2: [s, 0.0, c, 0.0],
-        row3: [tx + half - half*c + half*s, height, tz + half*s + half*c - half, 1.0],
+        row3: [tx + half, height, tz - half, 1.0],
     }
 }
 
@@ -137,8 +137,11 @@ pub fn build_instanced_tiles(area: &Area, model_cache: &mut ModelCache) -> Insta
                 } else {
                     let idx = models.len();
                     group_map.insert((model_name.to_string(), mi), idx);
-                    let vertices: Vec<Vertex> = mesh.positions.iter().zip(mesh.normals.iter().zip(mesh.uvs.iter())).map(|(p, (n, u))| {
-                        Vertex { position: *p, normal: *n, uv: *u, color: [1.0, 1.0, 1.0, 1.0] }
+                    let vertices: Vec<Vertex> = mesh.positions.iter().enumerate().map(|(i, p)| {
+                        let n = mesh.normals.get(i).copied().unwrap_or([0.0, 1.0, 0.0]);
+                        let u = mesh.uvs.get(i).copied().unwrap_or([0.0, 0.0]);
+                        let c = mesh.colors.get(i).copied().unwrap_or([1.0, 1.0, 1.0, 1.0]);
+                        Vertex { position: *p, normal: n, uv: u, color: c }
                     }).collect();
                     let mut indices = mesh.indices.clone();
                     let vcount = vertices.len() as u32;
@@ -208,6 +211,83 @@ pub fn build_instanced_tiles(area: &Area, model_cache: &mut ModelCache) -> Insta
         });
         instance_data.push(fallback_instances);
     }
+    InstancedTiles { models, instance_data }
+}
+
+/// Build 3D model instances for placeables, doors, and creatures that have
+/// a resolved `model_name`. Uses the same model caching as tiles.
+pub fn build_object_models(area: &Area, model_cache: &mut ModelCache) -> InstancedTiles {
+    let mut group_map: HashMap<(String, usize), usize> = HashMap::new();
+    let mut models: Vec<ModelGroup> = Vec::new();
+    let mut instance_data: Vec<Vec<InstanceData>> = Vec::new();
+
+    let mut add_object_instances = |model_name: &str, x: f32, y: f32, z: f32, bearing: f32,
+                                     models: &mut Vec<ModelGroup>,
+                                     instance_data: &mut Vec<Vec<InstanceData>>,
+                                     group_map: &mut HashMap<(String, usize), usize>| {
+        let meshes = match model_cache.get_or_load(model_name) {
+            Some(ms) if !ms.is_empty() => ms,
+            _ => return,
+        };
+        let all_empty = meshes.iter().all(|m| m.indices.is_empty());
+        if all_empty { return; }
+
+        let (rx, ry, rz) = nwn_to_renderer(x, y, z);
+        let (s, c) = bearing.sin_cos();
+
+        for (mi, mesh) in meshes.iter().enumerate() {
+            if mesh.indices.is_empty() { continue; }
+            let gidx = if let Some(&idx) = group_map.get(&(model_name.to_string(), mi)) {
+                idx
+            } else {
+                let idx = models.len();
+                group_map.insert((model_name.to_string(), mi), idx);
+                let vertices: Vec<Vertex> = mesh.positions.iter().enumerate().map(|(i, p)| {
+                    let n = mesh.normals.get(i).copied().unwrap_or([0.0, 1.0, 0.0]);
+                    let u = mesh.uvs.get(i).copied().unwrap_or([0.0, 0.0]);
+                    let c = mesh.colors.get(i).copied().unwrap_or([1.0, 1.0, 1.0, 1.0]);
+                    Vertex { position: *p, normal: n, uv: u, color: c }
+                }).collect();
+                let mut indices = mesh.indices.clone();
+                let vcount = vertices.len() as u32;
+                for idx in &mut indices {
+                    if *idx >= vcount {
+                        eprintln!("WARN: index {} >= vertex count {}", idx, vcount);
+                        *idx = (*idx).min(vcount - 1);
+                    }
+                }
+                models.push(ModelGroup {
+                    texture_name: mesh.texture_name.clone(),
+                    data: MeshData { vertices, indices },
+                });
+                instance_data.push(Vec::new());
+                idx
+            };
+            instance_data[gidx].push(InstanceData {
+                row0: [c, 0.0, -s, 0.0],
+                row1: [0.0, 1.0, 0.0, 0.0],
+                row2: [s, 0.0, c, 0.0],
+                row3: [rx, ry, rz, 1.0],
+            });
+        }
+    };
+
+    for p in &area.placeables {
+        if let Some(ref name) = p.model_name {
+            add_object_instances(name, p.x, p.y, p.z, p.bearing, &mut models, &mut instance_data, &mut group_map);
+        }
+    }
+    for d in &area.doors {
+        if let Some(ref name) = d.model_name {
+            add_object_instances(name, d.x, d.y, d.z, d.bearing, &mut models, &mut instance_data, &mut group_map);
+        }
+    }
+    for c in &area.creatures {
+        if let Some(ref name) = c.model_name {
+            add_object_instances(name, c.x, c.y, c.z, c.bearing, &mut models, &mut instance_data, &mut group_map);
+        }
+    }
+
     InstancedTiles { models, instance_data }
 }
 
@@ -343,6 +423,7 @@ pub fn build_object_markers(area: &Area, filter: VisibilityFilter) -> MarkersRes
 
     if filter.show_creatures {
         for (i, c) in area.creatures.iter().enumerate() {
+            if c.model_name.is_some() { continue; }
             let oz = c.z + 0.3;
             markers.push(MarkerInfo { obj_type: ObjectType::Creature, index: i, x: c.x, y: c.y, z: oz });
             add_creature_marker(&mut vertices, &mut indices, c.x, c.y, oz, c.bearing, [1.0, 0.3, 0.3, 1.0]);
@@ -350,12 +431,14 @@ pub fn build_object_markers(area: &Area, filter: VisibilityFilter) -> MarkersRes
     }
     if filter.show_doors {
         for (i, d) in area.doors.iter().enumerate() {
+            if d.model_name.is_some() { continue; }
             markers.push(MarkerInfo { obj_type: ObjectType::Door, index: i, x: d.x, y: d.y, z: d.z });
             add_door_marker(&mut vertices, &mut indices, d.x, d.y, d.z, d.bearing, [1.0, 0.8, 0.0, 1.0]);
         }
     }
     if filter.show_placeables {
         for (i, p) in area.placeables.iter().enumerate() {
+            if p.model_name.is_some() { continue; }
             let oz = p.z + 0.3;
             markers.push(MarkerInfo { obj_type: ObjectType::Placeable, index: i, x: p.x, y: p.y, z: oz });
             add_placeable_marker(&mut vertices, &mut indices, p.x, p.y, oz, p.bearing, [0.2, 0.4, 1.0, 1.0]);
@@ -524,6 +607,12 @@ fn build_paint_overlay_inner(area: &Area, water_level: i32, show_water: bool, wa
     MeshData { vertices, indices }
 }
 
+/// Map a physical edge direction to the tile-local wall edge, accounting for tile orientation.
+/// physical_edge: 0=right(+x), 1=bottom(-z), 2=left(-x), 3=top(+z)
+fn physical_to_local_edge(physical_edge: u8, tile_orientation: u8) -> u8 {
+    (physical_edge + 4 - (tile_orientation & 3)) % 4
+}
+
 pub fn build_walkmesh(area: &Area) -> MeshData {
     let cols = area.width.max(1) as usize;
     let rows = area.height.max(1) as usize;
@@ -536,6 +625,9 @@ pub fn build_walkmesh(area: &Area) -> MeshData {
     for &(ti, edge) in &area.walkmesh_walls {
         wall_set.insert((ti, edge));
     }
+
+    // Pre-collect orientations for all tiles
+    let orientations: Vec<u8> = area.tiles.iter().map(|t| t.orientation as u8 & 3).collect();
 
     for (i, tile) in area.tiles.iter().enumerate() {
         if i >= cols * rows { break; }
@@ -569,15 +661,18 @@ pub fn build_walkmesh(area: &Area) -> MeshData {
             let i = row * cols + col;
             if i >= area.tiles.len() { break; }
             let h = area.tiles[i].height as f32 * 0.25;
+            let oi = orientations.get(i).copied().unwrap_or(0);
             let tx = col as f32 * tile_w;
             let tz = -(row as f32) * tile_w;
 
-            // Check right neighbor
+            // Check right neighbor (physical edge 0)
             if col + 1 < cols {
                 let ri = row * cols + col + 1;
                 if ri < area.tiles.len() {
                     let rh = area.tiles[ri].height as f32 * 0.25;
-                    let has_wall = wall_set.contains(&(i, 0)) || wall_set.contains(&(ri, 2));
+                    let ori = orientations.get(ri).copied().unwrap_or(0);
+                    let has_wall = wall_set.contains(&(i, physical_to_local_edge(0, oi))) ||
+                                   wall_set.contains(&(ri, physical_to_local_edge(2, ori)));
                     if (rh - h).abs() > 0.01 || has_wall {
                         let wall_color = if has_wall { [0.8, 0.3, 0.0, 0.6] } else { [0.0, 0.4, 0.0, 0.3] };
                         let base = vertices.len() as u32;
@@ -589,12 +684,14 @@ pub fn build_walkmesh(area: &Area) -> MeshData {
                     }
                 }
             }
-            // Check bottom neighbor
+            // Check bottom neighbor (physical edge 1)
             if row + 1 < rows {
                 let bi = (row + 1) * cols + col;
                 if bi < area.tiles.len() {
                     let bh = area.tiles[bi].height as f32 * 0.25;
-                    let has_wall = wall_set.contains(&(i, 1)) || wall_set.contains(&(bi, 3));
+                    let obi = orientations.get(bi).copied().unwrap_or(0);
+                    let has_wall = wall_set.contains(&(i, physical_to_local_edge(1, oi))) ||
+                                   wall_set.contains(&(bi, physical_to_local_edge(3, obi)));
                     if (bh - h).abs() > 0.01 || has_wall {
                         let wall_color = if has_wall { [0.8, 0.3, 0.0, 0.6] } else { [0.0, 0.4, 0.0, 0.3] };
                         let base = vertices.len() as u32;
@@ -623,6 +720,9 @@ pub fn build_walkmesh_edges(area: &Area) -> (Vec<f32>, Vec<u32>) {
     for &(ti, edge) in &area.walkmesh_walls {
         wall_set.insert((ti, edge));
     }
+
+    // Pre-collect orientations
+    let orientations: Vec<u8> = area.tiles.iter().map(|t| t.orientation as u8 & 3).collect();
 
     for (i, tile) in area.tiles.iter().enumerate() {
         if i >= cols * rows { break; }
@@ -663,15 +763,18 @@ pub fn build_walkmesh_edges(area: &Area) -> (Vec<f32>, Vec<u32>) {
             let i = row * cols + col;
             if i >= area.tiles.len() { break; }
             let h = area.tiles[i].height as f32 * 0.25;
+            let oi = orientations.get(i).copied().unwrap_or(0);
             let tx = col as f32 * tile_w;
             let tz = -(row as f32) * tile_w;
 
-            // Right neighbor
+            // Right neighbor (physical edge 0)
             if col + 1 < cols {
                 let ri = row * cols + col + 1;
                 if ri < area.tiles.len() {
                     let rh = area.tiles[ri].height as f32 * 0.25;
-                    let has_wall = wall_set.contains(&(i, 0)) || wall_set.contains(&(ri, 2));
+                    let ori = orientations.get(ri).copied().unwrap_or(0);
+                    let has_wall = wall_set.contains(&(i, physical_to_local_edge(0, oi))) ||
+                                   wall_set.contains(&(ri, physical_to_local_edge(2, ori)));
                     if (rh - h).abs() > 0.01 || has_wall {
                         let wall_color = if has_wall { [0.8, 0.3, 0.0, 0.8] } else { [0.0, 0.6, 0.0, 0.5] };
                         let base = verts.len() as u32 / 7;
@@ -693,12 +796,14 @@ pub fn build_walkmesh_edges(area: &Area) -> (Vec<f32>, Vec<u32>) {
                     }
                 }
             }
-            // Bottom neighbor
+            // Bottom neighbor (physical edge 1)
             if row + 1 < rows {
                 let bi = (row + 1) * cols + col;
                 if bi < area.tiles.len() {
                     let bh = area.tiles[bi].height as f32 * 0.25;
-                    let has_wall = wall_set.contains(&(i, 1)) || wall_set.contains(&(bi, 3));
+                    let obi = orientations.get(bi).copied().unwrap_or(0);
+                    let has_wall = wall_set.contains(&(i, physical_to_local_edge(1, oi))) ||
+                                   wall_set.contains(&(bi, physical_to_local_edge(3, obi)));
                     if (bh - h).abs() > 0.01 || has_wall {
                         let wall_color = if has_wall { [0.8, 0.3, 0.0, 0.8] } else { [0.0, 0.6, 0.0, 0.5] };
                         let base = verts.len() as u32 / 7;

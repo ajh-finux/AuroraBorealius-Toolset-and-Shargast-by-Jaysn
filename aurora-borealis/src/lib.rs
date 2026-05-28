@@ -3215,6 +3215,7 @@ impl eframe::App for AuroraBorealisApp {
                                                 area.creatures.push(nwn_gamemodel::CreatureInstance {
                                                     resref: resref.clone(), tag: tag.clone(),
                                                     x: nwn_x, y: nwn_y, z: nwn_z, bearing: 0.0,
+                                                    appearance: 0, model_name: None,
                                                 });
                                                 placed = true;
                                             }
@@ -3222,6 +3223,7 @@ impl eframe::App for AuroraBorealisApp {
                                                 area.placeables.push(nwn_gamemodel::PlaceableInstance {
                                                     resref: resref.clone(), tag: tag.clone(),
                                                     x: nwn_x, y: nwn_y, z: nwn_z, bearing: 0.0,
+                                                    appearance: 0, model_name: None,
                                                 });
                                                 placed = true;
                                             }
@@ -3229,6 +3231,7 @@ impl eframe::App for AuroraBorealisApp {
                                                 area.doors.push(nwn_gamemodel::DoorInstance {
                                                     resref: resref.clone(), tag: tag.clone(),
                                                     x: nwn_x, y: nwn_y, z: nwn_z, bearing: 0.0,
+                                                    appearance: 0, model_name: None,
                                                 });
                                                 placed = true;
                                             }
@@ -3236,6 +3239,7 @@ impl eframe::App for AuroraBorealisApp {
                                                 area.placeables.push(nwn_gamemodel::PlaceableInstance {
                                                     resref: resref.clone(), tag: tag.clone(),
                                                     x: nwn_x, y: nwn_y, z: nwn_z, bearing: 0.0,
+                                                    appearance: 0, model_name: None,
                                                 });
                                                 placed = true;
                                             }
@@ -3942,6 +3946,7 @@ impl eframe::App for AuroraBorealisApp {
                                             resref: resref.clone(), tag,
                                             x: self.new_object_x, y: self.new_object_y,
                                             z: self.new_object_z, bearing: self.new_object_bearing,
+                                            appearance: 0, model_name: None,
                                         });
                                     }
                                     "door" => {
@@ -3949,6 +3954,7 @@ impl eframe::App for AuroraBorealisApp {
                                             resref: resref.clone(), tag,
                                             x: self.new_object_x, y: self.new_object_y,
                                             z: self.new_object_z, bearing: self.new_object_bearing,
+                                            appearance: 0, model_name: None,
                                         });
                                     }
                                     "placeable" => {
@@ -3956,6 +3962,7 @@ impl eframe::App for AuroraBorealisApp {
                                             resref: resref.clone(), tag,
                                             x: self.new_object_x, y: self.new_object_y,
                                             z: self.new_object_z, bearing: self.new_object_bearing,
+                                            appearance: 0, model_name: None,
                                         });
                                     }
                                     "trigger" => {

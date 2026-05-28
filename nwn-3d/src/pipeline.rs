@@ -1,10 +1,11 @@
 pub const VERTEX_SHADER: &str = r#"
 struct Uniforms {
     view_proj: mat4x4<f32>,
-    lighting: vec4<f32>,
+    ambient_color: vec4<f32>,
     fog_color: vec4<f32>,
     fog_params: vec4<f32>,
     camera_pos: vec4<f32>,
+    diffuse_color: vec4<f32>,
 }
 @group(0) @binding(0) var<uniform> uniforms: Uniforms;
 
@@ -52,11 +53,11 @@ fn vs_main(input: VertexInput) -> VertexOutput {
 fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     let tex_color = textureSample(texture, texture_sampler, input.uv);
     var final_color = input.color * tex_color;
-    if uniforms.lighting.x > 0.5 {
+    if uniforms.ambient_color.w > 0.5 {
         let light_dir = normalize(vec3<f32>(0.5, 1.0, 0.3));
-        let ambient = 0.3;
-        let diffuse = max(dot(normalize(input.world_normal), light_dir), 0.0);
-        let lighting = ambient + diffuse * 0.7;
+        let ambient = uniforms.ambient_color.xyz;
+        let diffuse = max(dot(normalize(input.world_normal), light_dir), 0.0) * uniforms.diffuse_color.xyz;
+        let lighting = ambient + diffuse;
         final_color = vec4<f32>(final_color.rgb * lighting, final_color.a);
     }
     let fog_amount = uniforms.fog_params.x;
@@ -346,10 +347,11 @@ fn _create_pipeline(
 pub const LINE_SHADER: &str = r#"
 struct Uniforms {
     view_proj: mat4x4<f32>,
-    lighting: vec4<f32>,
+    ambient_color: vec4<f32>,
     fog_color: vec4<f32>,
     fog_params: vec4<f32>,
     camera_pos: vec4<f32>,
+    diffuse_color: vec4<f32>,
 }
 @group(0) @binding(0) var<uniform> uniforms: Uniforms;
 

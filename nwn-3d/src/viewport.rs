@@ -90,12 +90,24 @@ pub struct ViewportState {
     fog_color: [f32; 4],
     fog_amount_norm: f32,
     fog_clip_dist: f32,
+    ambient_color: [f32; 3],
+    diffuse_color: [f32; 3],
 }
 
 fn load_texture(name: &str) -> Option<(u32, u32, Vec<u8>)> {
     match nwn_tileset::load_texture_data(name) {
-        Ok(Some(data)) => Some((data.width, data.height, data.rgba)),
-        _ => None,
+        Ok(Some(data)) => {
+            eprintln!("DEBUG: Loaded texture '{name}' ({}x{})", data.width, data.height);
+            Some((data.width, data.height, data.rgba))
+        }
+        Ok(None) => {
+            eprintln!("WARN: Texture '{name}' not found in game data");
+            None
+        }
+        Err(e) => {
+            eprintln!("ERROR: Failed to load texture '{name}': {e}");
+            None
+        }
     }
 }
 
@@ -127,6 +139,28 @@ impl ViewportState {
                     }
                 }
             }
+            // Also collect object model names
+            for p in &area.placeables {
+                if let Some(ref name) = p.model_name {
+                    if !name.is_empty() && seen.insert(name.clone()) {
+                        names.push(name.clone());
+                    }
+                }
+            }
+            for d in &area.doors {
+                if let Some(ref name) = d.model_name {
+                    if !name.is_empty() && seen.insert(name.clone()) {
+                        names.push(name.clone());
+                    }
+                }
+            }
+            for c in &area.creatures {
+                if let Some(ref name) = c.model_name {
+                    if !name.is_empty() && seen.insert(name.clone()) {
+                        names.push(name.clone());
+                    }
+                }
+            }
             names
         };
 
@@ -147,7 +181,12 @@ impl ViewportState {
             }
         }
 
-        let instanced = tile_renderer::build_instanced_tiles(area, &mut model_cache);
+        let mut instanced = tile_renderer::build_instanced_tiles(area, &mut model_cache);
+        let obj_instanced = tile_renderer::build_object_models(area, &mut model_cache);
+        // Merge object models into instanced
+        instanced.models.extend(obj_instanced.models);
+        instanced.instance_data.extend(obj_instanced.instance_data);
+
         let markers_result = tile_renderer::build_object_markers(area, visibility_filter);
         let marker_data = markers_result.mesh;
         let tile_count: usize = instanced.instance_data.iter().map(|v| v.len()).sum();
@@ -413,7 +452,7 @@ impl ViewportState {
 
         let uniform_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("nwn3d_uniform_buf"),
-            size: std::mem::size_of::<[f32; 32]>() as u64,
+            size: std::mem::size_of::<[f32; 36]>() as u64,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -545,6 +584,16 @@ impl ViewportState {
             ],
             fog_amount_norm: area.sun_fog_amount as f32 / 255.0,
             fog_clip_dist: area.fog_clip_dist,
+            ambient_color: [
+                area.sun_ambient_color[0] as f32 / 255.0,
+                area.sun_ambient_color[1] as f32 / 255.0,
+                area.sun_ambient_color[2] as f32 / 255.0,
+            ],
+            diffuse_color: [
+                area.sun_diffuse_color[0] as f32 / 255.0,
+                area.sun_diffuse_color[1] as f32 / 255.0,
+                area.sun_diffuse_color[2] as f32 / 255.0,
+            ],
         }
     }
 
@@ -645,9 +694,14 @@ impl ViewportState {
         };
         let vp = mat4_mul(self.camera.view_matrix(), self.camera.projection_matrix());
         queue.write_buffer(&self.uniform_buf, 0, bytemuck::cast_slice(&[vp]));
-        // lighting at offset 64 (byte offset of float[16])
-        let lighting_val = if self.lighting_enabled { 1.0f32 } else { 0.0f32 };
-        queue.write_buffer(&self.uniform_buf, 64, bytemuck::cast_slice(&[lighting_val]));
+        // ambient_color at offset 64 (float[16]): xyz = ambient RGB, w = lighting flag
+        let ambient = [
+            self.ambient_color[0],
+            self.ambient_color[1],
+            self.ambient_color[2],
+            if self.lighting_enabled { 1.0f32 } else { 0.0f32 },
+        ];
+        queue.write_buffer(&self.uniform_buf, 64, bytemuck::cast_slice(&ambient));
         // fog_color at offset 80 (float[20])
         queue.write_buffer(&self.uniform_buf, 80, bytemuck::cast_slice(&self.fog_color));
         // fog_params at offset 96 (float[24]): x=fog_amount_norm, y=fog_clip_dist
@@ -660,6 +714,8 @@ impl ViewportState {
         // camera_pos at offset 112 (float[28])
         let eye = self.camera.eye();
         queue.write_buffer(&self.uniform_buf, 112, bytemuck::cast_slice(&[eye[0], eye[1], eye[2], 0.0]));
+        // diffuse_color at offset 128 (float[32])
+        queue.write_buffer(&self.uniform_buf, 128, bytemuck::cast_slice(&self.diffuse_color));
     }
 
     pub fn render_3d(&self, render_pass: &mut wgpu::RenderPass) {

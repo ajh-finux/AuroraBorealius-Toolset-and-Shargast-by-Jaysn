@@ -413,6 +413,23 @@ impl Module {
             }
         }
 
+        // Resolve model names for placeables, doors, and creatures
+        for p in &mut area.placeables {
+            if p.appearance >= 0 {
+                p.model_name = nwn_tileset::lookup_placeable_model(p.appearance);
+            }
+        }
+        for d in &mut area.doors {
+            if d.appearance >= 0 {
+                d.model_name = nwn_tileset::lookup_door_model(d.appearance);
+            }
+        }
+        for c in &mut area.creatures {
+            if c.appearance >= 0 {
+                c.model_name = nwn_tileset::lookup_creature_model(c.appearance);
+            }
+        }
+
         let arc = Arc::new(area);
         self.area_cache.borrow_mut().insert(name.to_string(), arc.clone());
         Some(arc)

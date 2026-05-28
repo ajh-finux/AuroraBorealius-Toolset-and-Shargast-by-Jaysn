@@ -412,6 +412,8 @@ pub struct CreatureInstance {
     pub y: f32,
     pub z: f32,
     pub bearing: f32,
+    pub appearance: i32,
+    pub model_name: Option<String>,
 }
 
 pub(crate) fn make_field(label: &str, value: nwn_gff::FieldValue) -> nwn_gff::Field {
@@ -429,6 +431,20 @@ pub(crate) fn resref_field(label: &str, value: &str) -> nwn_gff::Field {
 
 pub(crate) fn float_field(label: &str, value: f32) -> nwn_gff::Field {
     make_field(label, nwn_gff::FieldValue::Float(value))
+}
+
+pub(crate) fn int_field(label: &str, value: i32) -> nwn_gff::Field {
+    make_field(label, nwn_gff::FieldValue::Int(value))
+}
+
+fn gff_int(s: &nwn_gff::Struct, label: &str, default: i32) -> i32 {
+    s.find(label)
+        .and_then(|v| match v {
+            nwn_gff::FieldValue::Int(i) => Some(*i),
+            nwn_gff::FieldValue::Byte(b) => Some(*b as i32),
+            _ => None,
+        })
+        .unwrap_or(default)
 }
 
 pub(crate) fn gff_float(s: &nwn_gff::Struct, primary: &str, fallback: &str) -> f32 {
@@ -489,6 +505,7 @@ impl CreatureInstance {
                 float_field("ZPosition", self.z),
                 float_field("XOrientation", self.bearing.sin()),
                 float_field("YOrientation", self.bearing.cos()),
+                int_field("Appearance", self.appearance),
             ],
         }
     }
@@ -502,6 +519,7 @@ impl CreatureInstance {
                 Property { label: "YPosition".into(), value: PropertyValue::Float(self.y), field_type: 8, category: String::new(), description: String::new() },
                 Property { label: "ZPosition".into(), value: PropertyValue::Float(self.z), field_type: 8, category: String::new(), description: String::new() },
                 Property { label: "Bearing".into(), value: PropertyValue::Float(self.bearing), field_type: 8, category: String::new(), description: String::new() },
+                Property { label: "Appearance".into(), value: PropertyValue::Int(self.appearance), field_type: 5, category: String::new(), description: String::new() },
             ],
         }
     }
@@ -514,10 +532,13 @@ impl CreatureInstance {
             y: bag.get_float("YPosition").unwrap_or(0.0),
             z: bag.get_float("ZPosition").unwrap_or(0.0),
             bearing: bag.get_float("Bearing").unwrap_or(0.0),
+            appearance: bag.get_int("Appearance").unwrap_or(-1),
+            model_name: None,
         }
     }
 
     fn from_gff_struct(s: &nwn_gff::Struct) -> Self {
+        let app = gff_int(s, "Appearance", -1);
         Self {
             resref: gff_resref_from_struct(s),
             tag: s.find("Tag").and_then(|v| if let nwn_gff::FieldValue::String(s) = v { Some(s.clone()) } else { None }).unwrap_or_default(),
@@ -525,6 +546,8 @@ impl CreatureInstance {
             y: gff_float(s, "YPosition", "Y"),
             z: gff_float(s, "ZPosition", "Z"),
             bearing: gff_bearing(s),
+            appearance: app,
+            model_name: None,
         }
     }
 }
@@ -537,6 +560,8 @@ pub struct DoorInstance {
     pub y: f32,
     pub z: f32,
     pub bearing: f32,
+    pub appearance: i32,
+    pub model_name: Option<String>,
 }
 
 impl DoorInstance {
@@ -550,6 +575,7 @@ impl DoorInstance {
                 float_field("YPosition", self.y),
                 float_field("ZPosition", self.z),
                 float_field("Bearing", self.bearing),
+                int_field("Appearance", self.appearance),
             ],
         }
     }
@@ -563,6 +589,7 @@ impl DoorInstance {
                 Property { label: "YPosition".into(), value: PropertyValue::Float(self.y), field_type: 8, category: String::new(), description: String::new() },
                 Property { label: "ZPosition".into(), value: PropertyValue::Float(self.z), field_type: 8, category: String::new(), description: String::new() },
                 Property { label: "Bearing".into(), value: PropertyValue::Float(self.bearing), field_type: 8, category: String::new(), description: String::new() },
+                Property { label: "Appearance".into(), value: PropertyValue::Int(self.appearance), field_type: 5, category: String::new(), description: String::new() },
             ],
         }
     }
@@ -575,6 +602,8 @@ impl DoorInstance {
             y: bag.get_float("YPosition").or_else(|| bag.get_float("Y")).unwrap_or(0.0),
             z: bag.get_float("ZPosition").or_else(|| bag.get_float("Z")).unwrap_or(0.0),
             bearing: bag.get_float("Bearing").unwrap_or(0.0),
+            appearance: bag.get_int("Appearance").unwrap_or(-1),
+            model_name: None,
         }
     }
 
@@ -586,6 +615,8 @@ impl DoorInstance {
             y: gff_float(s, "YPosition", "Y"),
             z: gff_float(s, "ZPosition", "Z"),
             bearing: gff_bearing(s),
+            appearance: gff_int(s, "Appearance", -1),
+            model_name: None,
         }
     }
 }
@@ -598,6 +629,8 @@ pub struct PlaceableInstance {
     pub y: f32,
     pub z: f32,
     pub bearing: f32,
+    pub appearance: i32,
+    pub model_name: Option<String>,
 }
 
 impl PlaceableInstance {
@@ -611,6 +644,7 @@ impl PlaceableInstance {
                 float_field("YPosition", self.y),
                 float_field("ZPosition", self.z),
                 float_field("Bearing", self.bearing),
+                int_field("Appearance", self.appearance),
             ],
         }
     }
@@ -624,6 +658,7 @@ impl PlaceableInstance {
                 Property { label: "YPosition".into(), value: PropertyValue::Float(self.y), field_type: 8, category: String::new(), description: String::new() },
                 Property { label: "ZPosition".into(), value: PropertyValue::Float(self.z), field_type: 8, category: String::new(), description: String::new() },
                 Property { label: "Bearing".into(), value: PropertyValue::Float(self.bearing), field_type: 8, category: String::new(), description: String::new() },
+                Property { label: "Appearance".into(), value: PropertyValue::Int(self.appearance), field_type: 5, category: String::new(), description: String::new() },
             ],
         }
     }
@@ -636,10 +671,13 @@ impl PlaceableInstance {
             y: bag.get_float("YPosition").or_else(|| bag.get_float("Y")).unwrap_or(0.0),
             z: bag.get_float("ZPosition").or_else(|| bag.get_float("Z")).unwrap_or(0.0),
             bearing: bag.get_float("Bearing").unwrap_or(0.0),
+            appearance: bag.get_int("Appearance").unwrap_or(-1),
+            model_name: None,
         }
     }
 
     fn from_gff_struct(s: &nwn_gff::Struct) -> Self {
+        let app = gff_int(s, "Appearance", -1);
         Self {
             resref: gff_resref_from_struct(s),
             tag: s.find("Tag").and_then(|v| if let nwn_gff::FieldValue::String(s) = v { Some(s.clone()) } else { None }).unwrap_or_default(),
@@ -647,6 +685,8 @@ impl PlaceableInstance {
             y: gff_float(s, "YPosition", "Y"),
             z: gff_float(s, "ZPosition", "Z"),
             bearing: gff_bearing(s),
+            appearance: app,
+            model_name: None,
         }
     }
 }

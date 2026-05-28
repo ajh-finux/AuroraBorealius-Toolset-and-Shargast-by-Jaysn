@@ -67,8 +67,9 @@ fn game_data_dir() -> Option<std::path::PathBuf> {
     if data_dir.is_dir() { Some(data_dir) } else { None }
 }
 
-fn load_resource_from_key(resref: &nwnrs_types::resman::ResRef, data_dir: &Path) -> Result<Option<Vec<u8>>> {
-    for key_name in &["nwn_base.key", "nwn_retail.key", "nwn_expn.key"] {
+pub fn load_resource_from_key(resref: &nwnrs_types::resman::ResRef, data_dir: &Path) -> Result<Option<Vec<u8>>> {
+    let key_names = &["nwn_base.key", "nwn_retail.key", "nwn_expn.key", "nwn_x1.key", "nwn_x2.key", "nwnx1.key", "nwnx2.key"];
+    for key_name in key_names {
         let key_path = data_dir.join(key_name);
         if !key_path.exists() { continue; }
         if let Ok(key_table) = nwnrs_types::key::read_key_table_from_file(&key_path) {
@@ -106,6 +107,7 @@ pub struct ModelMesh {
     pub normals: Vec<[f32; 3]>,
     pub indices: Vec<u32>,
     pub uvs: Vec<[f32; 2]>,
+    pub colors: Vec<[f32; 4]>,
     pub texture_name: Option<String>,
     pub name: String,
 }
@@ -122,6 +124,7 @@ pub fn load_model_mesh(model_name: &str) -> Result<Option<ModelMesh>> {
                 let mut pos = first.positions;
                 let mut norms = first.normals;
                 let mut u = first.uvs;
+                let mut c = first.colors;
                 let mut idx = first.indices;
                 let tex_name = first.texture_name;
                 for m in ms {
@@ -129,11 +132,12 @@ pub fn load_model_mesh(model_name: &str) -> Result<Option<ModelMesh>> {
                     pos.extend(m.positions);
                     norms.extend(m.normals);
                     u.extend(m.uvs);
+                    c.extend(m.colors);
                     for i in m.indices {
                         idx.push(base + i);
                     }
                 }
-                Ok(Some(ModelMesh { positions: pos, normals: norms, indices: idx, uvs: u, texture_name: tex_name, name: model_name.to_string() }))
+                Ok(Some(ModelMesh { positions: pos, normals: norms, indices: idx, uvs: u, colors: c, texture_name: tex_name, name: model_name.to_string() }))
             }
         }
         _ => Ok(None),
@@ -201,6 +205,7 @@ pub fn load_model_meshes(model_name: &str) -> Result<Option<Vec<ModelMesh>>> {
         positions: Vec<[f32; 3]>,
         normals: Vec<[f32; 3]>,
         uvs: Vec<[f32; 2]>,
+        colors: Vec<[f32; 4]>,
         indices: Vec<u32>,
         texture_name: Option<String>,
     }
@@ -231,6 +236,7 @@ pub fn load_model_meshes(model_name: &str) -> Result<Option<Vec<ModelMesh>>> {
                     positions: Vec::new(),
                     normals: Vec::new(),
                     uvs: Vec::new(),
+                    colors: Vec::new(),
                     indices: Vec::new(),
                     texture_name: tex_name,
                 });
@@ -284,6 +290,14 @@ pub fn load_model_meshes(model_name: &str) -> Result<Option<Vec<ModelMesh>>> {
                     };
                     group.uvs.push(uv);
 
+                    let color = if vi < prim.color_rows.len() && prim.color_rows[vi].len() >= 4 {
+                        let c = &prim.color_rows[vi];
+                        [c[0].min(1.0).max(0.0), c[1].min(1.0).max(0.0), c[2].min(1.0).max(0.0), c[3].min(1.0).max(0.0)]
+                    } else {
+                        [1.0, 1.0, 1.0, 1.0]
+                    };
+                    group.colors.push(color);
+
                     group.indices.push(group.positions.len() as u32 - 1);
                 }
             }
@@ -298,6 +312,7 @@ pub fn load_model_meshes(model_name: &str) -> Result<Option<Vec<ModelMesh>>> {
             normals,
             indices: g.indices,
             uvs: g.uvs,
+            colors: g.colors,
             texture_name: g.texture_name,
             name: model_name.to_string(),
         }
@@ -370,50 +385,154 @@ pub struct TextureData {
     pub rgba: Vec<u8>,
 }
 
-pub fn load_texture_data(texture_name: &str) -> Result<Option<TextureData>> {
-    let data_dir = match game_data_dir() {
-        Some(d) => d,
-        None => return Ok(None),
-    };
-    let name_lower = texture_name.to_lowercase()
-        .replace(".dds", "").replace(".tga", "")
+/// Decode a BMP buffer into RGBA pixels.
+/// Handles 24-bit (BGR) and 32-bit (BGRA) uncompressed BMP.
+fn decode_bmp_rgba(data: &[u8]) -> Option<TextureData> {
+    if data.len() < 54 { return None; }
+    let file_size = u32::from_le_bytes([data[2], data[3], data[4], data[5]]);
+    if data.len() < file_size as usize { return None; }
+    let pixel_offset = u32::from_le_bytes([data[10], data[11], data[12], data[13]]) as usize;
+    let width = u32::from_le_bytes([data[18], data[19], data[20], data[21]]);
+    let height = u32::from_le_bytes([data[22], data[23], data[24], data[25]]);
+    let bpp = u16::from_le_bytes([data[28], data[29]]);
+    let compression = u32::from_le_bytes([data[30], data[31], data[32], data[33]]);
+    if width == 0 || height == 0 { return None; }
+    if compression != 0 { return None; } // only uncompressed
+    if bpp != 24 && bpp != 32 { return None; }
+
+    let row_size = ((width * bpp as u32 + 31) / 32) * 4;
+    let mut rgba = Vec::with_capacity((width * height * 4) as usize);
+    // BMP rows are stored bottom-up
+    for y in (0..height).rev() {
+        let row_start = pixel_offset + (y as usize) * row_size as usize;
+        for x in 0..width {
+            let px = row_start + (x as usize) * (bpp as usize / 8);
+            if bpp == 24 {
+                rgba.push(data[px + 2]);  // R
+                rgba.push(data[px + 1]);  // G
+                rgba.push(data[px]);      // B
+                rgba.push(255);           // A
+            } else {
+                rgba.push(data[px + 2]);  // R
+                rgba.push(data[px + 1]);  // G
+                rgba.push(data[px]);      // B
+                rgba.push(data[px + 3]);  // A
+            }
+        }
+    }
+    Some(TextureData { width, height, rgba })
+}
+
+/// Decode raw texture bytes for a given resource type into RGBA.
+fn decode_texture_data(res_type: u16, data: &[u8]) -> Option<TextureData> {
+    match res_type {
+        8 => {
+            if let Ok(dds) = nwnrs_types::dds::DdsTexture::read_from_texture_bytes(data) {
+                if let Ok(rgba) = dds.decode_mip_rgba8(0) {
+                    return Some(TextureData { width: dds.width, height: dds.height, rgba });
+                }
+            }
+        }
+        3 => {
+            if let Ok(tga) = nwnrs_types::tga::read_tga(&mut Cursor::new(data)) {
+                if let Ok(rgba) = tga.decode_rgba8() {
+                    return Some(TextureData { width: tga.width as u32, height: tga.height as u32, rgba });
+                }
+            }
+        }
+        1 => {
+            if let Some(tex) = decode_bmp_rgba(data) {
+                return Some(tex);
+            }
+        }
+        _ => {}
+    }
+    None
+}
+
+/// Load a texture by normalizing the name and trying all supported resource types.
+fn load_texture_by_name(name: &str, lookup: &dyn Fn(&nwnrs_types::resman::ResRef) -> Option<Vec<u8>>) -> Option<TextureData> {
+    let name_lower = name.to_lowercase()
+        .replace(".dds", "").replace(".tga", "").replace(".bmp", "")
         .replace(" ", "_").replace("-", "_");
 
-    // Try DDS (type 8), then TGA (type 3)
-    for res_type in &[8u16, 3u16] {
-        let resref = match nwnrs_types::resman::ResRef::new(
-            name_lower.clone(),
-            nwnrs_types::resman::ResType(*res_type),
-        ) {
-            Ok(rr) => rr,
-            Err(_) => continue,
-        };
-        if let Some(data) = load_resource_from_key(&resref, &data_dir)? {
-            if *res_type == 8 {
-                if let Ok(dds) = nwnrs_types::dds::DdsTexture::read_from_texture_bytes(&data) {
-                    if let Ok(rgba) = dds.decode_mip_rgba8(0) {
-                        return Ok(Some(TextureData {
-                            width: dds.width,
-                            height: dds.height,
-                            rgba,
-                        }));
-                    }
-                }
-            } else if *res_type == 3 {
-                if let Ok(tga) = nwnrs_types::tga::read_tga(&mut Cursor::new(&data)) {
-                    if let Ok(rgba) = tga.decode_rgba8() {
-                        return Ok(Some(TextureData {
-                            width: tga.width as u32,
-                            height: tga.height as u32,
-                            rgba,
-                        }));
+    for res_type in &[8u16, 3u16, 1u16] {
+        let resref = nwnrs_types::resman::ResRef::new(name_lower.clone(), nwnrs_types::resman::ResType(*res_type)).ok()?;
+        if let Some(data) = lookup(&resref) {
+            if let Some(tex) = decode_texture_data(*res_type, &data) {
+                return Some(tex);
+            }
+        }
+    }
+    None
+}
+
+/// Search all standard hak directories for a given resource.
+#[allow(dead_code)]
+fn load_resource_from_haks(resref: &nwnrs_types::resman::ResRef) -> Option<Vec<u8>> {
+    let home = std::env::var("HOME").ok()?;
+    let hak_dirs = [
+        Path::new(&home).join("Documents/Neverwinter Nights/hak"),
+        Path::new(&home).join("Documents/Neverwinter Nights/development"),
+        Path::new(&home).join(".local/share/Steam/steamapps/common/Neverwinter Nights/hak"),
+    ];
+    for dir in &hak_dirs {
+        if !dir.is_dir() { continue; }
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().and_then(|e| e.to_str()) != Some("hak") { continue; }
+                if let Ok(erf) = nwn_erf::ErfFile::open(&path) {
+                    let name_lower = resref.res_ref().to_lowercase();
+                    if let Some(data) = erf.get(&name_lower, resref.res_type().0) {
+                        return Some(data);
                     }
                 }
             }
         }
     }
+    None
+}
 
-    Ok(None)
+pub fn load_texture_data(texture_name: &str) -> Result<Option<TextureData>> {
+    let data_dir = match game_data_dir() {
+        Some(d) => d,
+        None => return Ok(None),
+    };
+
+    Ok(load_texture_by_name(texture_name, &|resref| {
+        load_resource_from_key(resref, &data_dir).ok()?
+    }))
+}
+
+/// Like `load_texture_data` but also searches the given ERF files (module + haks) first.
+pub fn load_texture_data_from_sources(
+    texture_name: &str,
+    erfs: &[&nwn_erf::ErfFile],
+) -> Result<Option<TextureData>> {
+    // Search ERFs first
+    for erf in erfs {
+        if let Some(data) = load_texture_from_erf(texture_name, erf) {
+            return Ok(Some(data));
+        }
+    }
+    // Fall back to game data
+    load_texture_data(texture_name)
+}
+
+fn load_texture_from_erf(texture_name: &str, erf: &nwn_erf::ErfFile) -> Option<TextureData> {
+    let name = texture_name.to_lowercase()
+        .replace(".dds", "").replace(".tga", "").replace(".bmp", "")
+        .replace(" ", "_").replace("-", "_");
+
+    for &res_type in &[8u16, 3u16, 1u16] {
+        if let Some(data) = erf.get(&name, res_type) {
+            if let Some(tex) = decode_texture_data(res_type, &data) {
+                return Some(tex);
+            }
+        }
+    }
+    None
 }
 
 pub fn find_and_load_tileset(name: &str, module_path: &Path, haks: &[String]) -> Result<Option<Tileset>> {
@@ -549,6 +668,64 @@ fn mat4_is_identity(m: &[[f32; 4]; 4]) -> bool {
     m[1][0] == 0.0 && m[1][1] == 1.0 && m[1][2] == 0.0 && m[1][3] == 0.0 &&
     m[2][0] == 0.0 && m[2][1] == 0.0 && m[2][2] == 1.0 && m[2][3] == 0.0 &&
     m[3][0] == 0.0 && m[3][1] == 0.0 && m[3][2] == 0.0 && m[3][3] == 1.0
+}
+
+/// Load a 2DA file from game data (KEY/BIF) and look up the model name
+/// for a given row index. For `placeables.2da` and `door.2da`, the column
+/// is `ModelName`. For `appearance.2da`, the column is the 3rd column (index 2).
+pub fn lookup_model_name_from_2da(two_da_name: &str, row: i32, column_label: &str) -> Option<String> {
+    let data_dir = game_data_dir()?;
+    let resref = nwnrs_types::resman::ResRef::new(
+        two_da_name.to_lowercase(),
+        nwnrs_types::resman::ResType(2017), // Twoda
+    ).ok()?;
+    let data = load_resource_from_key(&resref, &data_dir).ok()??;
+    let text = std::str::from_utf8(&data).ok()?;
+
+    // Parse 2DA: find column index by label, find row by number, extract value
+    let mut lines = text.lines();
+    // Skip header line (2DA V2.0)
+    let _header = lines.next();
+    // Find column headers
+    let mut headers: Vec<&str> = Vec::new();
+    for line in &mut lines {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') { continue; }
+        headers = trimmed.split(|c| c == '\t' || c == ' ').filter(|s| !s.is_empty()).collect();
+        break;
+    }
+    let col_idx = headers.iter().position(|h| h.eq_ignore_ascii_case(column_label))?;
+
+    // Find the row with matching index
+    let target = format!("{}", row);
+    for line in lines {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') { continue; }
+        let parts: Vec<&str> = trimmed.split(|c| c == '\t' || c == ' ').filter(|s| !s.is_empty()).collect();
+        if parts.is_empty() { continue; }
+        if parts[0] == target {
+            return parts.get(col_idx).filter(|s| !s.is_empty() && **s != "****").map(|s| s.to_string());
+        }
+    }
+    None
+}
+
+/// Look up the model name for a placeable given its appearance ID.
+/// Uses `placeables.2da` which has a `ModelName` column.
+pub fn lookup_placeable_model(appearance: i32) -> Option<String> {
+    lookup_model_name_from_2da("placeables", appearance, "ModelName")
+}
+
+/// Look up the model name for a door given its appearance ID.
+/// Uses `door.2da` which has a `ModelName` column.
+pub fn lookup_door_model(appearance: i32) -> Option<String> {
+    lookup_model_name_from_2da("door", appearance, "ModelName")
+}
+
+/// Look up the model name for a creature given its appearance ID.
+/// Uses `appearance.2da` where the 3rd column is the model name.
+pub fn lookup_creature_model(appearance: i32) -> Option<String> {
+    lookup_model_name_from_2da("appearance", appearance, "model")
 }
 
 #[cfg(test)]
