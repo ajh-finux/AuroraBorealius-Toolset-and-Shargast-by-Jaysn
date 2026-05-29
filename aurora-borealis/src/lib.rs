@@ -1060,6 +1060,33 @@ impl eframe::App for AuroraBorealisApp {
                     if self.icons.label_toggle(ui, "Snap", "", self.snap_to_grid_enabled, S).clicked() {
                         self.snap_to_grid_enabled = !self.snap_to_grid_enabled;
                     }
+                    ui.separator();
+                    if has_area {
+                        if self.icons.label_toggle(ui, "Creature", "person", self.show_creatures, S).clicked() {
+                            self.show_creatures = !self.show_creatures; filter_changed = true;
+                        }
+                        if self.icons.label_toggle(ui, "Doors", "door", self.show_doors, S).clicked() {
+                            self.show_doors = !self.show_doors; filter_changed = true;
+                        }
+                        if self.icons.label_toggle(ui, "Placeable", "chest", self.show_placeables, S).clicked() {
+                            self.show_placeables = !self.show_placeables; filter_changed = true;
+                        }
+                        if self.icons.label_toggle(ui, "Trigger", "new-shoot", self.show_triggers, S).clicked() {
+                            self.show_triggers = !self.show_triggers; filter_changed = true;
+                        }
+                        if self.icons.label_toggle(ui, "Waypoint", "star-flag", self.show_waypoints, S).clicked() {
+                            self.show_waypoints = !self.show_waypoints; filter_changed = true;
+                        }
+                        if self.icons.label_toggle(ui, "Encounter", "star-flag", self.show_encounters, S).clicked() {
+                            self.show_encounters = !self.show_encounters; filter_changed = true;
+                        }
+                        if self.icons.label_toggle(ui, "Sound", "musical-notes", self.show_sound_emitters, S).clicked() {
+                            self.show_sound_emitters = !self.show_sound_emitters; filter_changed = true;
+                        }
+                        if self.icons.label_toggle(ui, "Light", "light-bulb", self.show_lights, S).clicked() {
+                            self.show_lights = !self.show_lights; filter_changed = true;
+                        }
+                    }
                     if filter_changed { self.update_visibility_filter(target_format); }
                     ui.separator();
                     egui::menu::menu_button(ui, "...", |ui| {
@@ -1145,6 +1172,26 @@ impl eframe::App for AuroraBorealisApp {
                         if self.transition_editor_open { self.status = "Scanning transitions.".to_string(); }
                     }
                     ui.separator();
+                    if has_area && self.icons.label_button(ui, "New", "new-shoot", S).clicked() {
+                        self.new_object_open = true;
+                        self.new_object_type = "creature".to_string();
+                        self.new_object_resref.clear();
+                        self.new_object_tag.clear();
+                        self.new_object_x = 0.0;
+                        self.new_object_y = 0.0;
+                        self.new_object_z = 0.0;
+                        self.new_object_bearing = 0.0;
+                    }
+                    if has_area && self.icons.label_button(ui, "Copy", "select", S).clicked() {
+                        self.copy_selected_object();
+                    }
+                    if has_area && self.icons.label_button(ui, "Paste", "hand", S).clicked() {
+                        self.paste_object();
+                    }
+                    if has_area && self.icons.label_button(ui, "Del", "trash-can", S).clicked() {
+                        self.delete_selected_object();
+                    }
+                    ui.separator();
                     if self.icons.label_button(ui, "Undo", "return-arrow", S).clicked() {
                         self.undo(target_format);
                     }
@@ -1207,70 +1254,6 @@ impl eframe::App for AuroraBorealisApp {
                             }
                         }
                     });
-                });
-            });
-        });
-
-        // ---- EDIT BAR ----
-        egui::TopBottomPanel::top("menu_edit").min_height(22.0).show(ctx, |ui| {
-            ui.style_mut().spacing.item_spacing = egui::vec2(1.0, 0.0);
-            egui::ScrollArea::horizontal().id_salt("toolbar_edit").show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    if has_area && self.icons.label_button(ui, "New", "new-shoot", S).clicked() {
-                        self.new_object_open = true;
-                        self.new_object_type = "creature".to_string();
-                        self.new_object_resref.clear();
-                        self.new_object_tag.clear();
-                        self.new_object_x = 0.0;
-                        self.new_object_y = 0.0;
-                        self.new_object_z = 0.0;
-                        self.new_object_bearing = 0.0;
-                    }
-                    if has_area && self.icons.label_button(ui, "Copy", "select", S).clicked() {
-                        self.copy_selected_object();
-                    }
-                    if has_area && self.icons.label_button(ui, "Paste", "hand", S).clicked() {
-                        self.paste_object();
-                    }
-                    if has_area && self.icons.label_button(ui, "Del", "trash-can", S).clicked() {
-                        self.delete_selected_object();
-                    }
-                });
-            });
-        });
-
-        // ---- MARKS BAR (visibility toggles) ----
-        egui::TopBottomPanel::top("menu_marks").min_height(22.0).show(ctx, |ui| {
-            ui.style_mut().spacing.item_spacing = egui::vec2(1.0, 0.0);
-            egui::ScrollArea::horizontal().id_salt("toolbar_marks").show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    if has_area {
-                        if self.icons.label_toggle(ui, "Creature", "person", self.show_creatures, S).clicked() {
-                            self.show_creatures = !self.show_creatures; filter_changed = true;
-                        }
-                        if self.icons.label_toggle(ui, "Doors", "door", self.show_doors, S).clicked() {
-                            self.show_doors = !self.show_doors; filter_changed = true;
-                        }
-                        if self.icons.label_toggle(ui, "Placeable", "chest", self.show_placeables, S).clicked() {
-                            self.show_placeables = !self.show_placeables; filter_changed = true;
-                        }
-                        if self.icons.label_toggle(ui, "Trigger", "new-shoot", self.show_triggers, S).clicked() {
-                            self.show_triggers = !self.show_triggers; filter_changed = true;
-                        }
-                        if self.icons.label_toggle(ui, "Waypoint", "star-flag", self.show_waypoints, S).clicked() {
-                            self.show_waypoints = !self.show_waypoints; filter_changed = true;
-                        }
-                        if self.icons.label_toggle(ui, "Encounter", "star-flag", self.show_encounters, S).clicked() {
-                            self.show_encounters = !self.show_encounters; filter_changed = true;
-                        }
-                        if self.icons.label_toggle(ui, "Sound", "musical-notes", self.show_sound_emitters, S).clicked() {
-                            self.show_sound_emitters = !self.show_sound_emitters; filter_changed = true;
-                        }
-                        if self.icons.label_toggle(ui, "Light", "light-bulb", self.show_lights, S).clicked() {
-                            self.show_lights = !self.show_lights; filter_changed = true;
-                        }
-                        if filter_changed { self.update_visibility_filter(target_format); }
-                    }
                 });
             });
         });
