@@ -3054,13 +3054,16 @@ impl eframe::App for AuroraBorealisApp {
                 }
                 let (_id, rect) = ui.allocate_space(ui.available_size());
                 // Minimap overlay (bottom-right corner of viewport)
+                // Must use a separate foreground layer so it renders on top of the 3D paint callback
                 if self.show_minimap {
                     let mini_size = egui::vec2(150.0, 100.0);
                     let mini_rect = egui::Rect::from_min_size(
                         egui::pos2(rect.right() - mini_size.x - 6.0, rect.bottom() - mini_size.y - 6.0),
                         mini_size,
                     );
-                    ui.painter().rect_filled(mini_rect, 2.0, egui::Color32::from_black_alpha(180));
+                    let layer_id = egui::LayerId::new(egui::Order::Foreground, egui::Id::new("minimap_overlay"));
+                    let painter = egui::Painter::new(ui.ctx().clone(), layer_id, mini_rect);
+                    painter.rect_filled(mini_rect, 2.0, egui::Color32::from_black_alpha(180));
                     let w = area.width.max(1) as usize;
                     let h = area.height.max(1) as usize;
                     let cell = ((mini_size.x / w as f32).min(mini_size.y / h as f32)).max(1.0);
@@ -3086,7 +3089,7 @@ impl eframe::App for AuroraBorealisApp {
                             let cx = ox + col as f32 * cell;
                             let cy = oy + row as f32 * cell;
                             let c = egui::Color32::from_rgb(r, g, b);
-                            ui.painter().rect_filled(
+                            painter.rect_filled(
                                 egui::Rect::from_min_size(egui::pos2(cx, cy), egui::vec2(cell, cell)),
                                 0.0, c,
                             );
