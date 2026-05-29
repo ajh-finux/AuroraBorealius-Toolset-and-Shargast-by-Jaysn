@@ -3744,9 +3744,10 @@ impl eframe::App for AuroraBorealisApp {
                 let cb = egui_wgpu::Callback::new_paint_callback(rect, self.viewport.clone_arc());
                 ui.painter().add(cb);
 
-                // Ghost placement preview overlay
+                // Ghost placement preview overlay (in foreground layer to be above 3D viewport)
                 if let Some(ghost_pos) = self.ghost_screen_pos {
-                    let painter = ui.painter();
+                    let ghost_layer_id = egui::LayerId::new(egui::Order::Foreground, egui::Id::new("ghost_preview"));
+                    let painter = egui::Painter::new(ui.ctx().clone(), ghost_layer_id, rect);
                     painter.line_segment(
                         [ghost_pos - egui::vec2(10.0, 0.0), ghost_pos + egui::vec2(10.0, 0.0)],
                         egui::Stroke::new(2.0, egui::Color32::YELLOW),
