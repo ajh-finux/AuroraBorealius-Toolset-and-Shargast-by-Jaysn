@@ -941,6 +941,14 @@ impl eframe::App for AuroraBorealisApp {
                     if has_mod && self.icons.label_button(ui, "Save", "save", S).clicked() {
                         self.save_module();
                     }
+                    if has_mod && self.icons.label_button(ui, "SaveAs", "save", S).clicked() {
+                        if let Some(ref module) = self.module {
+                            if let Some(path) = pick_save_path(&module.name) {
+                                self.save_module_as(&path);
+                                self.status = format!("Module saved to {}", path);
+                            }
+                        }
+                    }
                     if has_mod && self.icons.label_button(ui, "Props", "cog", S).clicked() {
                         if let Some(ref module) = self.module {
                             self.module_name_edit = module.name.clone();
