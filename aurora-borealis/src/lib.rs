@@ -1080,6 +1080,7 @@ impl eframe::App for AuroraBorealisApp {
                         ui.checkbox(&mut sl, "Lights"); if sl != self.show_lights { self.show_lights = sl; filter_changed = true; }
                     });
                     if filter_changed { self.update_visibility_filter(target_format); }
+                    ui.separator();
                     egui::menu::menu_button(ui, "...", |ui| {
                         if has_area {
                             if ui.button("Generate Walls").clicked() {
