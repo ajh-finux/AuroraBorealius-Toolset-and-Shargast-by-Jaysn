@@ -1,34 +1,27 @@
 # rust-neveredit — Agent Status
 
-## Toolbar & UI (May 29 2026)
-- **4 scrollable bars** (File/View/Tools/Edit) replacing dropdown menus — each with `ScrollArea::horizontal` and tight 1px spacing.
-- **Text+icon buttons**: `label_toggle` (highlighted when active) and `label_button` (momentary) in `icons.rs`.
-- **File bar**: Open, Recent (dropdown), Save, SaveAs, Props, Minimap export, Launch NWN, Quit, Modified indicator.
-- **View bar**: Res, BP, Items, Search, Tree, Con(contents), Palette, Graph, Height, Nav, Mini, Sky toggles; then render toggles (Tiles, Grid, Light, Fog, Walk, WEdges, Paint, Sprite, Water, Snap); Marks popup; "..." popup (Generate Walls, Water/Grid/Texture sliders).
-- **Tools bar**: Env, Factions, Journal, Enc, Tex, Sound, Store, Whois, Geom, Find, Trans toggles; Undo/Redo; Camera bookmarks + NWSync export (right-aligned).
-- **Edit bar**: New, Copy, Paste, Del (area-conditional).
+## Toolbar (3 scrollable bars)
+- **File**: Open, Recent, Save, SaveAs, Props, Minimap export, Launch NWN, Quit, Modified indicator
+- **View**: Window toggles (Res, BP, Items, Search, Tree, Con, Palette, Graph, Height, Nav, Mini, Sky) | render toggles (Tiles, Grid, Light, Fog, Walk, WEdges, Paint, Sprite, Water, Snap) | marks toggles (Creature, Doors, Placeable, Trigger, Waypoint, Encounter, Sound, Light) | "..." overflow
+- **Tools**: Editor toggles (Env, Factions, Journal, Enc, Tex, Sound, Store, Whois, Geom, Find, Trans) | edit actions (New, Copy, Paste, Del) | Undo, Redo | bookmarks + NWSync (right-aligned)
+- **Pattern**: `TopBottomPanel::top` + `ScrollArea::horizontal`, 1px item spacing, `label_toggle`/`label_button` (text + icon at 12px), `icon_button` (16px) for utility buttons.
 
 ## Rendering Fixes
-- **Minimap overlay**: Fixed — was hidden behind 3D viewport paint callback. Now renders in `Order::Foreground` layer (above the 3D scene).
-- **Ghost placement preview**: Same fix — rendered in foreground layer.
+- **Minimap overlay** & **ghost preview**: Fixed — were hidden behind 3D paint callback (egui renders shapes before paint callbacks in same layer). Now render in `Order::Foreground` layer.
 
-## Data Loading Fixes (previous session)
-- **Faction Editor**: Fallback lookups for `"repute"` / `"Repute"` (NWN modules store factions as `repute.fac`).
-- **Journal Editor**: Fallback lookups for `"module"` / `"Module"` (NWN modules store journal as `module.jrl`).
-- **Appearance Picker**: Uses `resource_manager.get_2da("appearance")` instead of raw ERF.
-- **`get_resource_data`** (`nwn-gamemodel/src/module.rs`): Hak fallback + FAC/JRL alias swaps.
-- **`resource_list`**: Includes hak resources via `hak_index.all_resources()`.
+## Data Loading
+- **Faction/Journal editors**: Fallback lookups (`repute.fac`, `module.jrl`) since NWN modules use these names.
+- **Appearance Picker**: Uses `resource_manager.get_2da("appearance")`.
+- **`get_resource_data`**: Hak fallback + FAC/JRL alias swaps.
+- **`resource_list`**: Includes hak resources.
 - **Transition Editor**: ERF fallback for GIT data.
 - **Encounter Editor**: `selected_idx` persisted.
-- **Area search bar**: Text filter in left sidebar.
 
 ## Known Issues
-- Area Geometry Editor may show empty list if area has no triggers/encounters
-- All audio resources (WAV/BMU) expected to be missing from module ERF (game data / haks only)
+- Area Geometry Editor empty if area has no triggers/encounters
+- Audio resources (WAV/BMU) missing from ERF (game data / haks only)
 
-## Relevant Files
-- `aurora-borealis/src/lib.rs` — main app, all toolbars + windows
-- `aurora-borealis/src/icons.rs` — `label_toggle`, `label_button`, `text_icon_layout`, `icon_toggle`
+## Key Files
+- `aurora-borealis/src/lib.rs` — main app
+- `aurora-borealis/src/icons.rs` — `label_toggle`, `label_button`, `text_icon_layout`
 - `nwn-gamemodel/src/module.rs` — `get_resource_data`, `resource_list`
-- `aurora-borealis/src/faction_editor.rs` — `"repute"` fallback
-- `aurora-borealis/src/encounter_editor.rs` — `&mut Option<usize>` parameter
