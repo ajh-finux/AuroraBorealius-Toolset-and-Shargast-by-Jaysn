@@ -56,6 +56,7 @@ struct SpriteBatch {
 pub struct ViewportState {
     pub camera: OrbitCamera,
     pub area_version: u64,
+    pub area_resref: String,
     pub markers: Vec<MarkerInfo>,
     pub tile_count: usize,
     pub color_format: wgpu::TextureFormat,
@@ -77,6 +78,9 @@ pub struct ViewportState {
     paint_vertex_buf: Option<wgpu::Buffer>,
     paint_index_buf: Option<wgpu::Buffer>,
     show_paint: bool,
+    water_idx_count: u32,
+    water_vertex_buf: Option<wgpu::Buffer>,
+    water_index_buf: Option<wgpu::Buffer>,
     pub clear_color: wgpu::Color,
     pub water_level: i32,
     pub show_water: bool,
@@ -106,7 +110,12 @@ pub struct ViewportState {
     highlight_vbuf: Option<wgpu::Buffer>,
     highlight_ibuf: Option<wgpu::Buffer>,
     highlight_count: u32,
+    tile_hl_vbuf: Option<wgpu::Buffer>,
+    tile_hl_ibuf: Option<wgpu::Buffer>,
+    tile_hl_count: u32,
     highlight_pipeline: wgpu::RenderPipeline,
+    cached_highlight: Option<([f32; 3], f32)>,
+    cached_tile_highlight: Option<(Option<usize>, usize, usize, f32)>,
 
     floor_pipeline: wgpu::RenderPipeline,
     floor_vertex_buf: Option<wgpu::Buffer>,
@@ -132,10 +141,15 @@ pub struct ViewportState {
     // CPU-side instance data for fast drag updates
     instance_data: Vec<Vec<tile_renderer::InstanceData>>,
     tile_group_count: usize,
+    tile_instance_map: std::collections::HashMap<(usize, usize), Vec<(usize, usize)>>,
     object_instance_map: std::collections::HashMap<(String, usize), Vec<(usize, usize)>>,
 
     /// Point lights uploaded to the GPU each frame
     lights: Vec<PointLightData>,
+
+    /// Cache last camera right/up to skip sprite updates when camera hasn't moved
+    last_camera_right_up: Option<([f32; 3], [f32; 3])>,
+    sprite_instance_dirty: bool,
 }
 
 fn load_texture(name: &str, module_erf: Option<&nwn_erf::ErfFile>, hak_index: Option<&nwn_tileset::HakIndex>, mod_path: Option<&Path>, _hak_names: &[String]) -> Option<(u32, u32, Vec<u8>)> {
@@ -183,11 +197,12 @@ impl ViewportState {
         hak_names: &[String],
         existing_cache: Option<&mut tile_renderer::ModelCache>,
         max_texture_bytes: u64,
+        persist: ViewportPersist,
     ) -> Self {
 
         let camera = existing_camera.unwrap_or_else(|| OrbitCamera::new(area.width as f32, area.height as f32));
         let show_tiles = visibility_filter.show_tiles;
-        let show_walkmesh = false;
+        let show_walkmesh = persist.show_walkmesh;
 
         // Build HakIndex for efficient texture search (only opens the relevant hak, not all haks)
         let hak_index = mod_path.and_then(|p| {
@@ -273,10 +288,8 @@ impl ViewportState {
                             }
                         }
                     }
-                    if loaded.is_some() {
-                        eprintln!("  DEBUG model '{}' loaded OK", name);
-                    } else {
-                        eprintln!("  DEBUG model '{}' NOT FOUND", name);
+                    if loaded.is_none() {
+                        eprintln!("  model '{}' NOT FOUND", name);
                     }
                     ((*name).clone(), loaded)
                 })
@@ -290,15 +303,15 @@ impl ViewportState {
 
         let mut instanced = tile_renderer::build_instanced_tiles(area, model_cache);
         let tile_group_count = instanced.models.len();
-        let obj_instanced = tile_renderer::build_object_models(area, model_cache);
-        let object_instance_map = tile_renderer::build_object_instance_map(area, &obj_instanced, model_cache);
+        let obj_instanced = tile_renderer::build_object_models(area, model_cache, &visibility_filter);
+        let object_instance_map = tile_renderer::build_object_instance_map(area, &obj_instanced, model_cache, &visibility_filter);
         let obj_models = obj_instanced.models;
         let obj_instance_data = obj_instanced.instance_data;
         // Merge object models into instanced
         instanced.models.extend(obj_models);
         instanced.instance_data.extend(obj_instance_data);
 
-        let markers_result = tile_renderer::build_object_markers(area, visibility_filter);
+        let markers_result = tile_renderer::build_object_markers(area, visibility_filter, &model_cache);
         let marker_data = markers_result.mesh;
         let tile_count: usize = instanced.instance_data.iter().map(|v| v.len()).sum();
         let draw_calls = instanced.instance_data.iter().filter(|v| !v.is_empty()).count() + 1;
@@ -384,31 +397,31 @@ impl ViewportState {
             }
         }
 
-        // Load textures with memory cap
+        // Load textures one-at-a-time, building texture_slots directly (no intermediate Vec)
+        // This avoids having all decoded textures in CPU RAM simultaneously
+        let ram_limit_kb = (max_texture_bytes / 1024).saturating_mul(2);
         let mut total_tex_bytes: u64 = 0;
-        let tex_data: Vec<(String, Option<(u32, u32, Vec<u8>)>)> = {
-            tex_names.iter()
-                .map(|name| {
-                    if total_tex_bytes >= max_texture_bytes {
-                        return (name.clone(), None);
-                    }
-                    let result = load_texture(name, module_erf, hak_index.as_ref(), mod_path, hak_names);
-                    if let Some((w, h, ref _data)) = result {
-                        total_tex_bytes += w as u64 * h as u64 * 4;
-                    }
-                    (name.clone(), result)
-                })
-                .collect()
-        };
-        let loaded_count = tex_data.iter().filter(|(_, d)| d.is_some()).count();
-        let skipped_count = tex_data.len() - loaded_count;
-        if skipped_count > 0 {
-            eprintln!("  Texture cap ({} MB): loaded {}, skipped {} textures", max_texture_bytes / 1024 / 1024, loaded_count, skipped_count);
-        }
-
-        // Create texture slots from loaded data
-        let mut texture_slots: Vec<TextureSlot> = tex_data.iter().map(|(name, pending)| {
+        let mut texture_slots: Vec<TextureSlot> = Vec::new();
+        let mut loaded_count = 0usize;
+        let mut tex_slot_map: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        for (i, name) in tex_names.iter().enumerate() {
+            if total_tex_bytes >= max_texture_bytes {
+                break;
+            }
+            if i % 4 == 0 && current_rss_kb() > ram_limit_kb && ram_limit_kb > 512 * 1024 {
+                eprintln!("  RAM limit — stopped textures at {}/{}", i, tex_names.len());
+                break;
+            }
+            let pending = load_texture(name, module_erf, hak_index.as_ref(), mod_path, hak_names);
             let (w, h) = pending.as_ref().map(|d| (d.0, d.1)).unwrap_or((2, 2));
+            if pending.is_some() {
+                loaded_count += 1;
+                total_tex_bytes += w as u64 * h as u64 * 4;
+            } else {
+                continue;
+            }
+            let slot_idx = texture_slots.len() + 1; // +1 for fallback at index 0
+            tex_slot_map.insert(name.clone(), slot_idx);
             let texture = device.create_texture(&wgpu::TextureDescriptor {
                 label: Some(&format!("nwn3d_tex_{name}")),
                 size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
@@ -419,7 +432,7 @@ impl ViewportState {
                 usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
                 view_formats: &[],
             });
-            TextureSlot {
+            texture_slots.push(TextureSlot {
                 view: texture.create_view(&wgpu::TextureViewDescriptor::default()),
                 sampler: device.create_sampler(&wgpu::SamplerDescriptor {
                     label: Some("nwn3d_tex_sampler"),
@@ -433,13 +446,11 @@ impl ViewportState {
                 }),
                 texture,
                 bind_group: None,
-                pending: pending.clone(),
-            }
-        }).collect();
-
-        // Map texture name -> slot index (+1 for fallback at 0)
-        let tex_slot_map: std::collections::HashMap<&str, usize> = tex_names.iter()
-            .enumerate().map(|(i, n)| (n.as_str(), i + 1)).collect();
+                pending,
+            });
+        }
+        let skipped_count = tex_names.len().saturating_sub(texture_slots.len());
+        eprintln!("  Textures: {} unique, {} loaded, {} skipped (cap={} MB)", tex_names.len(), loaded_count, skipped_count, max_texture_bytes / 1024 / 1024);
 
         // Create per-model group resources with instance buffers
         let mut group_resources = Vec::new();
@@ -741,9 +752,39 @@ impl ViewportState {
         let keep_set: std::collections::HashSet<String> = unique_models.iter().cloned().collect();
         model_cache.retain(&keep_set);
 
+        // Build point light list from area lights + placeables with HasLight
+        let mut lights: Vec<PointLightData> = area.lights.iter().take(MAX_POINT_LIGHTS as usize).map(|l| {
+            let (rx, ry, rz) = tile_renderer::nwn_to_renderer(l.x, l.y, l.z);
+            PointLightData {
+                position_radius: [rx, ry, rz, l.radius.max(2.0)],
+                color_pad: [
+                    l.color[0] as f32 / 255.0 * 2.0,
+                    l.color[1] as f32 / 255.0 * 2.0,
+                    l.color[2] as f32 / 255.0 * 2.0,
+                    1.0,
+                ],
+            }
+        }).collect();
+        let placeable_capacity = (MAX_POINT_LIGHTS as usize).saturating_sub(lights.len());
+        for pl in area.placeables.iter().take(placeable_capacity) {
+            if pl.has_light {
+                let (rx, ry, rz) = tile_renderer::nwn_to_renderer(pl.x, pl.y, pl.z);
+                lights.push(PointLightData {
+                    position_radius: [rx, ry, rz, pl.light_radius.max(2.0)],
+                    color_pad: [
+                        pl.light_color[0] as f32 / 255.0 * 2.0,
+                        pl.light_color[1] as f32 / 255.0 * 2.0,
+                        pl.light_color[2] as f32 / 255.0 * 2.0,
+                        1.0,
+                    ],
+                });
+            }
+        }
+
         Self {
             camera,
             area_version,
+            area_resref: area.resref.clone(),
             markers: markers_result.markers,
             tile_count,
             color_format: config.format,
@@ -759,15 +800,18 @@ impl ViewportState {
             walkmesh_edge_vbuf,
             walkmesh_edge_ibuf,
             walkmesh_edge_count,
-            show_walkmesh_edges: false,
+            show_walkmesh_edges: persist.show_walkmesh_edges,
             clear_color: wgpu::Color { r: 0.1, g: 0.1, b: 0.12, a: 1.0 },
-            water_level: 0,
-            show_water: false,
-            water_color: [40, 80, 200, 160],
+            water_level: persist.water_level,
+            show_water: persist.show_water,
+            water_color: persist.water_color,
+            water_idx_count: 0,
+            water_vertex_buf: None,
+            water_index_buf: None,
             paint_idx_count,
             paint_vertex_buf,
             paint_index_buf,
-            show_paint: false,
+            show_paint: persist.show_paint,
             show_tiles,
             uniform_buf,
             uniform_bind_group,
@@ -802,15 +846,20 @@ impl ViewportState {
             highlight_vbuf: None,
             highlight_ibuf: None,
             highlight_count: 0,
+            tile_hl_vbuf: None,
+            tile_hl_ibuf: None,
+            tile_hl_count: 0,
             highlight_pipeline,
+            cached_highlight: None,
+            cached_tile_highlight: None,
 
             floor_pipeline,
             floor_vertex_buf,
             floor_index_buf,
             floor_idx_count,
-            show_grid: true,
-            lighting_enabled: true,
-            show_fog: false,
+            show_grid: persist.show_grid,
+            lighting_enabled: persist.lighting_enabled,
+            show_fog: persist.show_fog,
             fog_color: [
                 area.sun_fog_color[0] as f32 / 255.0,
                 area.sun_fog_color[1] as f32 / 255.0,
@@ -820,9 +869,9 @@ impl ViewportState {
             fog_amount_norm: area.sun_fog_amount as f32 / 255.0,
             fog_clip_dist: area.fog_clip_dist,
             ambient_color: [
-                (area.sun_ambient_color[0] as f32 / 255.0).max(0.5),
-                (area.sun_ambient_color[1] as f32 / 255.0).max(0.5),
-                (area.sun_ambient_color[2] as f32 / 255.0).max(0.5),
+                area.sun_ambient_color[0] as f32 / 255.0,
+                area.sun_ambient_color[1] as f32 / 255.0,
+                area.sun_ambient_color[2] as f32 / 255.0,
             ],
             diffuse_color: [
                 area.sun_diffuse_color[0] as f32 / 255.0,
@@ -835,27 +884,32 @@ impl ViewportState {
             sprite_quad_vbuf,
             sprite_quad_ibuf,
             sprite_instance_buf,
-            show_sprites: true,
+            show_sprites: persist.show_sprites,
 
             instance_data: instanced.instance_data,
             tile_group_count,
+            tile_instance_map: instanced.tile_instance_map,
             object_instance_map,
 
-            // Convert area point lights to renderer-space GPU data
-            lights: area.lights.iter().take(MAX_POINT_LIGHTS as usize).map(|l| {
-                let (rx, ry, rz) = tile_renderer::nwn_to_renderer(l.x, l.y, l.z);
-                PointLightData {
-                    position_radius: [rx, ry, rz, l.radius.max(0.1)],
-                    color_pad: [
-                        l.color[0] as f32 / 255.0,
-                        l.color[1] as f32 / 255.0,
-                        l.color[2] as f32 / 255.0,
-                        1.0,
-                    ],
-                }
-            }).collect(),
+            lights,
+            last_camera_right_up: None,
+            sprite_instance_dirty: true,
         }
 
+    }
+
+    /// Fast-path: update a single tile's transform (height / orientation) without rebuilding the scene.
+    pub fn set_tile_transform(&mut self, queue: &wgpu::Queue, col: usize, row: usize, height: i32, orientation: i32) {
+        let Some(entries) = self.tile_instance_map.get(&(col, row)) else { return };
+        let h = height as f32 * 0.25;
+        for &(gidx, inst_idx) in entries {
+            if gidx >= self.tile_group_count { continue; }
+            if inst_idx >= self.instance_data[gidx].len() { continue; }
+            let inst = tile_renderer::tile_instance_transform(col, row, h, orientation as u8);
+            self.instance_data[gidx][inst_idx] = inst;
+            let offset = inst_idx as u64 * 64;
+            queue.write_buffer(&self.groups[gidx].instance_buf, offset, bytemuck::cast_slice(&[inst]));
+        }
     }
 
     /// Fast-path: update a single object's instance transform without rebuilding the entire scene.
@@ -979,44 +1033,56 @@ impl ViewportState {
         } else {
             1.0
         };
+        let light_count = self.lights.len();
+        let total_size = 144 + light_count * 32;
+        let mut data = Vec::with_capacity(total_size);
         let vp = mat4_mul(self.camera.view_matrix(), self.camera.projection_matrix());
-        queue.write_buffer(&self.uniform_buf, 0, bytemuck::cast_slice(&[vp]));
-        // ambient_color at offset 64 (float[16]): xyz = ambient RGB, w = lighting flag
+        data.extend_from_slice(bytemuck::cast_slice(&[vp]));
+        data.resize(64, 0u8);
         let ambient = [
-            self.ambient_color[0],
-            self.ambient_color[1],
-            self.ambient_color[2],
+            self.ambient_color[0].max(0.5),
+            self.ambient_color[1].max(0.5),
+            self.ambient_color[2].max(0.5),
             if self.lighting_enabled { 1.0f32 } else { 0.0f32 },
         ];
-        queue.write_buffer(&self.uniform_buf, 64, bytemuck::cast_slice(&ambient));
-        // fog_color at offset 80 (float[20])
-        queue.write_buffer(&self.uniform_buf, 80, bytemuck::cast_slice(&self.fog_color));
-        // fog_params at offset 96 (float[24]): x=fog_amount_norm, y=fog_clip_dist, z=light_count
+        data.extend_from_slice(bytemuck::cast_slice(&ambient));
+        let fog_dist = if self.show_fog && self.fog_clip_dist <= 0.0 {
+            50.0
+        } else {
+            self.fog_clip_dist
+        };
+        data.extend_from_slice(bytemuck::cast_slice(&self.fog_color));
         let fog_params = [
-            if self.show_fog { self.fog_amount_norm } else { 0.0 },
-            self.fog_clip_dist,
-            self.lights.len() as f32,
+            if self.show_fog { self.fog_amount_norm.max(0.01) } else { 0.0 },
+            fog_dist,
+            light_count as f32,
             0.0,
         ];
-        queue.write_buffer(&self.uniform_buf, 96, bytemuck::cast_slice(&fog_params));
-        // camera_pos at offset 112 (float[28])
+        data.extend_from_slice(bytemuck::cast_slice(&fog_params));
         let eye = self.camera.eye();
-        queue.write_buffer(&self.uniform_buf, 112, bytemuck::cast_slice(&[eye[0], eye[1], eye[2], 0.0]));
-        // diffuse_color at offset 128 (float[32])
-        queue.write_buffer(&self.uniform_buf, 128, bytemuck::cast_slice(&self.diffuse_color));
-        // point lights at offset 144: each light is 2 × vec4<f32> = 32 bytes
+        data.extend_from_slice(bytemuck::cast_slice(&[eye[0], eye[1], eye[2], 0.0]));
+        let diff = [
+            self.diffuse_color[0].max(0.5),
+            self.diffuse_color[1].max(0.5),
+            self.diffuse_color[2].max(0.5),
+        ];
+        data.extend_from_slice(bytemuck::cast_slice(&diff));
         if !self.lights.is_empty() {
-            let light_bytes = bytemuck::cast_slice(&self.lights);
-            queue.write_buffer(&self.uniform_buf, 144, light_bytes);
+            data.extend_from_slice(bytemuck::cast_slice(&self.lights));
         }
+        queue.write_buffer(&self.uniform_buf, 0, &data);
     }
 
-    pub fn update_sprite_instances(&self, queue: &wgpu::Queue) {
+    pub fn update_sprite_instances(&mut self, queue: &wgpu::Queue) {
         if !self.show_sprites || self.sprites.is_empty() {
             return;
         }
-        let sprite_size = 0.8;
         let (right, up_vec) = self.camera.right_up();
+        let camera_changed = self.last_camera_right_up.map_or(true, |last| last != (right, up_vec));
+        if !camera_changed && !self.sprite_instance_dirty {
+            return;
+        }
+        let sprite_size = 0.8;
 
         let mut instances = Vec::with_capacity(self.sprites.len());
         for sp in &self.sprites {
@@ -1028,6 +1094,8 @@ impl ViewportState {
             });
         }
         queue.write_buffer(&self.sprite_instance_buf, 0, bytemuck::cast_slice(&instances));
+        self.last_camera_right_up = Some((right, up_vec));
+        self.sprite_instance_dirty = false;
     }
 
     pub fn render_3d(&self, render_pass: &mut wgpu::RenderPass) {
@@ -1150,7 +1218,25 @@ impl ViewportState {
             }
         }
 
-        // Render tile highlight wireframe
+        // Render water overlay (flat colored quad at water level)
+        if self.show_water {
+            if let (Some(bg), Some(vbuf), Some(ibuf)) = (
+                self.texture_slots.first().and_then(|s| s.bind_group.as_ref()),
+                &self.water_vertex_buf, &self.water_index_buf
+            ) {
+                if self.water_idx_count > 0 {
+                    render_pass.set_pipeline(&self.walkmesh_pipeline);
+                    render_pass.set_bind_group(0, &self.uniform_bind_group, &[]);
+                    render_pass.set_bind_group(1, bg, &[]);
+                    render_pass.set_vertex_buffer(0, vbuf.slice(..));
+                    render_pass.set_vertex_buffer(1, self.default_instance_buf.slice(..));
+                    render_pass.set_index_buffer(ibuf.slice(..), wgpu::IndexFormat::Uint32);
+                    render_pass.draw_indexed(0..self.water_idx_count, 0, 0..1);
+                }
+            }
+        }
+
+        // Render object highlight wireframe
         if let (Some(vbuf), Some(ibuf)) = (&self.highlight_vbuf, &self.highlight_ibuf) {
             if self.highlight_count > 0 {
                 render_pass.set_pipeline(&self.highlight_pipeline);
@@ -1160,6 +1246,17 @@ impl ViewportState {
                 render_pass.draw_indexed(0..self.highlight_count, 0, 0..1);
             }
         }
+
+        // Render tile highlight wireframe
+        if let (Some(vbuf), Some(ibuf)) = (&self.tile_hl_vbuf, &self.tile_hl_ibuf) {
+            if self.tile_hl_count > 0 {
+                render_pass.set_pipeline(&self.highlight_pipeline);
+                render_pass.set_bind_group(0, &self.uniform_bind_group, &[]);
+                render_pass.set_vertex_buffer(0, vbuf.slice(..));
+                render_pass.set_index_buffer(ibuf.slice(..), wgpu::IndexFormat::Uint32);
+                render_pass.draw_indexed(0..self.tile_hl_count, 0, 0..1);
+            }
+        }
     }
 
 
@@ -1167,36 +1264,37 @@ impl ViewportState {
     pub fn raypick(&self, screen_x: f32, screen_y: f32, view_w: f32, view_h: f32) -> Option<(usize, &MarkerInfo)> {
         if view_w <= 0.0 || view_h <= 0.0 { return None; }
         let (origin, dir) = self.camera.ray_from_screen(screen_x, screen_y, view_w, view_h);
-        let half = 1.5;
         let eps = 1e-15;
         let inv_dir = [
             if dir[0].abs() > eps { 1.0 / dir[0] } else { f32::INFINITY },
             if dir[1].abs() > eps { 1.0 / dir[1] } else { f32::INFINITY },
             if dir[2].abs() > eps { 1.0 / dir[2] } else { f32::INFINITY },
         ];
+        let mut best: Option<(usize, f32)> = None;
         for (idx, marker) in self.markers.iter().enumerate() {
-            let pos_x = marker.x;
-            let pos_y = marker.z;
-            let pos_z = -marker.y;
-            let tmin = ((pos_x - half - origin[0]) * inv_dir[0])
-                .min((pos_x + half - origin[0]) * inv_dir[0]);
-            let tmax = ((pos_x - half - origin[0]) * inv_dir[0])
-                .max((pos_x + half - origin[0]) * inv_dir[0]);
-            let tymin = ((pos_y - half - origin[1]) * inv_dir[1])
-                .min((pos_y + half - origin[1]) * inv_dir[1]);
-            let tymax = ((pos_y - half - origin[1]) * inv_dir[1])
-                .max((pos_y + half - origin[1]) * inv_dir[1]);
-            let tzmin = ((pos_z - half - origin[2]) * inv_dir[2])
-                .min((pos_z + half - origin[2]) * inv_dir[2]);
-            let tzmax = ((pos_z - half - origin[2]) * inv_dir[2])
-                .max((pos_z + half - origin[2]) * inv_dir[2]);
+            let (bx0, by0, bz0) = (marker.aabb_min[0], marker.aabb_min[1], marker.aabb_min[2]);
+            let (bx1, by1, bz1) = (marker.aabb_max[0], marker.aabb_max[1], marker.aabb_max[2]);
+            let tmin = ((bx0 - origin[0]) * inv_dir[0]).min((bx1 - origin[0]) * inv_dir[0]);
+            let tmax = ((bx0 - origin[0]) * inv_dir[0]).max((bx1 - origin[0]) * inv_dir[0]);
+            let tymin = ((by0 - origin[1]) * inv_dir[1]).min((by1 - origin[1]) * inv_dir[1]);
+            let tymax = ((by0 - origin[1]) * inv_dir[1]).max((by1 - origin[1]) * inv_dir[1]);
+            let tzmin = ((bz0 - origin[2]) * inv_dir[2]).min((bz1 - origin[2]) * inv_dir[2]);
+            let tzmax = ((bz0 - origin[2]) * inv_dir[2]).max((bz1 - origin[2]) * inv_dir[2]);
             let t0 = tmin.max(tymin).max(tzmin);
             let t1 = tmax.min(tymax).min(tzmax);
             if t0 <= t1 && t1 >= 0.0 {
-                return Some((idx, marker));
+                let dist = if t0 >= 0.0 { t0 } else { t1 };
+                let better = best.map_or(true, |(_, d)| dist < d);
+                if better {
+                    best = Some((idx, dist));
+                }
             }
         }
-        None
+        best.map(|(idx, _)| (idx, &self.markers[idx]))
+    }
+
+    pub fn world_to_screen(&self, world: [f32; 3], view_w: f32, view_h: f32) -> Option<[f32; 2]> {
+        self.camera.world_to_screen(world, view_w, view_h)
     }
 
     /// Returns (world_x, world_y, world_z) where the ray hits the ground plane (Y=0 in renderer space).
@@ -1209,10 +1307,32 @@ impl ViewportState {
         Some([origin[0] + t * dir[0], origin[1] + t * dir[1], origin[2] + t * dir[2]])
     }
 
+    /// Returns markers whose screen-space projection falls inside the given rectangle.
+    pub fn screen_rect_select(&self, min_screen: [f32; 2], max_screen: [f32; 2], view_w: f32, view_h: f32) -> Vec<(usize, &MarkerInfo)> {
+        let mut hits = Vec::new();
+        let (x0, x1) = if min_screen[0] < max_screen[0] { (min_screen[0], max_screen[0]) } else { (max_screen[0], min_screen[0]) };
+        let (y0, y1) = if min_screen[1] < max_screen[1] { (min_screen[1], max_screen[1]) } else { (max_screen[1], min_screen[1]) };
+        for (idx, marker) in self.markers.iter().enumerate() {
+            let render_pos = [marker.x, marker.z, -marker.y];
+            if let Some(screen) = self.camera.world_to_screen(render_pos, view_w, view_h) {
+                if screen[0] >= x0 && screen[0] <= x1 && screen[1] >= y0 && screen[1] <= y1 {
+                    hits.push((idx, marker));
+                }
+            }
+        }
+        hits
+    }
+
     pub fn set_highlight_tile(&mut self, device: &wgpu::Device, tile_idx: Option<usize>, col: usize, row: usize, height: f32) {
-        self.highlight_vbuf = None;
-        self.highlight_ibuf = None;
-        self.highlight_count = 0;
+        let key = (tile_idx, col, row, height);
+        if Some(key) == self.cached_tile_highlight {
+            return;
+        }
+        self.cached_tile_highlight = Some((tile_idx, col, row, height));
+
+        self.tile_hl_vbuf = None;
+        self.tile_hl_ibuf = None;
+        self.tile_hl_count = 0;
 
         if tile_idx.is_none() { return; }
 
@@ -1256,21 +1376,28 @@ impl ViewportState {
 
         if verts.is_empty() { return; }
 
-        self.highlight_vbuf = Some(device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("nwn3d_highlight_vbuf"),
+        self.tile_hl_vbuf = Some(device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("nwn3d_tile_hl_vbuf"),
             contents: bytemuck::cast_slice(&verts),
             usage: wgpu::BufferUsages::VERTEX,
         }));
-        self.highlight_ibuf = Some(device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("nwn3d_highlight_ibuf"),
+        self.tile_hl_ibuf = Some(device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("nwn3d_tile_hl_ibuf"),
             contents: bytemuck::cast_slice(&indices),
             usage: wgpu::BufferUsages::INDEX,
         }));
-        self.highlight_count = indices.len() as u32;
+        self.tile_hl_count = indices.len() as u32;
     }
 
     /// Draw a green wireframe box around a world position (for selected objects).
     pub fn set_highlight_object(&mut self, device: &wgpu::Device, pos: Option<[f32; 3]>, half_size: f32) {
+        // Cache check: skip if highlight hasn't changed
+        let key = pos.map(|p| (p, half_size));
+        if key == self.cached_highlight {
+            return;
+        }
+        self.cached_highlight = key;
+
         self.highlight_vbuf = None;
         self.highlight_ibuf = None;
         self.highlight_count = 0;
@@ -1392,6 +1519,31 @@ struct PendingArea {
     format: wgpu::TextureFormat,
 }
 
+pub struct ViewportPersist {
+    pub show_grid: bool,
+    pub lighting_enabled: bool,
+    pub show_fog: bool,
+    pub show_water: bool,
+    pub water_level: i32,
+    pub water_color: [u8; 4],
+    pub show_walkmesh: bool,
+    pub show_walkmesh_edges: bool,
+    pub show_paint: bool,
+    pub show_sprites: bool,
+}
+
+fn current_rss_kb() -> u64 {
+    std::fs::read_to_string("/proc/self/status")
+        .ok()
+        .and_then(|data| {
+            data.lines()
+                .find(|l| l.starts_with("VmRSS:"))
+                .and_then(|l| l.split_whitespace().nth(1))
+                .and_then(|v| v.parse().ok())
+        })
+        .unwrap_or(0)
+}
+
 pub struct WgpuViewport {
     pub inner: Arc<Mutex<Option<ViewportState>>>,
     pending: Arc<Mutex<Option<PendingArea>>>,
@@ -1406,6 +1558,17 @@ pub struct WgpuViewport {
     queue: Arc<Mutex<Option<wgpu::Queue>>>,
     /// Persistent model cache to avoid reloading models from disk on rebuild
     model_cache: Arc<Mutex<tile_renderer::ModelCache>>,
+    /// Persistent toggle states (survive scene rebuilds)
+    persist_show_grid: Arc<Mutex<bool>>,
+    persist_lighting_enabled: Arc<Mutex<bool>>,
+    persist_show_fog: Arc<Mutex<bool>>,
+    persist_show_water: Arc<Mutex<bool>>,
+    persist_water_level: Arc<Mutex<i32>>,
+    persist_water_color: Arc<Mutex<[u8; 4]>>,
+    persist_show_walkmesh: Arc<Mutex<bool>>,
+    persist_show_walkmesh_edges: Arc<Mutex<bool>>,
+    persist_show_paint: Arc<Mutex<bool>>,
+    persist_show_sprites: Arc<Mutex<bool>>,
 }
 
 impl WgpuViewport {
@@ -1423,6 +1586,16 @@ impl WgpuViewport {
             device: Arc::new(Mutex::new(None)),
             queue: Arc::new(Mutex::new(None)),
             model_cache: Arc::new(Mutex::new(tile_renderer::ModelCache::new())),
+            persist_show_grid: Arc::new(Mutex::new(true)),
+            persist_lighting_enabled: Arc::new(Mutex::new(true)),
+            persist_show_fog: Arc::new(Mutex::new(false)),
+            persist_show_water: Arc::new(Mutex::new(false)),
+            persist_water_level: Arc::new(Mutex::new(0)),
+            persist_water_color: Arc::new(Mutex::new([40, 80, 200, 160])),
+            persist_show_walkmesh: Arc::new(Mutex::new(false)),
+            persist_show_walkmesh_edges: Arc::new(Mutex::new(false)),
+            persist_show_paint: Arc::new(Mutex::new(false)),
+            persist_show_sprites: Arc::new(Mutex::new(true)),
         }
     }
 
@@ -1440,6 +1613,16 @@ impl WgpuViewport {
             device: Arc::clone(&self.device),
             queue: Arc::clone(&self.queue),
             model_cache: Arc::clone(&self.model_cache),
+            persist_show_grid: Arc::clone(&self.persist_show_grid),
+            persist_lighting_enabled: Arc::clone(&self.persist_lighting_enabled),
+            persist_show_fog: Arc::clone(&self.persist_show_fog),
+            persist_show_water: Arc::clone(&self.persist_show_water),
+            persist_water_level: Arc::clone(&self.persist_water_level),
+            persist_water_color: Arc::clone(&self.persist_water_color),
+            persist_show_walkmesh: Arc::clone(&self.persist_show_walkmesh),
+            persist_show_walkmesh_edges: Arc::clone(&self.persist_show_walkmesh_edges),
+            persist_show_paint: Arc::clone(&self.persist_show_paint),
+            persist_show_sprites: Arc::clone(&self.persist_show_sprites),
         }
     }
 
@@ -1470,6 +1653,16 @@ impl WgpuViewport {
         }
     }
 
+    pub fn evict_model_cache(&self) {
+        if let Ok(mut guard) = self.model_cache.lock() {
+            let before = guard.cache.len();
+            guard.cache.clear();
+            if before > 0 {
+                eprintln!("  Evicted {} model caches to free memory", before);
+            }
+        }
+    }
+
     pub fn set_area(&self, area: Arc<nwn_gamemodel::Area>, version: u64, format: wgpu::TextureFormat) {
         if let Ok(mut guard) = self.pending.lock() {
             *guard = Some(PendingArea { area, version, format });
@@ -1477,6 +1670,18 @@ impl WgpuViewport {
     }
 
     /// Fast-path: update a single object's transform without rebuilding the scene.
+    /// Fast-path: update a single tile's height/orientation without rebuilding the scene.
+    pub fn set_tile_transform(&self, col: usize, row: usize, height: i32, orientation: i32) {
+        let queue = self.queue.lock().ok().and_then(|q| q.clone());
+        if let Some(queue) = queue {
+            if let Ok(mut guard) = self.inner.lock() {
+                if let Some(ref mut state) = *guard {
+                    state.set_tile_transform(&queue, col, row, height, orientation);
+                }
+            }
+        }
+    }
+
     pub fn set_object_transform(&self, obj_type: &str, obj_idx: usize,
                                  x: f32, y: f32, z: f32, bearing: f32) {
         let queue = self.queue.lock().ok().and_then(|q| q.clone());
@@ -1490,6 +1695,7 @@ impl WgpuViewport {
     }
 
     pub fn set_show_grid(&self, show: bool) {
+        if let Ok(mut guard) = self.persist_show_grid.lock() { *guard = show; }
         if let Ok(mut guard) = self.inner.lock() {
             if let Some(ref mut state) = *guard {
                 state.show_grid = show;
@@ -1503,10 +1709,11 @@ impl WgpuViewport {
                 return state.show_grid;
             }
         }
-        true
+        self.persist_show_grid.lock().map(|g| *g).unwrap_or(true)
     }
 
     pub fn set_show_walkmesh_edges(&self, show: bool) {
+        if let Ok(mut guard) = self.persist_show_walkmesh_edges.lock() { *guard = show; }
         if let Ok(mut guard) = self.inner.lock() {
             if let Some(ref mut state) = *guard {
                 state.show_walkmesh_edges = show;
@@ -1520,10 +1727,11 @@ impl WgpuViewport {
                 return state.show_walkmesh_edges;
             }
         }
-        false
+        self.persist_show_walkmesh_edges.lock().map(|g| *g).unwrap_or(false)
     }
 
     pub fn set_lighting_enabled(&self, enabled: bool) {
+        if let Ok(mut guard) = self.persist_lighting_enabled.lock() { *guard = enabled; }
         if let Ok(mut guard) = self.inner.lock() {
             if let Some(ref mut state) = *guard {
                 state.lighting_enabled = enabled;
@@ -1537,10 +1745,11 @@ impl WgpuViewport {
                 return state.lighting_enabled;
             }
         }
-        true
+        self.persist_lighting_enabled.lock().map(|g| *g).unwrap_or(true)
     }
 
     pub fn set_show_fog(&self, show: bool) {
+        if let Ok(mut guard) = self.persist_show_fog.lock() { *guard = show; }
         if let Ok(mut guard) = self.inner.lock() {
             if let Some(ref mut state) = *guard {
                 state.show_fog = show;
@@ -1554,10 +1763,11 @@ impl WgpuViewport {
                 return state.show_fog;
             }
         }
-        false
+        self.persist_show_fog.lock().map(|g| *g).unwrap_or(false)
     }
 
     pub fn set_show_walkmesh(&self, show: bool) {
+        if let Ok(mut guard) = self.persist_show_walkmesh.lock() { *guard = show; }
         if let Ok(mut guard) = self.inner.lock() {
             if let Some(ref mut state) = *guard {
                 state.show_walkmesh = show;
@@ -1566,6 +1776,7 @@ impl WgpuViewport {
     }
 
     pub fn set_show_sprites(&self, show: bool) {
+        if let Ok(mut guard) = self.persist_show_sprites.lock() { *guard = show; }
         if let Ok(mut guard) = self.inner.lock() {
             if let Some(ref mut state) = *guard {
                 state.show_sprites = show;
@@ -1579,10 +1790,11 @@ impl WgpuViewport {
                 return state.show_sprites;
             }
         }
-        true
+        self.persist_show_sprites.lock().map(|g| *g).unwrap_or(true)
     }
 
     pub fn set_show_paint(&self, show: bool) {
+        if let Ok(mut guard) = self.persist_show_paint.lock() { *guard = show; }
         if let Ok(mut guard) = self.inner.lock() {
             if let Some(ref mut state) = *guard {
                 state.show_paint = show;
@@ -1599,6 +1811,9 @@ impl WgpuViewport {
     }
 
     pub fn set_water(&self, level: i32, show: bool, color: [u8; 4]) {
+        if let Ok(mut guard) = self.persist_water_level.lock() { *guard = level; }
+        if let Ok(mut guard) = self.persist_show_water.lock() { *guard = show; }
+        if let Ok(mut guard) = self.persist_water_color.lock() { *guard = color; }
         if let Ok(mut guard) = self.inner.lock() {
             if let Some(ref mut state) = *guard {
                 state.water_level = level;
@@ -1683,6 +1898,15 @@ impl WgpuViewport {
         None
     }
 
+    pub fn world_to_screen(&self, world: [f32; 3], view_w: f32, view_h: f32) -> Option<[f32; 2]> {
+        if let Ok(guard) = self.inner.lock() {
+            if let Some(ref state) = *guard {
+                return state.world_to_screen(world, view_w, view_h);
+            }
+        }
+        None
+    }
+
     pub fn pick_ground(&self, screen_x: f32, screen_y: f32, view_w: f32, view_h: f32) -> Option<[f32; 3]> {
         if let Ok(guard) = self.inner.lock() {
             if let Some(ref state) = *guard {
@@ -1692,6 +1916,16 @@ impl WgpuViewport {
         None
     }
 
+    pub fn screen_rect_select(&self, min_screen: [f32; 2], max_screen: [f32; 2], view_w: f32, view_h: f32) -> Vec<(usize, tile_renderer::ObjectType, usize)> {
+        if let Ok(guard) = self.inner.lock() {
+            if let Some(ref state) = *guard {
+                return state.screen_rect_select(min_screen, max_screen, view_w, view_h)
+                    .into_iter().map(|(i, m)| (i, m.obj_type, m.index)).collect();
+            }
+        }
+        Vec::new()
+    }
+
     pub fn set_highlight_object(&self, pos: Option<[f32; 3]>, half_size: f32) {
         let device_guard = self.device.lock().ok();
         let device = device_guard.as_ref().and_then(|d| d.as_ref());
@@ -1699,6 +1933,17 @@ impl WgpuViewport {
         if let Ok(mut guard) = self.inner.lock() {
             if let Some(ref mut state) = *guard {
                 state.set_highlight_object(device, pos, half_size);
+            }
+        }
+    }
+
+    pub fn set_highlight_tile(&self, tile_idx: Option<usize>, col: usize, row: usize, height: f32) {
+        let device_guard = self.device.lock().ok();
+        let device = device_guard.as_ref().and_then(|d| d.as_ref());
+        let Some(device) = device else { return };
+        if let Ok(mut guard) = self.inner.lock() {
+            if let Some(ref mut state) = *guard {
+                state.set_highlight_tile(device, tile_idx, col, row, height);
             }
         }
     }
@@ -1846,10 +2091,12 @@ impl CallbackTrait for WgpuViewport {
         // Check if a background rebuild finished
         if let Ok(mut rb_guard) = self.pending_rebuild.lock() {
             if let Some(mut state) = rb_guard.take() {
-                // Copy camera from old state if user moved it during rebuild
+                // Copy camera from old state if user moved it during rebuild (same area only)
                 if let Ok(guard) = self.inner.lock() {
                     if let Some(ref old) = *guard {
-                        state.camera = old.camera.clone();
+                        if state.area_resref == old.area_resref {
+                            state.camera = old.camera.clone();
+                        }
                         // Copy live object transforms (drag/rotate/nudge) from old state
                         for (key, old_entries) in &old.object_instance_map {
                             if let Some(new_entries) = state.object_instance_map.get(key) {
@@ -1859,6 +2106,7 @@ impl CallbackTrait for WgpuViewport {
                                     let (ng, ni) = new_entries[k];
                                     if og < old.instance_data.len() && oi < old.instance_data[og].len()
                                         && ng < state.instance_data.len() && ni < state.instance_data[ng].len()
+                                        && ng < state.groups.len()
                                     {
                                         let inst = old.instance_data[og][oi];
                                         state.instance_data[ng][ni] = inst;
@@ -1882,24 +2130,49 @@ impl CallbackTrait for WgpuViewport {
         // Spawn background rebuild if there's a pending area and no rebuild is running
         if let Ok(mut pending_guard) = self.pending.lock() {
             if pending_guard.is_some() && !self.rebuild_in_progress.load(Ordering::SeqCst) {
-                let pending = pending_guard.take().unwrap();
-                self.rebuild_in_progress.store(true, Ordering::SeqCst);
-
-                let pending_rebuild = self.pending_rebuild.clone();
-                let rebuild_flag = self.rebuild_in_progress.clone();
-                let inner = self.inner.clone();
-                let vf = self.visibility_filter.lock().map(|g| g.clone()).unwrap_or_default();
-                let erf = self.module_erf_bytes.lock().ok()
-                    .and_then(|g| g.clone())
-                    .and_then(|bytes| nwn_erf::ErfFile::from_bytes(&bytes).ok());
-                let mod_path = self.mod_path.lock().ok().and_then(|g| g.clone());
-                let hak_names = self.hak_names.lock().map(|g| g.clone()).unwrap_or_default();
-                let device_arc = self.device.clone();
-                let size = screen_descriptor.size_in_pixels;
-                let model_cache_arc = self.model_cache.clone();
+                // Hard cap: check RSS before starting a rebuild
+                let rss_kb = current_rss_kb();
                 let max_tex_bytes = self.texture_mem_limit.lock().map(|g| *g).unwrap_or(u64::MAX);
+                let ram_limit_kb = (max_tex_bytes / 1024).saturating_mul(2);
+                let already_over = rss_kb > ram_limit_kb && rss_kb > 512 * 1024;
+                eprintln!("  prepare: pending rebuild, rss={} MB, max_tex={} MB, limit={} MB, already_over={}", rss_kb/1024, max_tex_bytes/1024/1024, ram_limit_kb/1024, already_over);
+                if !already_over {
+                    let pending = pending_guard.take().unwrap();
+                    self.rebuild_in_progress.store(true, Ordering::SeqCst);
+
+                    // Take old state NOW so its GPU resources are freed before the thread loads new ones
+                    let old_state = self.inner.lock().ok().and_then(|mut g| g.take());
+                    let existing_camera = old_state.as_ref().map(|s| s.camera.clone());
+
+                    let pending_rebuild = self.pending_rebuild.clone();
+                    let rebuild_flag = self.rebuild_in_progress.clone();
+                    let vf = self.visibility_filter.lock().map(|g| g.clone()).unwrap_or_default();
+                    let erf = self.module_erf_bytes.lock().ok()
+                        .and_then(|g| g.clone())
+                        .and_then(|bytes| nwn_erf::ErfFile::from_bytes(&bytes).ok());
+                    let mod_path = self.mod_path.lock().ok().and_then(|g| g.clone());
+                    let hak_names = self.hak_names.lock().map(|g| g.clone()).unwrap_or_default();
+                    let device_arc = self.device.clone();
+                    let size = screen_descriptor.size_in_pixels;
+                    let model_cache_arc = self.model_cache.clone();
+                    let max_tex_bytes = self.texture_mem_limit.lock().map(|g| *g).unwrap_or(u64::MAX);
+                    let persist = ViewportPersist {
+                        show_grid: self.persist_show_grid.lock().map(|g| *g).unwrap_or(true),
+                        lighting_enabled: self.persist_lighting_enabled.lock().map(|g| *g).unwrap_or(true),
+                        show_fog: self.persist_show_fog.lock().map(|g| *g).unwrap_or(false),
+                        show_water: self.persist_show_water.lock().map(|g| *g).unwrap_or(false),
+                        water_level: self.persist_water_level.lock().map(|g| *g).unwrap_or(0),
+                        water_color: self.persist_water_color.lock().map(|g| *g).unwrap_or([40, 80, 200, 160]),
+                        show_walkmesh: self.persist_show_walkmesh.lock().map(|g| *g).unwrap_or(false),
+                        show_walkmesh_edges: self.persist_show_walkmesh_edges.lock().map(|g| *g).unwrap_or(false),
+                        show_paint: self.persist_show_paint.lock().map(|g| *g).unwrap_or(false),
+                        show_sprites: self.persist_show_sprites.lock().map(|g| *g).unwrap_or(true),
+                    };
 
                 std::thread::spawn(move || {
+                    // Drop old state IMMEDIATELY to free GPU resources before loading new ones
+                    drop(old_state);
+
                     let dev = device_arc.lock().ok().and_then(|g| g.clone());
                     if let Some(ref device) = dev.as_ref() {
                         let config = wgpu::SurfaceConfiguration {
@@ -1912,18 +2185,36 @@ impl CallbackTrait for WgpuViewport {
                             view_formats: vec![],
                             desired_maximum_frame_latency: 3,
                         };
-                        let existing_camera = inner.lock().ok().and_then(|g| g.as_ref().map(|s| s.camera.clone()));
-                        let mut cache_guard = model_cache_arc.lock().unwrap();
+                        let existing_camera = existing_camera;
+                        let mut cache_guard = match model_cache_arc.lock() {
+                            Ok(guard) => guard,
+                            Err(poisoned) => {
+                                eprintln!("WARN: model_cache mutex was poisoned, recovering");
+                                poisoned.into_inner()
+                            }
+                        };
+                        // Clear old models BEFORE rebuilding to free memory for new allocations
+                        let evicted = cache_guard.cache.len();
+                        cache_guard.cache.clear();
+                        if evicted > 0 {
+                            eprintln!("  Cleared {} model caches before rebuild", evicted);
+                        }
+                        let water_level = persist.water_level;
+                        let water_color = persist.water_color;
                         let mut state = ViewportState::new(device, &config, &pending.area, pending.version, vf, existing_camera,
                             erf.as_ref(),
                             mod_path.as_deref(),
                             &hak_names,
                             Some(&mut *cache_guard),
                             max_tex_bytes,
+                            persist,
                         );
                         drop(cache_guard);
+                        eprintln!("  Rebuild done: RSS={} MB", current_rss_kb()/1024);
                         let area_ref = &*pending.area;
                         let paint_data = tile_renderer::build_paint_overlay_ex(area_ref, 0, false, [40, 80, 200, 160]);
+                        // Build water mesh (flat quad grid at water level)
+                        let water_data = build_water_mesh(area_ref, water_level, water_color);
                         let paint_vertex_buf = if !paint_data.vertices.is_empty() {
                             Some(device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                                 label: Some("nwn3d_paint_vbuf"),
@@ -1941,12 +2232,30 @@ impl CallbackTrait for WgpuViewport {
                         state.paint_idx_count = paint_data.indices.len() as u32;
                         state.paint_vertex_buf = paint_vertex_buf;
                         state.paint_index_buf = paint_index_buf;
+                        let water_vertex_buf = if !water_data.vertices.is_empty() {
+                            Some(device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                                label: Some("nwn3d_water_vbuf"),
+                                contents: bytemuck::cast_slice(&water_data.vertices),
+                                usage: wgpu::BufferUsages::VERTEX,
+                            }))
+                        } else { None };
+                        let water_index_buf = if !water_data.indices.is_empty() {
+                            Some(device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                                label: Some("nwn3d_water_ibuf"),
+                                contents: bytemuck::cast_slice(&water_data.indices),
+                                usage: wgpu::BufferUsages::INDEX,
+                            }))
+                        } else { None };
+                        state.water_idx_count = water_data.indices.len() as u32;
+                        state.water_vertex_buf = water_vertex_buf;
+                        state.water_index_buf = water_index_buf;
                         if let Ok(mut guard) = pending_rebuild.lock() {
                             *guard = Some(state);
                         }
                     }
                     rebuild_flag.store(false, Ordering::SeqCst);
                 });
+                }
             }
         }
 
@@ -2108,6 +2417,34 @@ fn create_blit_pipeline(
         multiview: None,
         cache: None,
     })
+}
+
+/// Build a flat water mesh at the given Z level covering the full area extent.
+fn build_water_mesh(area: &nwn_gamemodel::Area, water_level: i32, color: [u8; 4]) -> tile_renderer::MeshData {
+    let cols = area.width.max(1) as usize;
+    let rows = area.height.max(1) as usize;
+    let tile_w = 10.0;
+    let tile_h = 10.0;
+    let wz = water_level as f32 * 0.25;
+    let r = color[0] as f32 / 255.0;
+    let g = color[1] as f32 / 255.0;
+    let b = color[2] as f32 / 255.0;
+    let a = color[3] as f32 / 255.0;
+    let mut vertices = Vec::new();
+    let mut indices = Vec::new();
+    for row in 0..rows {
+        for col in 0..cols {
+            let tx = col as f32 * tile_w;
+            let ty = -(row as f32) * tile_h;
+            let base = vertices.len() as u32;
+            vertices.push(tile_renderer::Vertex { position: [tx, wz, ty], normal: [0.0, 1.0, 0.0], uv: [0.0, 0.0], color: [r, g, b, a] });
+            vertices.push(tile_renderer::Vertex { position: [tx + tile_w, wz, ty], normal: [0.0, 1.0, 0.0], uv: [1.0, 0.0], color: [r, g, b, a] });
+            vertices.push(tile_renderer::Vertex { position: [tx + tile_w, wz, ty - tile_h], normal: [0.0, 1.0, 0.0], uv: [1.0, 1.0], color: [r, g, b, a] });
+            vertices.push(tile_renderer::Vertex { position: [tx, wz, ty - tile_h], normal: [0.0, 1.0, 0.0], uv: [0.0, 1.0], color: [r, g, b, a] });
+            indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
+        }
+    }
+    tile_renderer::MeshData { vertices, indices }
 }
 
 const BLIT_SHADER: &str = r#"

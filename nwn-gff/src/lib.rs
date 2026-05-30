@@ -43,12 +43,21 @@ pub struct GffFile {
 
 impl GffFile {
     pub fn from_bytes(data: &[u8]) -> Result<Self> {
-        match Gff::from_bytes(data) {
-            Ok((_, inner)) => Ok(Self { inner }),
-            Err(e) => Err(match e {
-                nom::Err::Error(e) | nom::Err::Failure(e) => GffError::Parse(e.to_string()),
-                nom::Err::Incomplete(_) => GffError::Parse("incomplete input".into()),
-            }),
+        let prev_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            match Gff::from_bytes(data) {
+                Ok((_, inner)) => Ok(Self { inner }),
+                Err(e) => Err(match e {
+                    nom::Err::Error(e) | nom::Err::Failure(e) => GffError::Parse(e.to_string()),
+                    nom::Err::Incomplete(_) => GffError::Parse("incomplete input".into()),
+                }),
+            }
+        }));
+        std::panic::set_hook(prev_hook);
+        match result {
+            Ok(r) => r,
+            Err(_) => Err(GffError::Parse("nwn-lib-rs panic during GFF parse".into())),
         }
     }
 

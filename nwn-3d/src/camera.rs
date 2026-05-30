@@ -48,12 +48,12 @@ impl OrbitCamera {
     }
 
     pub fn rotate(&mut self, delta_x: f32, delta_y: f32) {
-        self.theta -= delta_x * 0.005;
+        self.theta += delta_x * 0.005;
         self.phi = (self.phi + delta_y * 0.005).clamp(-1.5, 1.5);
     }
 
     pub fn rotate_yaw(&mut self, delta_x: f32) {
-        self.theta -= delta_x * 0.005;
+        self.theta += delta_x * 0.005;
     }
 
     pub fn zoom(&mut self, delta: f32) {
@@ -95,6 +95,25 @@ impl OrbitCamera {
             fwd[2] + ndc_x * self.aspect * tan_hfov * right[2] + ndc_y * tan_hfov * up[2],
         ]);
         (eye, ray_dir)
+    }
+
+    pub fn world_to_screen(&self, world: [f32; 3], view_w: f32, view_h: f32) -> Option<[f32; 2]> {
+        if view_w <= 0.0 || view_h <= 0.0 { return None; }
+        let vp = mat4_mul(self.view_matrix(), self.projection_matrix());
+        let mut clip = [
+            vp[0][0] * world[0] + vp[0][1] * world[1] + vp[0][2] * world[2] + vp[0][3],
+            vp[1][0] * world[0] + vp[1][1] * world[1] + vp[1][2] * world[2] + vp[1][3],
+            vp[2][0] * world[0] + vp[2][1] * world[1] + vp[2][2] * world[2] + vp[2][3],
+            vp[3][0] * world[0] + vp[3][1] * world[1] + vp[3][2] * world[2] + vp[3][3],
+        ];
+        if clip[3].abs() < 1e-15 { return None; }
+        let inv_w = 1.0 / clip[3];
+        clip[0] *= inv_w;
+        clip[1] *= inv_w;
+        clip[2] *= inv_w;
+        let sx = (clip[0] * 0.5 + 0.5) * view_w;
+        let sy = (1.0 - (clip[1] * 0.5 + 0.5)) * view_h;
+        Some([sx, sy])
     }
 
     pub fn walk(&mut self, forward_input: f32, right_input: f32) {

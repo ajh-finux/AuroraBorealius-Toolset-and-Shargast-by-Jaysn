@@ -62,6 +62,7 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     let tex_color = textureSample(texture, texture_sampler, input.uv);
     var final_color = input.color * tex_color;
     if uniforms.ambient_color.w > 0.5 {
+        // Full lighting: directional sun + ambient + point lights
         let light_dir = normalize(vec3<f32>(0.5, 1.0, 0.3));
         let ambient = uniforms.ambient_color.xyz;
         let diffuse = max(dot(normalize(input.world_normal), light_dir), 0.0) * uniforms.diffuse_color.xyz;
@@ -78,6 +79,9 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
             lighting += pl.color_pad.rgb * ndotl * atten;
         }
         final_color = vec4<f32>(final_color.rgb * lighting, final_color.a);
+    } else {
+        // Dim scene when lighting is off so the toggle is visible
+        final_color = vec4<f32>(final_color.rgb * vec3<f32>(0.5), final_color.a);
     }
     let fog_amount = uniforms.fog_params.x;
     let fog_dist = uniforms.fog_params.y;

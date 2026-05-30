@@ -7,7 +7,7 @@ pub struct SelectedObject {
     pub bag: PropertyBag,
 }
 
-pub fn show_inspector(ui: &mut egui::Ui, obj: &mut SelectedObject, resrefs: &[String]) -> bool {
+pub fn show_inspector(ui: &mut egui::Ui, obj: &mut SelectedObject, resrefs: &[String], tags: &[String]) -> bool {
     let mut modified = false;
     egui::ScrollArea::vertical().show(ui, |ui| {
         ui.heading(&obj.title);
@@ -34,7 +34,7 @@ pub fn show_inspector(ui: &mut egui::Ui, obj: &mut SelectedObject, resrefs: &[St
                                 title: label,
                                 bag: *inner,
                             };
-                            modified |= show_inspector(ui, &mut inner_obj, resrefs);
+                            modified |= show_inspector(ui, &mut inner_obj, resrefs, tags);
                         });
                 }
                 PropertyValue::List(items) => {
@@ -50,13 +50,33 @@ pub fn show_inspector(ui: &mut egui::Ui, obj: &mut SelectedObject, resrefs: &[St
                                 egui::CollapsingHeader::new(format!("#{}", j))
                                     .default_open(false)
                                     .show(ui, |ui| {
-                                        modified |= show_inspector(ui, &mut item_obj, resrefs);
+                                        modified |= show_inspector(ui, &mut item_obj, resrefs, tags);
                                     });
                             }
                         });
                 }
                 PropertyValue::CExoString(mut s) => {
-                    let changed = ui.text_edit_singleline(&mut s).changed();
+                    let mut changed = false;
+                    if label == "Tag" {
+                        let id = ui.id().with(&label);
+                        egui::ComboBox::from_id_salt(id)
+                            .selected_text(&s)
+                            .show_ui(ui, |ui| {
+                                for t in tags {
+                                    let selected = *t == s;
+                                    if ui.selectable_label(selected, t).clicked() {
+                                        s = t.clone();
+                                        changed = true;
+                                    }
+                                }
+                                if ui.selectable_label(false, "✏ Type manually...").clicked() {
+                                }
+                            });
+                    } else {
+                        if ui.text_edit_singleline(&mut s).changed() {
+                            changed = true;
+                        }
+                    }
                     if changed { set_prop(&mut obj.bag, i, PropertyValue::CExoString(s)); modified = true; }
                 }
                 PropertyValue::ResRef(mut s) => {
@@ -138,7 +158,7 @@ fn set_prop(bag: &mut PropertyBag, i: usize, value: PropertyValue) {
 }
 
 /// A recursive property bag editor that properly writes back nested changes.
-pub fn show_bag_editor(ui: &mut egui::Ui, bag: &mut PropertyBag, resrefs: &[String]) -> bool {
+pub fn show_bag_editor(ui: &mut egui::Ui, bag: &mut PropertyBag, resrefs: &[String], tags: &[String]) -> bool {
     let mut modified = false;
     let indices: Vec<usize> = (0..bag.properties.len()).collect();
     for i in indices {
@@ -158,7 +178,7 @@ pub fn show_bag_editor(ui: &mut egui::Ui, bag: &mut PropertyBag, resrefs: &[Stri
                     .default_open(false)
                     .show(ui, |ui| {
                         if let PropertyValue::Struct(inner_bag) = &mut bag.properties[i].value {
-                            modified |= show_bag_editor(ui, inner_bag.as_mut(), resrefs);
+                            modified |= show_bag_editor(ui, inner_bag.as_mut(), resrefs, tags);
                         }
                     });
             }
@@ -172,7 +192,7 @@ pub fn show_bag_editor(ui: &mut egui::Ui, bag: &mut PropertyBag, resrefs: &[Stri
                                 egui::CollapsingHeader::new(format!("#{}", j))
                                     .default_open(false)
                                     .show(ui, |ui| {
-                                        modified |= show_bag_editor(ui, item.as_mut(), resrefs);
+                                        modified |= show_bag_editor(ui, item.as_mut(), resrefs, tags);
                                     });
                             }
                         }
@@ -180,7 +200,28 @@ pub fn show_bag_editor(ui: &mut egui::Ui, bag: &mut PropertyBag, resrefs: &[Stri
             }
             PropertyValue::CExoString(s) => {
                 let mut val = s.clone();
-                if ui.text_edit_singleline(&mut val).changed() {
+                let mut changed = false;
+                if label == "Tag" {
+                    let id = ui.id().with(&label);
+                    egui::ComboBox::from_id_salt(id)
+                        .selected_text(&val)
+                        .show_ui(ui, |ui| {
+                            for t in tags {
+                                let selected = *t == val;
+                                if ui.selectable_label(selected, t).clicked() {
+                                    val = t.clone();
+                                    changed = true;
+                                }
+                            }
+                            if ui.selectable_label(false, "✏ Type manually...").clicked() {
+                            }
+                        });
+                } else {
+                    if ui.text_edit_singleline(&mut val).changed() {
+                        changed = true;
+                    }
+                }
+                if changed {
                     bag.properties[i].value = PropertyValue::CExoString(val);
                     modified = true;
                 }

@@ -124,18 +124,51 @@ pub fn reload_from_git(area: &mut Area, git: &nwn_gff::GffFile) {
         None
     }
 
+    // Preserve model_name across reload
+    let old_models: std::collections::HashMap<(String, usize), String> = {
+        let mut m = std::collections::HashMap::new();
+        for (i, c) in area.creatures.iter().enumerate() {
+            if let Some(ref n) = c.model_name {
+                m.insert(("creature".into(), i), n.clone());
+            }
+        }
+        for (i, d) in area.doors.iter().enumerate() {
+            if let Some(ref n) = d.model_name {
+                m.insert(("door".into(), i), n.clone());
+            }
+        }
+        for (i, p) in area.placeables.iter().enumerate() {
+            if let Some(ref n) = p.model_name {
+                m.insert(("placeable".into(), i), n.clone());
+            }
+        }
+        m
+    };
+
     if let Some(list) = find_list(git.root(), &["Creature_List", "Creature List"]) {
-        area.creatures = list.iter().map(|s| CreatureInstance::from_gff_struct(s)).collect();
+        area.creatures = list.iter().enumerate().map(|(i, s)| {
+            let mut c = CreatureInstance::from_gff_struct(s);
+            c.model_name = old_models.get(&("creature".into(), i)).cloned().or(c.model_name);
+            c
+        }).collect();
     } else {
         area.creatures.clear();
     }
     if let Some(list) = find_list(git.root(), &["Door_List", "Door List"]) {
-        area.doors = list.iter().map(|s| DoorInstance::from_gff_struct(s)).collect();
+        area.doors = list.iter().enumerate().map(|(i, s)| {
+            let mut d = DoorInstance::from_gff_struct(s);
+            d.model_name = old_models.get(&("door".into(), i)).cloned().or(d.model_name);
+            d
+        }).collect();
     } else {
         area.doors.clear();
     }
     if let Some(list) = find_list(git.root(), &["Placeable_List", "Placeable List"]) {
-        area.placeables = list.iter().map(|s| PlaceableInstance::from_gff_struct(s)).collect();
+        area.placeables = list.iter().enumerate().map(|(i, s)| {
+            let mut p = PlaceableInstance::from_gff_struct(s);
+            p.model_name = old_models.get(&("placeable".into(), i)).cloned().or(p.model_name);
+            p
+        }).collect();
     } else {
         area.placeables.clear();
     }
@@ -542,9 +575,9 @@ impl CreatureInstance {
         Self {
             resref: bag.get_string("TemplateResRef").unwrap_or("").to_string(),
             tag: bag.get_string("Tag").unwrap_or("").to_string(),
-            x: bag.get_float("XPosition").unwrap_or(0.0),
-            y: bag.get_float("YPosition").unwrap_or(0.0),
-            z: bag.get_float("ZPosition").unwrap_or(0.0),
+            x: bag.get_float("XPosition").or_else(|| bag.get_float("X")).unwrap_or(0.0),
+            y: bag.get_float("YPosition").or_else(|| bag.get_float("Y")).unwrap_or(0.0),
+            z: bag.get_float("ZPosition").or_else(|| bag.get_float("Z")).unwrap_or(0.0),
             bearing: bag.get_float("Bearing").unwrap_or(0.0),
             appearance: bag.get_int("Appearance").unwrap_or(-1),
             model_name: None,
@@ -645,22 +678,33 @@ pub struct PlaceableInstance {
     pub bearing: f32,
     pub appearance: i32,
     pub model_name: Option<String>,
+    pub has_light: bool,
+    pub light_color: [u8; 4],
+    pub light_radius: f32,
 }
 
 impl PlaceableInstance {
     pub fn to_gff_struct(&self) -> nwn_gff::Struct {
-        nwn_gff::Struct {
-            id: 6,
-            fields: vec![
-                resref_field("TemplateResRef", &self.resref),
-                string_field("Tag", &self.tag),
-                float_field("XPosition", self.x),
-                float_field("YPosition", self.y),
-                float_field("ZPosition", self.z),
-                float_field("Bearing", self.bearing),
-                int_field("Appearance", self.appearance),
-            ],
+        let mut fields = vec![
+            resref_field("TemplateResRef", &self.resref),
+            string_field("Tag", &self.tag),
+            float_field("XPosition", self.x),
+            float_field("YPosition", self.y),
+            float_field("ZPosition", self.z),
+            float_field("Bearing", self.bearing),
+            int_field("Appearance", self.appearance),
+        ];
+        if self.has_light {
+            let light_color_dword =
+                (self.light_color[3] as u32) << 24 |
+                (self.light_color[2] as u32) << 16 |
+                (self.light_color[1] as u32) << 8 |
+                self.light_color[0] as u32;
+            fields.push(make_field("HasLight", nwn_gff::FieldValue::Byte(1)));
+            fields.push(make_field("LightColor", nwn_gff::FieldValue::DWord(light_color_dword)));
+            fields.push(float_field("LightRadius", self.light_radius));
         }
+        nwn_gff::Struct { id: 6, fields }
     }
 
     pub fn to_property_bag(&self) -> crate::PropertyBag {
@@ -673,11 +717,20 @@ impl PlaceableInstance {
                 Property { label: "ZPosition".into(), value: PropertyValue::Float(self.z), field_type: 8, category: String::new(), description: String::new() },
                 Property { label: "Bearing".into(), value: PropertyValue::Float(self.bearing), field_type: 8, category: String::new(), description: String::new() },
                 Property { label: "Appearance".into(), value: PropertyValue::Int(self.appearance), field_type: 5, category: String::new(), description: String::new() },
+                Property { label: "HasLight".into(), value: PropertyValue::Byte(if self.has_light { 1 } else { 0 }), field_type: 1, category: String::new(), description: String::new() },
+                Property { label: "LightColor".into(), value: PropertyValue::DWord(
+                    (self.light_color[3] as u32) << 24 |
+                    (self.light_color[2] as u32) << 16 |
+                    (self.light_color[1] as u32) << 8 |
+                    self.light_color[0] as u32
+                ), field_type: 7, category: String::new(), description: String::new() },
+                Property { label: "LightRadius".into(), value: PropertyValue::Float(self.light_radius), field_type: 8, category: String::new(), description: String::new() },
             ],
         }
     }
 
     pub fn from_property_bag(bag: &crate::PropertyBag) -> Self {
+        let light_color_dword = bag.get_int("LightColor").unwrap_or(-1) as u32;
         Self {
             resref: bag.get_string("TemplateResRef").unwrap_or("").to_string(),
             tag: bag.get_string("Tag").unwrap_or("").to_string(),
@@ -687,11 +740,22 @@ impl PlaceableInstance {
             bearing: bag.get_float("Bearing").unwrap_or(0.0),
             appearance: bag.get_int("Appearance").unwrap_or(-1),
             model_name: None,
+            has_light: bag.get_int("HasLight").unwrap_or(0) != 0,
+            light_color: [
+                (light_color_dword & 0xFF) as u8,
+                ((light_color_dword >> 8) & 0xFF) as u8,
+                ((light_color_dword >> 16) & 0xFF) as u8,
+                ((light_color_dword >> 24) & 0xFF) as u8,
+            ],
+            light_radius: bag.get_float("LightRadius").unwrap_or(5.0),
         }
     }
 
     fn from_gff_struct(s: &nwn_gff::Struct) -> Self {
         let app = gff_int(s, "Appearance", -1);
+        let light_color_dword = s.find("LightColor")
+            .and_then(|v| if let nwn_gff::FieldValue::DWord(d) = v { Some(*d) } else { None })
+            .unwrap_or(0xFFFFFFFF);
         Self {
             resref: gff_resref_from_struct(s),
             tag: s.find("Tag").and_then(|v| if let nwn_gff::FieldValue::String(s) = v { Some(s.clone()) } else { None }).unwrap_or_default(),
@@ -701,6 +765,14 @@ impl PlaceableInstance {
             bearing: gff_bearing(s),
             appearance: app,
             model_name: None,
+            has_light: gff_int(s, "HasLight", 0) != 0,
+            light_color: [
+                (light_color_dword & 0xFF) as u8,
+                ((light_color_dword >> 8) & 0xFF) as u8,
+                ((light_color_dword >> 16) & 0xFF) as u8,
+                ((light_color_dword >> 24) & 0xFF) as u8,
+            ],
+            light_radius: gff_float(s, "LightRadius", "LightRadius"),
         }
     }
 }

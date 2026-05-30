@@ -714,22 +714,75 @@ pub fn load_texture_data_from_haks(texture_name: &str, mod_dir: &Path, hak_names
     Ok(None)
 }
 
+/// Read only the header + key entries of an ERF file and extract a single resource.
+/// Avoids loading the entire file into memory (unlike ErfFile::open).
+fn extract_resource_from_erf(path: &Path, resref: &str, restype: u16) -> Result<Option<Vec<u8>>> {
+    let mut file = match std::fs::File::open(path) {
+        Ok(f) => f,
+        Err(_) => return Ok(None),
+    };
+    let file_len = match file.metadata().map(|m| m.len()) {
+        Ok(l) => l,
+        Err(_) => return Ok(None),
+    };
+    if file_len < 160 { return Ok(None); }
+
+    let mut header = [0u8; 160];
+    if file.read_exact(&mut header).is_err() { return Ok(None); }
+
+    let version = std::str::from_utf8(&header[4..8]).unwrap_or("V0.0");
+    let has_long = version >= "V1.1";
+    let keys_count = u32::from_le_bytes(header[16..20].try_into().unwrap()) as usize;
+    let keys_offset = u32::from_le_bytes(header[24..28].try_into().unwrap()) as u64;
+    let resources_offset = u32::from_le_bytes(header[28..32].try_into().unwrap()) as u64;
+    if keys_count == 0 || keys_offset > file_len || resources_offset > file_len {
+        return Ok(None);
+    }
+
+    let key_entry_size: u64 = if has_long { 40 } else { 24 };
+    let name_len: usize = if has_long { 32 } else { 16 };
+    let key_bytes = (keys_count as u64).saturating_mul(key_entry_size).min(10_000_000);
+    if file.seek(SeekFrom::Start(keys_offset)).is_err() { return Ok(None); }
+    let mut key_buf = vec![0u8; key_bytes as usize];
+    if file.read_exact(&mut key_buf).is_err() { return Ok(None); }
+
+    let resref_lower = resref.to_lowercase();
+    for i in 0..keys_count {
+        let off = i as u64 * key_entry_size;
+        if (off + key_entry_size) as usize > key_buf.len() { break; }
+        let off = off as usize;
+        let n_end = key_buf[off..off + name_len].iter().position(|&b| b == 0).unwrap_or(name_len);
+        let n = std::str::from_utf8(&key_buf[off..off + n_end]).unwrap_or("").to_lowercase();
+        if n != resref_lower { continue; }
+        let rt_off = off + name_len + 4;
+        let rt = u16::from_le_bytes(key_buf[rt_off..rt_off + 2].try_into().unwrap());
+        if rt != restype { continue; }
+        // Found — read resource entry (offset + size)
+        if file.seek(SeekFrom::Start(resources_offset + (i as u64) * 8)).is_err() {
+            return Ok(None);
+        }
+        let mut entry = [0u8; 8];
+        if file.read_exact(&mut entry).is_err() { return Ok(None); }
+        let data_off = u32::from_le_bytes(entry[0..4].try_into().unwrap()) as u64;
+        let data_sz = u32::from_le_bytes(entry[4..8].try_into().unwrap()) as usize;
+        if data_sz > 10_000_000 || data_off + data_sz as u64 > file_len { return Ok(None); }
+        if file.seek(SeekFrom::Start(data_off)).is_err() { return Ok(None); }
+        let mut data = vec![0u8; data_sz];
+        if file.read_exact(&mut data).is_err() { return Ok(None); }
+        return Ok(Some(data));
+    }
+    Ok(None)
+}
+
 pub fn find_and_load_tileset(name: &str, module_path: &Path, haks: &[String]) -> Result<Option<Tileset>> {
     let mod_dir = module_path.parent().unwrap_or(Path::new("."));
     let set_lower = name.to_lowercase();
-
-    fn try_erf(erf: &nwn_erf::ErfFile, set_lower: &str, name: &str) -> Result<Option<Tileset>> {
-        let set_type = nwn_lib_rs::erf::ResourceType::Set as u16;
-        if let Some(data) = erf.get(set_lower, set_type) {
-            return Tileset::from_bytes(name, &data).map(Some);
-        }
-        Ok(None)
-    }
+    let set_type = nwn_lib_rs::erf::ResourceType::Set as u16;
 
     // First try the module itself
-    if let Ok(erf) = nwn_erf::ErfFile::open(module_path) {
-        if let Some(ts) = try_erf(&erf, &set_lower, name)? {
-            return Ok(Some(ts));
+    if let Ok(data) = extract_resource_from_erf(module_path, &set_lower, set_type) {
+        if let Some(d) = data {
+            return Tileset::from_bytes(name, &d).map(Some);
         }
     }
 
@@ -740,9 +793,9 @@ pub fn find_and_load_tileset(name: &str, module_path: &Path, haks: &[String]) ->
             mod_dir.join("hak").join(format!("{}.hak", hak_name)),
         ];
         for p in &paths {
-            if let Ok(erf) = nwn_erf::ErfFile::open(p) {
-                if let Some(ts) = try_erf(&erf, &set_lower, name)? {
-                    return Ok(Some(ts));
+            if let Ok(data) = extract_resource_from_erf(p, &set_lower, set_type) {
+                if let Some(d) = data {
+                    return Tileset::from_bytes(name, &d).map(Some);
                 }
             }
         }
@@ -754,9 +807,9 @@ pub fn find_and_load_tileset(name: &str, module_path: &Path, haks: &[String]) ->
         if hak_dir.is_dir() {
             for hak_name in haks {
                 let hak_path = hak_dir.join(format!("{}.hak", hak_name));
-                if let Ok(erf) = nwn_erf::ErfFile::open(&hak_path) {
-                    if let Some(ts) = try_erf(&erf, &set_lower, name)? {
-                        return Ok(Some(ts));
+                if let Ok(data) = extract_resource_from_erf(&hak_path, &set_lower, set_type) {
+                    if let Some(d) = data {
+                        return Tileset::from_bytes(name, &d).map(Some);
                     }
                 }
             }

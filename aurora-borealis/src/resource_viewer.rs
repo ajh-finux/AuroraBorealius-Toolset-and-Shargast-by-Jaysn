@@ -51,11 +51,7 @@ fn resource_category_label(restype: u16) -> &'static str {
         _ => {
             let ext = nwn_gamemodel::resource_types::type_to_ext(restype)
                 .unwrap_or("???");
-            if ext == "???" {
-                "Other"
-            } else {
-                ext
-            }
+            if ext == "???" { "Other" } else { ext }
         }
     }
 }
@@ -63,125 +59,84 @@ fn resource_category_label(restype: u16) -> &'static str {
 pub fn show_resource_viewer(
     ui: &mut egui::Ui,
     module: &Module,
-    on_edit_2da: &mut Option<(String, nwn_2da::TwoDa)>,
     on_open_script: &mut Option<String>,
     on_open_conversation: &mut Option<String>,
     on_edit_blueprint: &mut Option<(String, u16, Vec<u8>)>,
-    on_edit_tlk: &mut Option<Vec<u8>>,
     on_open_faction: &mut Option<String>,
     on_open_journal: &mut Option<String>,
 ) {
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let res_list = module.resource_list();
-        let mut groups: std::collections::BTreeMap<String, Vec<(String, u16)>> = std::collections::BTreeMap::new();
-        for (resref, restype) in &res_list {
-            let group = resource_category_label(*restype).to_string();
-            groups.entry(group).or_default().push((resref.clone(), *restype));
-        }
+    let res_list = module.resource_list();
+    let total = res_list.len();
 
-        egui::TopBottomPanel::top("resource_toolbar")
-            .show_inside(ui, |ui| {
-                ui.horizontal(|ui| {
-                    ui.heading("Resources");
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.label(format!("{} resources", res_list.len()));
-                        ui.label(format!("{} TLK files, {} 2DA files",
-                            module.resource_manager.tlks.len(),
-                            module.resource_manager.two_das.len()
-                        ));
-                    });
+    let mut groups: std::collections::BTreeMap<String, Vec<(String, u16)>> = std::collections::BTreeMap::new();
+    for (resref, restype) in &res_list {
+        let group = resource_category_label(*restype).to_string();
+        groups.entry(group).or_default().push((resref.clone(), *restype));
+    }
+
+    egui::TopBottomPanel::top("resource_toolbar")
+        .show_inside(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.heading("Resources");
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.label(format!("{} resources", total));
                 });
             });
+        });
 
-        egui::ScrollArea::vertical()
-            .id_salt("resource_scroll")
-            .show(ui, |ui| {
-                for (cat, entries) in &groups {
-                    let count = entries.len();
-                    let header_label = format!("{} [{}]", cat, count);
-                    egui::CollapsingHeader::new(header_label)
-                        .default_open(count < 100)
-                        .show(ui, |ui| {
-                            let max_show = count.min(200);
-                            for (resref, restype) in entries.iter().take(max_show) {
-                                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                                    let ext = resource_types::type_to_ext(*restype).unwrap_or("???");
-                                    let label = format!("{}.{}", resref, ext.to_lowercase());
-                                    ui.horizontal(|ui| {
-                                        ui.label(label);
-                                        let data = module.get_resource_data(resref, *restype);
-                                        if let Some(ref bytes) = data {
-                                            ui.label(format!("({} bytes)", bytes.len()));
-                                            match *restype {
-                                                t if t == resource_types::NSS => {
-                                                    if ui.button("Edit Script").clicked() {
-                                                        *on_open_script = Some(resref.clone());
-                                                    }
-                                                }
-                                                t if t == resource_types::DLG => {
-                                                    if ui.button("Edit Convo").clicked() {
-                                                        *on_open_conversation = Some(resref.clone());
-                                                    }
-                                                }
-                                                t if t == resource_types::TWO_DA => {
-                                                    if let Ok(s) = std::str::from_utf8(bytes) {
-                                                        if let Ok(table) = nwn_2da::TwoDa::from_string(s) {
-                                                            if ui.button("Edit").clicked() {
-                                                                *on_edit_2da = Some((resref.clone(), table));
-                                                            }
-                                                        }
-                                                    }
-                                                }
-                                                t if t == resource_types::TLK => {
-                                                    if ui.button("Edit TLK").clicked() {
-                                                        *on_edit_tlk = Some(bytes.clone());
-                                                    }
-                                                    ui.label(format!("{} strings", module.resource_manager.tlks.first().map_or(0, |t| t.count())));
-                                                }
-                                                t if t == resource_types::FAC => {
-                                                    if ui.button("Edit Factions").clicked() {
-                                                        *on_open_faction = Some(resref.clone());
-                                                    }
-                                                }
-                                                t if t == resource_types::JRL => {
-                                                    if ui.button("Edit Journal").clicked() {
-                                                        *on_open_journal = Some(resref.clone());
-                                                    }
-                                                }
-                                                _ if is_gff_type(*restype) => {
-                                                    let gff_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                                                        nwn_gff::GffFile::from_bytes(bytes)
-                                                    }));
-                                                    if let Ok(Ok(gff)) = gff_result {
-                                                        if ui.button("Edit").clicked() {
-                                                            *on_edit_blueprint = Some((resref.clone(), *restype, bytes.clone()));
-                                                        }
-                                                        ui.label(gff.inner.file_type.to_string());
-                                                    } else {
-                                                        ui.colored_label(egui::Color32::GRAY, "binary");
-                                                    }
-                                                }
-                                                _ => {
-                                                    ui.colored_label(egui::Color32::GRAY, "binary");
-                                                }
-                                            }
-                                        } else {
-                                            ui.colored_label(egui::Color32::RED, "(not found)");
+    egui::ScrollArea::vertical()
+        .id_salt("resource_scroll")
+        .show(ui, |ui| {
+            for (cat, entries) in &groups {
+                let count = entries.len();
+                let header_label = format!("{} [{}]", cat, count);
+                egui::CollapsingHeader::new(header_label)
+                    .default_open(count < 100)
+                    .show(ui, |ui| {
+                        let max_show = count.min(200);
+                        for (resref, restype) in entries.iter().take(max_show) {
+                            let ext = resource_types::type_to_ext(*restype).unwrap_or("???");
+                            let label = format!("{}.{}", resref, ext.to_lowercase());
+                            ui.horizontal(|ui| {
+                                ui.label(&label);
+                                match *restype {
+                                    t if t == resource_types::NSS => {
+                                        if ui.button("Edit Script").clicked() {
+                                            *on_open_script = Some(resref.clone());
                                         }
-                                    });
-                                }));
-                                let _ = result;
-                            }
-                            if count > 200 {
-                                ui.colored_label(egui::Color32::GRAY, format!("... and {} more", count - 200));
-                            }
-                        });
-                }
-            });
-    }));
-    if result.is_err() {
-        ui.colored_label(egui::Color32::RED, "Resource viewer encountered an error and could not display resources.");
-    }
+                                    }
+                                    t if t == resource_types::DLG => {
+                                        if ui.button("Edit Convo").clicked() {
+                                            *on_open_conversation = Some(resref.clone());
+                                        }
+                                    }
+                                    t if t == resource_types::FAC => {
+                                        if ui.button("Edit Factions").clicked() {
+                                            *on_open_faction = Some(resref.clone());
+                                        }
+                                    }
+                                    t if t == resource_types::JRL => {
+                                        if ui.button("Edit Journal").clicked() {
+                                            *on_open_journal = Some(resref.clone());
+                                        }
+                                    }
+                                    _ if is_gff_type(*restype) && !is_special_type(*restype) => {
+                                        if ui.button("Edit").clicked() {
+                                            if let Some(bytes) = module.get_resource_data(resref, *restype) {
+                                                *on_edit_blueprint = Some((resref.clone(), *restype, bytes));
+                                            }
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                            });
+                        }
+                        if count > 200 {
+                            ui.colored_label(egui::Color32::GRAY, format!("... and {} more", count - 200));
+                        }
+                    });
+            }
+        });
 }
 
 fn is_gff_type(restype: u16) -> bool {
@@ -192,4 +147,8 @@ fn is_gff_type(restype: u16) -> bool {
         resource_types::UTI | resource_types::FAC | resource_types::BIC | resource_types::JRL |
         resource_types::LTR | resource_types::ITP | resource_types::SSF | resource_types::GUI
     )
+}
+
+fn is_special_type(restype: u16) -> bool {
+    matches!(restype, resource_types::FAC | resource_types::JRL)
 }

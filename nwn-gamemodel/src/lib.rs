@@ -15,6 +15,7 @@ pub mod light;
 pub mod conversation;
 pub mod faction;
 pub mod resource_manager;
+pub mod game_data;
 pub mod property;
 pub mod journal;
 
@@ -116,6 +117,7 @@ pub mod resource_types {
     pub const UTP: u16 = nwn_lib_rs::erf::ResourceType::Utp as u16;
     pub const TGA: u16 = nwn_lib_rs::erf::ResourceType::Tga as u16;
     pub const WAV: u16 = nwn_lib_rs::erf::ResourceType::Wav as u16;
+    pub const BMU: u16 = nwn_lib_rs::erf::ResourceType::Bmu as u16;
     pub const PLT: u16 = nwn_lib_rs::erf::ResourceType::Plt as u16;
     pub const INI: u16 = nwn_lib_rs::erf::ResourceType::Ini as u16;
     pub const BMP: u16 = nwn_lib_rs::erf::ResourceType::Bmp as u16;

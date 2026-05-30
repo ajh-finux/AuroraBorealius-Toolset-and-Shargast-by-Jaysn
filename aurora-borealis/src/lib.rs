@@ -1,6 +1,7 @@
 #![allow(incomplete_features)]
 #![feature(generic_const_exprs)]
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use eframe::egui;
 #[cfg(target_arch = "wasm32")]
 use wasm_bindgen::prelude::*;
@@ -11,15 +12,54 @@ use nwn_3d::{ObjectType, VisibilityFilter};
 use nwn_gamemodel::LightInstance;
 use nwn_gamemodel::PropertyBag;
 use crate::inspector::{SelectedObject, show_inspector, show_bag_editor};
+mod audio;
+use audio::AudioSystem;
+
+fn current_rss_kb() -> u64 {
+    std::fs::read_to_string("/proc/self/status")
+        .ok()
+        .and_then(|data| {
+            data.lines()
+                .find(|l| l.starts_with("VmRSS:"))
+                .and_then(|l| l.split_whitespace().nth(1))
+                .and_then(|v| v.parse().ok())
+        })
+        .unwrap_or(0)
+}
 
 fn module_resref_names(module: &nwn_gamemodel::Module) -> Vec<String> {
-    let mut names: Vec<String> = module.resource_list().iter()
-        .map(|(r, _)| r.clone())
-        .collect();
-    names.sort();
-    names.dedup();
-    names
+    module.all_resref_names()
 }
+
+fn module_tag_names(module: &nwn_gamemodel::Module) -> Vec<String> {
+    module.all_tags()
+}
+
+fn get_tile_palette(module: &nwn_gamemodel::Module, tileset: &str) -> Vec<(i32, String)> {
+    let tileset_lower = tileset.to_lowercase();
+    let two_da_name = format!("tileset_apply_{}", tileset_lower);
+    if let Some(table) = module.resource_manager.get_2da(&two_da_name) {
+        let entries: Vec<(i32, String)> = (0..table.row_count().min(500))
+            .filter_map(|r| {
+                let id = table.get_cell_by_label(r, "TileID").and_then(|s| s.parse::<i32>().ok()).unwrap_or(-1);
+                let name = table.get_cell_by_label(r, "ResRef").unwrap_or("").to_string();
+                if id < 0 || name.is_empty() { None } else { Some((id, name)) }
+            })
+            .collect();
+        if !entries.is_empty() {
+            return entries;
+        }
+    }
+    if let Some(ts) = module.tileset_info(&tileset_lower) {
+        let mut entries: Vec<(i32, String)> = ts.tiles.iter()
+            .map(|(id, def)| (*id as i32, def.model_name.clone()))
+            .collect();
+        entries.sort_by_key(|(id, _)| *id);
+        return entries;
+    }
+    Vec::new()
+}
+
 use nwn_gamemodel::resource_types;
 use nwn_gamemodel::resource_types::type_to_ext;
 use crate::script_editor::show_script_editor;
@@ -34,6 +74,7 @@ use crate::area_geometry_editor::{GeometryEditorState, show_geometry_editor};
 use crate::universal_search::show_universal_search;
 use crate::tools_panel::{Tool, show_tools_panel};
 
+mod background_tasks;
 mod icons;
 mod inspector;
 mod script_editor;
@@ -142,6 +183,17 @@ fn nwn_modules_dir() -> String {
     }
 }
 
+struct CompileAllResult {
+    results: Vec<(String, Vec<u8>)>,
+    errors: Vec<(String, String)>,
+}
+
+#[derive(PartialEq)]
+enum PaletteMode {
+    Blueprints,
+    Tiles,
+}
+
 struct AuroraBorealisApp {
     viewport: nwn_3d::WgpuViewport,
     current_area: Option<Arc<nwn_gamemodel::Area>>,
@@ -157,6 +209,7 @@ struct AuroraBorealisApp {
     module_tag_edit: String,
     module_entry_edit: String,
     status: String,
+    compile_progress: Option<(Arc<AtomicUsize>, usize)>,
     clear_override_enabled: bool,
     clear_override: Option<[u8; 3]>,
     show_resource_viewer: bool,
@@ -164,9 +217,11 @@ struct AuroraBorealisApp {
 
 
     geometry_editor: GeometryEditorState,
-    show_blueprint_palette: bool,
+    show_palette: bool,
+    palette_mode: PaletteMode,
     universal_search_open: bool,
     show_sky_override: bool,
+    show_launch_dialog: bool,
     nwn_process_handle: Option<std::process::Child>,
     #[allow(dead_code)]
     module_save_handle: Option<std::thread::JoinHandle<()>>,
@@ -226,6 +281,7 @@ struct AuroraBorealisApp {
     placement_state: PlacementState,
     manip_mode: ManipMode,
     drag_state: Option<DragState>,
+    drag_select_start: Option<egui::Pos2>,
     space_move_active: bool,
     manip_nudge_speed: f32,
     ghost_screen_pos: Option<egui::Pos2>,
@@ -266,13 +322,13 @@ struct AuroraBorealisApp {
     lighting_enabled: bool,
     show_fog: bool,
     selected_tile: Option<(usize, usize)>,
-    tile_palette_open: bool,
     tile_palette_filter: String,
     new_object_open: bool,
     new_object_type: String,
     new_object_resref: String,
     new_object_tag: String,
     new_object_filter: String,
+    new_object_resref_browse_open: bool,
     new_object_blueprints: Vec<(String, String)>,
     new_object_x: f32,
     new_object_y: f32,
@@ -281,8 +337,18 @@ struct AuroraBorealisApp {
     nwsync_output_path: Option<std::path::PathBuf>,
     nwsync_busy: bool,
     nwsync_result: std::sync::Arc<std::sync::Mutex<Option<String>>>,
-    max_texture_mem_mb: u32,
+    max_ram_mb: u32,
+    last_rss_mb: u64,
     icons: icons::Icons,
+    last_frame_time: std::time::Instant,
+    fps_accum: f64,
+    fps_timer: f64,
+
+    pending_compile_all: Option<tokio::sync::oneshot::Receiver<CompileAllResult>>,
+    pending_save: Option<tokio::sync::oneshot::Receiver<(nwn_gamemodel::Module, Result<(), String>)>>,
+
+    audio_system: AudioSystem,
+    sound_enabled: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -614,6 +680,25 @@ fn save_object_comment(module: &mut nwn_gamemodel::Module, area_resref: &str, ob
     module.modified = true;
 }
 
+/// Embedded NWScript compiler binary (extracted on first use).
+#[cfg(not(target_arch = "wasm32"))]
+static NWNSC: &[u8] = include_bytes!("../../nwnsc");
+include!(concat!(env!("OUT_DIR"), "/nwnx_scripts.rs"));
+
+#[cfg(not(target_arch = "wasm32"))]
+fn nwnsc_exe() -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    static PATH: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+    PATH.get_or_init(|| {
+        let dir = std::env::temp_dir().join("aurora_nwnsc_bin");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("nwnsc");
+        let _ = std::fs::write(&path, NWNSC);
+        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755));
+        path
+    }).clone()
+}
+
 fn set_object_appearance(module: &mut nwn_gamemodel::Module, area_resref: &str, obj_type: &str, obj_idx: usize, appearance_id: i32) {
     use nwn_gamemodel::{PropertyBag, PropertyValue, Property};
     let git_key = area_resref.trim().to_lowercase();
@@ -753,6 +838,7 @@ fn save_item_list(module: Option<&mut nwn_gamemodel::Module>, area_resref: &str,
 
 impl AuroraBorealisApp {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        background_tasks::init_runtime();
         let viewport = nwn_3d::WgpuViewport::new();
         let mut recent_files: Vec<String> = load_recent_files();
         recent_files.retain(|f| std::path::Path::new(f).exists());
@@ -771,6 +857,7 @@ impl AuroraBorealisApp {
             module_tag_edit: String::new(),
             module_entry_edit: String::new(),
             status: "Ready.".to_string(),
+            compile_progress: None,
             clear_override_enabled: false,
             clear_override: None,
             show_resource_viewer: false,
@@ -778,9 +865,11 @@ impl AuroraBorealisApp {
 
 
             geometry_editor: GeometryEditorState::default(),
-            show_blueprint_palette: false,
+            show_palette: false,
+            palette_mode: PaletteMode::Blueprints,
             universal_search_open: false,
             show_sky_override: false,
+            show_launch_dialog: false,
             nwn_process_handle: None,
             module_save_handle: None,
             clipboard: None,
@@ -835,6 +924,7 @@ impl AuroraBorealisApp {
             placement_state: PlacementState::Inactive,
             manip_mode: ManipMode::None,
             drag_state: None,
+            drag_select_start: None,
             space_move_active: false,
             manip_nudge_speed: 0.5,
             ghost_screen_pos: None,
@@ -872,7 +962,6 @@ impl AuroraBorealisApp {
             new_area_tileset_filter: String::new(),
             show_tiles: true,
             selected_tile: None,
-            tile_palette_open: false,
             show_grid: true,
             lighting_enabled: true,
             tile_palette_filter: String::new(),
@@ -881,6 +970,7 @@ impl AuroraBorealisApp {
             new_object_resref: String::new(),
             new_object_tag: String::new(),
             new_object_filter: String::new(),
+            new_object_resref_browse_open: false,
             new_object_blueprints: Vec::new(),
             new_object_x: 0.0,
             new_object_y: 0.0,
@@ -889,20 +979,33 @@ impl AuroraBorealisApp {
             nwsync_output_path: None,
             nwsync_busy: false,
             nwsync_result: std::sync::Arc::new(std::sync::Mutex::new(None)),
-            max_texture_mem_mb: 512,
+            max_ram_mb: 1536,
+            last_rss_mb: 0,
             icons: icons::Icons::new(&cc.egui_ctx),
+            last_frame_time: std::time::Instant::now(),
+            fps_accum: 0.0,
+            fps_timer: 0.0,
+
+            pending_compile_all: None,
+            pending_save: None,
+
+            audio_system: AudioSystem::new(),
+            sound_enabled: true,
         }
     }
 }
 
 impl eframe::App for AuroraBorealisApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.check_pending_tasks();
+        if self.pending_compile_all.is_some() || self.pending_save.is_some() {
+            ctx.request_repaint();
+        }
         // Callbacks from editors
-        let mut save_2da: Option<(String, nwn_2da::TwoDa)> = None;
+        let save_2da: Option<(String, nwn_2da::TwoDa)> = None;
         let mut open_script: Option<String> = None;
         let mut open_conversation: Option<String> = None;
         let mut edit_blueprint: Option<(String, u16, Vec<u8>)> = None;
-        let mut edit_tlk: Option<Vec<u8>> = None;
         let mut open_faction: Option<String> = None;
         let mut open_journal: Option<String> = None;
         let mut module_props_changed = false;
@@ -971,7 +1074,7 @@ impl eframe::App for AuroraBorealisApp {
                         }
                     }
                     if has_mod && self.icons.label_button(ui, "Launch", "play-button", S).clicked() {
-                        self.launch_nwn();
+                        self.show_launch_dialog = true;
                     }
                     self.icons.label_button(ui, "Quit", "cross-mark", S).clicked().then(|| {
                         ctx.send_viewport_cmd(egui::ViewportCommand::Close);
@@ -995,8 +1098,8 @@ impl eframe::App for AuroraBorealisApp {
                     if self.icons.label_toggle(ui, "Res", "box", self.show_resource_viewer, S).clicked() {
                         self.show_resource_viewer = !self.show_resource_viewer;
                     }
-                    if self.icons.label_toggle(ui, "BP", "cube", self.show_blueprint_palette, S).clicked() {
-                        self.show_blueprint_palette = !self.show_blueprint_palette;
+                    if self.icons.label_toggle(ui, "Palette", "gate", self.show_palette, S).clicked() {
+                        self.show_palette = !self.show_palette;
                     }
                     if self.icons.label_toggle(ui, "Items", "chest", self.item_browser_open, S).clicked() {
                         self.item_browser_open = !self.item_browser_open;
@@ -1009,9 +1112,6 @@ impl eframe::App for AuroraBorealisApp {
                     }
                     if self.icons.label_toggle(ui, "Con", "door", self.show_contents_panel, S).clicked() {
                         self.show_contents_panel = !self.show_contents_panel;
-                    }
-                    if self.icons.label_toggle(ui, "Palette", "gate", self.tile_palette_open, S).clicked() {
-                        self.tile_palette_open = !self.tile_palette_open;
                     }
                     if self.icons.label_toggle(ui, "Graph", "new-shoot", self.graph_view_open, S).clicked() {
                         self.graph_view_open = !self.graph_view_open;
@@ -1056,6 +1156,10 @@ impl eframe::App for AuroraBorealisApp {
                     if self.icons.label_toggle(ui, "Water", "", self.show_water, S).clicked() {
                         self.show_water = !self.show_water;
                         if self.show_water { self.viewport.set_water(self.water_level, true, [40, 80, 200, 160]); } else { self.viewport.set_water(0, false, [0;4]); }
+                    }
+                    if self.icons.label_toggle(ui, "Audio", "musical-notes", self.sound_enabled, S).clicked() {
+                        self.sound_enabled = !self.sound_enabled;
+                        if !self.sound_enabled { self.audio_system.stop_all(); }
                     }
                     if self.icons.label_toggle(ui, "Snap", "", self.snap_to_grid_enabled, S).clicked() {
                         self.snap_to_grid_enabled = !self.snap_to_grid_enabled;
@@ -1117,8 +1221,8 @@ impl eframe::App for AuroraBorealisApp {
                             ui.add(egui::Slider::new(&mut sv, 0.5..=50.0).text("Grid Size"));
                             if sv != self.snap_to_grid_value { self.snap_to_grid_value = sv; }
                         }
-                        ui.add(egui::Slider::new(&mut self.max_texture_mem_mb, 128..=4096).text("Max Texture Memory (MB)"));
-                        self.viewport.set_texture_mem_limit(self.max_texture_mem_mb as u64 * 1024 * 1024);
+                        ui.add(egui::Slider::new(&mut self.max_ram_mb, 128..=4096).text("Max Texture Memory (MB)"));
+                        self.viewport.set_texture_mem_limit(self.max_ram_mb as u64 * 1024 * 1024);
                     });
                 });
             });
@@ -1177,16 +1281,25 @@ impl eframe::App for AuroraBorealisApp {
                         self.new_object_type = "creature".to_string();
                         self.new_object_resref.clear();
                         self.new_object_tag.clear();
-                        self.new_object_x = 0.0;
-                        self.new_object_y = 0.0;
-                        self.new_object_z = 0.0;
+                        // Place at camera target (center of viewport)
+                        if let Some(cam) = self.viewport.camera_state() {
+                            let (tx, ty, tz) = (cam.target[0], cam.target[1], cam.target[2]);
+                            // Renderer coords (x, z, -y) -> NWN coords (x, -z, y)
+                            self.new_object_x = tx;
+                            self.new_object_y = -tz;
+                            self.new_object_z = ty;
+                        } else {
+                            self.new_object_x = 0.0;
+                            self.new_object_y = 0.0;
+                            self.new_object_z = 0.0;
+                        }
                         self.new_object_bearing = 0.0;
                     }
                     if has_area && self.icons.label_button(ui, "Copy", "select", S).clicked() {
                         self.copy_selected_object();
                     }
                     if has_area && self.icons.label_button(ui, "Paste", "hand", S).clicked() {
-                        self.paste_object();
+                        self.paste_object(target_format);
                     }
                     if has_area && self.icons.label_button(ui, "Del", "trash-can", S).clicked() {
                         self.delete_selected_object();
@@ -1197,6 +1310,118 @@ impl eframe::App for AuroraBorealisApp {
                     }
                     if self.icons.label_button(ui, "Redo", "forward-field", S).clicked() {
                         self.redo(target_format);
+                    }
+                    if has_mod && self.icons.big_label_button(ui, "COMPILE!", "play-button").clicked() {
+                        let nwnsc_path = nwnsc_exe();
+                        let nwn_install = std::path::PathBuf::from(
+                            "/home/grimshackle/.local/share/Steam/steamapps/common/Neverwinter Nights"
+                        );
+                        let tmp_dir = std::env::temp_dir().join("aurora_nwnsc");
+                        let _ = std::fs::remove_dir_all(&tmp_dir);
+                        let _ = std::fs::create_dir_all(&tmp_dir);
+                        for (name, data) in NWNX_SCRIPTS {
+                            let _ = std::fs::write(tmp_dir.join(name), data);
+                        }
+                        let scripts: Vec<(String, String)> = self.module.as_ref().map(|m| {
+                            m.script_names().into_iter().filter_map(|name| {
+                                let source = m.get_script_source(name)?;
+                                let nss_path = tmp_dir.join(format!("{}.nss", name));
+                                let _ = std::fs::write(&nss_path, source);
+                                Some((name.to_string(), source.to_string()))
+                            }).collect()
+                        }).unwrap_or_default();
+                        let total = scripts.len();
+                        let progress = Arc::new(AtomicUsize::new(0));
+                        self.compile_progress = Some((progress.clone(), total));
+                        self.status = format!("Compiling 0/{} scripts...", total);
+                            let (tx, rx) = tokio::sync::oneshot::channel::<CompileAllResult>();
+                            let np = nwnsc_path;
+                            let ni = nwn_install;
+                            let ti = tmp_dir.clone();
+                            background_tasks::spawn_blocking(move || {
+                                let pool = rayon::ThreadPoolBuilder::new()
+                                    .num_threads(8)
+                                    .build()
+                                    .unwrap();
+                                let out_dir = ti.join("out");
+                                let _ = std::fs::create_dir_all(&out_dir);
+                                let results = std::sync::Mutex::new(Vec::new());
+                                let errors = std::sync::Mutex::new(Vec::new());
+                                pool.scope(|s| {
+                                    for (name, _) in &scripts {
+                                        let name = name.clone();
+                                        let np = np.clone();
+                                        let ni = ni.clone();
+                                        let ti = ti.clone();
+                                        let out_dir = out_dir.clone();
+                                        let results = &results;
+                                        let errors = &errors;
+                                        let progress = &progress;
+                                        s.spawn(move |_| {
+                                            let in_path = ti.join(format!("{}.nss", name));
+                                            let out_path = out_dir.join(format!("{}.ncs", name));
+                                            let mut child = match std::process::Command::new(&np)
+                                                .arg("-n").arg(&ni)
+                                                .arg("-e")
+                                                .arg("-i").arg(&ti)
+                                                .arg("-q")
+                                                .arg("-r").arg(&out_path)
+                                                .arg(&in_path)
+                                                .stdin(std::process::Stdio::null())
+                                                .stdout(std::process::Stdio::piped())
+                                                .stderr(std::process::Stdio::piped())
+                                                .spawn()
+                                            {
+                                                Ok(c) => c,
+                                                Err(e) => {
+                                                    progress.fetch_add(1, Ordering::Relaxed);
+                                                    errors.lock().unwrap().push((name, e.to_string()));
+                                                    return;
+                                                }
+                                            };
+                                            let start = std::time::Instant::now();
+                                            loop {
+                                                if start.elapsed() > std::time::Duration::from_secs(30) {
+                                                    let _ = child.kill();
+                                                    let _ = child.wait();
+                                                    progress.fetch_add(1, Ordering::Relaxed);
+                                                    errors.lock().unwrap().push((name, "Timeout (30s)".to_string()));
+                                                    break;
+                                                }
+                                                match child.try_wait() {
+                                                    Ok(Some(status)) => {
+                                                        let stdout = child.stdout.take().map(|mut s| { let mut b = Vec::new(); let _ = std::io::Read::read_to_end(&mut s, &mut b); b }).unwrap_or_default();
+                                                        let stderr = child.stderr.take().map(|mut s| { let mut b = Vec::new(); let _ = std::io::Read::read_to_end(&mut s, &mut b); b }).unwrap_or_default();
+                                                        let msg = format!("{}{}", String::from_utf8_lossy(&stdout), String::from_utf8_lossy(&stderr));
+                                                        progress.fetch_add(1, Ordering::Relaxed);
+                                                        if status.success() {
+                                                            if let Ok(ncs_data) = std::fs::read(&out_path) {
+                                                                results.lock().unwrap().push((name, ncs_data));
+                                                            }
+                                                        } else {
+                                                            errors.lock().unwrap().push((name, msg));
+                                                        }
+                                                        break;
+                                                    }
+                                                    Ok(None) => {
+                                                        std::thread::sleep(std::time::Duration::from_millis(100));
+                                                    }
+                                                    Err(e) => {
+                                                        progress.fetch_add(1, Ordering::Relaxed);
+                                                        errors.lock().unwrap().push((name, e.to_string()));
+                                                        break;
+                                                    }
+                                                }
+                                            }
+                                        });
+                                    }
+                                });
+                                let _ = tx.send(CompileAllResult {
+                                    results: results.into_inner().unwrap(),
+                                    errors: errors.into_inner().unwrap(),
+                                });
+                            });
+                            self.pending_compile_all = Some(rx);
                     }
                     // Right side: bookmarks + NWSync
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -1447,8 +1672,48 @@ impl eframe::App for AuroraBorealisApp {
                                 }
                                 if ui.selectable_label(false, &entry.label).clicked() {
                                     let area_resref = self.current_area.as_ref().map(|a| a.resref.clone()).unwrap_or_default();
+                                    let mut should_rebuild = false;
                                     if let Some(ref mut module) = self.module {
                                         set_object_appearance(module, &area_resref, &ap.obj_type, ap.obj_idx, entry.id);
+                                        if let Some(ref mut obj) = self.selected_object {
+                                            for p in obj.bag.properties.iter_mut() {
+                                                if p.label == "Appearance" {
+                                                    p.value = nwn_gamemodel::PropertyValue::Int(entry.id);
+                                                    break;
+                                                }
+                                            }
+                                        }
+                                        if let Some(area) = self.current_area.as_mut() {
+                                            let area = Arc::make_mut(area);
+                                            let model_name = match ap.obj_type.as_str() {
+                                                "creature" => area.creatures.get_mut(ap.obj_idx).and_then(|c| {
+                                                    let name = module.resolve_creature_model(entry.id, &c.resref);
+                                                    c.model_name = name.clone();
+                                                    name
+                                                }),
+                                                "placeable" => area.placeables.get_mut(ap.obj_idx).and_then(|p| {
+                                                    let name = module.resolve_placeable_model(entry.id, &p.resref);
+                                                    p.model_name = name.clone();
+                                                    name
+                                                }),
+                                                "door" => area.doors.get_mut(ap.obj_idx).and_then(|d| {
+                                                    let name = module.resolve_door_model(entry.id, &d.resref);
+                                                    d.model_name = name.clone();
+                                                    name
+                                                }),
+                                                _ => None,
+                                            };
+                                            if model_name.is_some() {
+                                                should_rebuild = true;
+                                            }
+                                        }
+                                    }
+                                    if should_rebuild {
+                                        if let Some(area) = self.current_area.as_ref().map(|a| a.as_ref().clone()) {
+                                            self.area_version = self.area_version.wrapping_add(1);
+                                            self.viewport.set_area(Arc::new(area), self.area_version, target_format);
+                                        }
+                                    } else {
                                     }
                                     self.status = format!("Appearance set to {} ({})", entry.label, entry.id);
                                     close = true;
@@ -1492,6 +1757,8 @@ impl eframe::App for AuroraBorealisApp {
         }
 
         // Inventory editor
+        let inv_resrefs = self.module.as_ref().map(module_resref_names).unwrap_or_default();
+        let inv_tags = self.module.as_ref().map(module_tag_names).unwrap_or_default();
         if let Some(ref mut inv) = self.inventory_editor {
             let mut close = false;
             egui::Window::new(format!("Inventory - {} #{}", inv.obj_type, inv.obj_idx))
@@ -1501,8 +1768,7 @@ impl eframe::App for AuroraBorealisApp {
                         if let Some(item) = inv.items.get_mut(edit_idx) {
                             ui.heading(format!("Item #{}", edit_idx));
                             ui.separator();
-                            let resrefs = self.module.as_ref().map(module_resref_names).unwrap_or_default();
-                            let modified = show_bag_editor(ui, item, &resrefs);
+                            let modified = show_bag_editor(ui, item, &inv_resrefs, &inv_tags);
                             if modified {
                                 let resref = self.current_area.as_ref().map(|a| a.resref.clone()).unwrap_or_default();
                                 save_item_list(self.module.as_mut(), &resref, &inv.obj_type, inv.obj_idx, &inv.items);
@@ -1683,7 +1949,13 @@ impl eframe::App for AuroraBorealisApp {
                                     egui::pos2(p0.x.max(p1.x), p0.y.max(p1.y)),
                                 );
                                 painter.rect_filled(t_rect, 0.0, color);
-                                painter.rect_stroke(t_rect, 0.0, egui::Stroke::new(0.5, egui::Color32::from_gray(60)), egui::StrokeKind::Outside);
+                                // Highlight selected tile
+                                if let Some((sel_col, sel_row)) = self.selected_tile {
+                                    let is_sel = sel_row == row as usize && sel_col == col as usize;
+                                    painter.rect_stroke(t_rect, 0.0, egui::Stroke::new(if is_sel { 3.0 } else { 0.5 }, if is_sel { egui::Color32::GREEN } else { egui::Color32::from_gray(60) }), egui::StrokeKind::Outside);
+                                } else {
+                                    painter.rect_stroke(t_rect, 0.0, egui::Stroke::new(0.5, egui::Color32::from_gray(60)), egui::StrokeKind::Outside);
+                                }
                             }
                         }
                         let selected = self.selected_obj_info.clone();
@@ -1836,6 +2108,9 @@ impl eframe::App for AuroraBorealisApp {
             }
             if let Some((col, row)) = out_select_tile {
                 self.selected_tile = Some((col, row));
+                self.selected_object = None;
+                self.selected_obj_info = None;
+                self.selection_list.clear();
                 self.status = format!("Selected tile ({}, {})", col, row);
             }
             // Apply drag-move updates outside closure
@@ -2722,11 +2997,9 @@ impl eframe::App for AuroraBorealisApp {
                     if let Some(ref module) = self.module {
                         show_resource_viewer(
                             ui, module,
-                            &mut save_2da,
                             &mut open_script,
                             &mut open_conversation,
                             &mut edit_blueprint,
-                            &mut edit_tlk,
                             &mut open_faction,
                             &mut open_journal,
                         );
@@ -2751,19 +3024,128 @@ impl eframe::App for AuroraBorealisApp {
             self.journal_editor_open = true;
         }
 
-        // Blueprint Palette window
-        if self.show_blueprint_palette {
-            if let Some(ref module) = self.module {
-                let mut place_cmd: Option<(String, String)> = None;
-                egui::Window::new("Blueprint Palette")
-                    .default_size([300.0, 500.0])
-                    .show(ctx, |ui| {
-                        show_blueprint_palette(ui, &module.resource_manager, &mut place_cmd);
+        // Palette selector window (always shown when palette is open)
+        if self.show_palette {
+            egui::Window::new("Palette")
+                .default_size([300.0, 500.0])
+                .show(ctx, |ui| {
+                    egui::ComboBox::from_id_salt("palette_mode")
+                        .selected_text(match self.palette_mode {
+                            PaletteMode::Blueprints => "Blueprints",
+                            PaletteMode::Tiles => "Tiles",
+                        })
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(&mut self.palette_mode, PaletteMode::Blueprints, "Blueprints");
+                            ui.selectable_value(&mut self.palette_mode, PaletteMode::Tiles, "Tiles");
+                        });
+                    ui.separator();
+                    match self.palette_mode {
+                        PaletteMode::Blueprints => {
+                            if let Some(ref module) = self.module {
+                                let mut place_cmd: Option<(String, String)> = None;
+                                show_blueprint_palette(ui, &module.resource_manager, &mut place_cmd);
+                                if let Some((typ, resref)) = place_cmd {
+                                    self.status = format!("Placement mode: {} {}. Click in viewport to place.", typ, resref);
+                                    self.placement_state = PlacementState::Pending(typ, resref);
+                                }
+                            }
+                        }
+                        PaletteMode::Tiles => {
+                            ui.label("Use the Paint toggle in the View bar to open the tile selector.");
+                        }
+                    }
+                });
+        }
+        // Tile palette window (shown when Paint is toggled on)
+        if self.show_paint {
+            let tileset_name = self.current_area.as_ref().map(|a| a.tileset.clone()).unwrap_or_default();
+            let tiles_from_2da: Vec<(i32, String)> = if let Some(ref module) = self.module {
+                get_tile_palette(module, &tileset_name)
+            } else { Vec::new() };
+            let mut paint_open = true;
+            egui::Window::new("Paint")
+                .id("paint_window".into())
+                .default_size([300.0, 500.0])
+                .open(&mut paint_open)
+                .show(ctx, |ui| {
+                    ui.label(format!("Tileset: {}", tileset_name));
+                    ui.horizontal(|ui| {
+                        ui.label("Filter:");
+                        ui.text_edit_singleline(&mut self.tile_palette_filter);
                     });
-                if let Some((typ, resref)) = place_cmd {
-                    self.status = format!("Placement mode: {} {}. Click in viewport to place.", typ, resref);
-                    self.placement_state = PlacementState::Pending(typ, resref);
-                }
+                    ui.separator();
+                    if tiles_from_2da.is_empty() {
+                        ui.label(format!("No tileset data found for '{}'", tileset_name));
+                    } else {
+                        let mut filtered: Vec<(i32, String)> = tiles_from_2da.iter()
+                            .filter(|(_, name)| {
+                                self.tile_palette_filter.is_empty()
+                                    || name.to_lowercase().contains(&self.tile_palette_filter.to_lowercase())
+                            })
+                            .cloned().collect();
+                        filtered.sort_by_key(|(id, _)| *id);
+                        ui.horizontal(|ui| {
+                            ui.label("Auto:");
+                            let fill_id = filtered.first().map(|(id, _)| *id).unwrap_or(0);
+                            if ui.button("Fill All").clicked() {
+                                self.fill_area_tiles(fill_id);
+                                if let Some(ref area) = self.current_area {
+                                    self.viewport.set_area(area.clone(), self.area_version, target_format);
+                                }
+                            }
+                            if ui.button("Orient").clicked() {
+                                self.auto_orient_tiles();
+                                if let Some(ref area) = self.current_area {
+                                    self.viewport.set_area(area.clone(), self.area_version, target_format);
+                                }
+                            }
+                        });
+                        ui.separator();
+                        egui::Grid::new("paint_tile_grid").striped(true).show(ui, |ui| {
+                            for (i, (tile_id, tile_name)) in filtered.iter().enumerate() {
+                                if i % 4 == 0 && i > 0 { ui.end_row(); }
+                                let shift = ui.input(|i| i.modifiers.shift);
+                                if ui.button(format!("{}:{}", tile_id, tile_name)).clicked() {
+                                    let paint_id = *tile_id;
+                                    if shift {
+                                        if let Some((tile_col, tile_row)) = self.selected_tile {
+                                            self.tile_flood_fill(tile_col, tile_row, paint_id);
+                                        }
+                                    } else if let Some((tile_col, tile_row)) = self.selected_tile {
+                                        self.push_undo();
+                                        if let Some(ref mut area) = self.current_area {
+                                            let idx = tile_row * area.width as usize + tile_col;
+                                            let area_mut = Arc::make_mut(area);
+                                            if idx < area_mut.tiles.len() {
+                                                area_mut.tiles[idx].id = paint_id;
+                                                // Keep tile_models in sync
+                                                if let Some(ref module) = self.module {
+                                                    if let Some(ts) = module.tileset_info(&area_mut.tileset) {
+                                                        if idx < area_mut.tile_models.len() {
+                                                            area_mut.tile_models[idx] = ts.tile_model(paint_id as u32).map(|s| s.to_string());
+                                                        }
+                                                    }
+                                                }
+                                                self.status = format!("Painted tile ({},{}) with id {}", tile_col, tile_row, paint_id);
+                                                let resref = area_mut.resref.clone();
+                                                if let Some(ref mut module) = self.module {
+                                                    module.update_area_are(&resref, area_mut);
+                                                }
+                                                self.area_version = self.area_version.wrapping_add(1);
+                                            }
+                                        }
+                                    }
+                                    if let Some(ref area) = self.current_area {
+                                        self.viewport.set_area(area.clone(), self.area_version, target_format);
+                                    }
+                                }
+                            }
+                        });
+                    }
+                });
+            if !paint_open {
+                self.show_paint = false;
+                self.viewport.set_show_paint(false);
             }
         }
 
@@ -2800,6 +3182,47 @@ impl eframe::App for AuroraBorealisApp {
                     self.status = format!("Placement mode: {} {}. Click in viewport to place.", typ, resref);
                     self.placement_state = PlacementState::Pending(typ, resref);
                 }
+            }
+        }
+
+        // Launch confirmation dialog
+        if self.show_launch_dialog {
+            let mut keep_open = true;
+            let area_name = self.current_area.as_ref().map(|a| a.resref.clone()).unwrap_or_default();
+            let mod_name = self.module.as_ref().map(|m| m.name.clone()).unwrap_or_default();
+            egui::Window::new("Launch Module")
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .collapsible(false)
+                .resizable(false)
+                .open(&mut keep_open)
+                .show(ctx, |ui| {
+                    ui.vertical_centered(|ui| {
+                        ui.heading("Launch Neverwinter Nights:EE?");
+                    });
+                    ui.add_space(8.0);
+                    ui.label(format!("Module: {}", mod_name));
+                    if !area_name.is_empty() {
+                        ui.label(format!("Area: {}", area_name));
+                    }
+                    ui.add_space(4.0);
+                    ui.colored_label(egui::Color32::GOLD, "The module will be copied to your NWN modules directory and NWN will launch.");
+                    ui.add_space(4.0);
+                    ui.colored_label(egui::Color32::LIGHT_BLUE, "Make sure you've saved your work first!");
+                    ui.add_space(12.0);
+                    ui.horizontal(|ui| {
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.button("Cancel").clicked() {
+                                self.show_launch_dialog = false;
+                            }
+                            if ui.button("🚀 Launch").clicked() {
+                                self.show_launch_dialog = false;
+                                self.launch_nwn();
+                            }
+                        });
+                    });
+                });
+            if !keep_open {
+                self.show_launch_dialog = false;
             }
         }
 
@@ -2891,6 +3314,8 @@ impl eframe::App for AuroraBorealisApp {
 
         // Blueprint editors
         let mut bp_to_remove = Vec::new();
+        let bp_resrefs = self.module.as_ref().map(module_resref_names).unwrap_or_default();
+        let bp_tags = self.module.as_ref().map(module_tag_names).unwrap_or_default();
         for i in 0..self.blueprint_editors.len() {
             let (resref, restype, bag) = &mut self.blueprint_editors[i];
             let (resref_clone, restype_clone) = (resref.clone(), *restype);
@@ -2903,8 +3328,7 @@ impl eframe::App for AuroraBorealisApp {
                 .show(ctx, |ui| {
                     ui.label(format!("ResRef: {}  Type: {}", resref_clone, ext));
                     ui.separator();
-                    let resrefs = self.module.as_ref().map(module_resref_names).unwrap_or_default();
-                    show_bag_editor(ui, bag, &resrefs);
+                    show_bag_editor(ui, bag, &bp_resrefs, &bp_tags);
                     ui.separator();
                     if ui.button("Save to Module").clicked() {
                         if let Some(ref mut module) = self.module {
@@ -3038,6 +3462,7 @@ impl eframe::App for AuroraBorealisApp {
                                             self.area_version = self.area_version.wrapping_add(1);
                                             self.viewport.set_area(area.clone(), self.area_version, target_format);
                                             self.current_area = Some(area);
+                                            self.sync_area_sounds();
                                         }
                                     }
                                     self.status = format!("Deleted '{}', switched to '{}'.", name, next);
@@ -3062,6 +3487,7 @@ impl eframe::App for AuroraBorealisApp {
                     ui.separator();
                 }
                 let (_id, rect) = ui.allocate_space(ui.available_size());
+                let viewport_resp = ui.allocate_rect(rect, egui::Sense::click_and_drag());
                 // Minimap overlay (bottom-right corner of viewport)
                 // Must use a separate foreground layer so it renders on top of the 3D paint callback
                 if self.show_minimap {
@@ -3117,13 +3543,13 @@ impl eframe::App for AuroraBorealisApp {
                     self.ghost_screen_pos = None;
                 }
 
-                let (is_hovered, has_w, has_s, has_a, has_d, delta, secondary_down, middle_down, primary_clicked, primary_down, click_pos, scroll) = ctx.input(|i| {
-                    let hovered = i.pointer.hover_pos().map_or(false, |p| rect.contains(p));
+                let is_hovered = viewport_resp.hovered();
+                let (has_w, has_s, has_a, has_d, delta, secondary_down, middle_down, primary_clicked, primary_down, click_pos, scroll) = ctx.input(|i| {
                     let w = i.keys_down.contains(&egui::Key::W);
                     let s = i.keys_down.contains(&egui::Key::S);
                     let a = i.keys_down.contains(&egui::Key::A);
                     let d = i.keys_down.contains(&egui::Key::D);
-                    (hovered, w, s, a, d, i.pointer.delta(), i.pointer.secondary_down(), i.pointer.middle_down(), i.pointer.primary_clicked(), i.pointer.primary_down(), i.pointer.interact_pos(), i.raw_scroll_delta)
+                    (w, s, a, d, i.pointer.delta(), i.pointer.secondary_down(), i.pointer.middle_down(), i.pointer.primary_clicked(), i.pointer.primary_down(), i.pointer.interact_pos(), i.raw_scroll_delta)
                 });
                 let vp_w = rect.width();
                 let vp_h = rect.height();
@@ -3302,6 +3728,7 @@ impl eframe::App for AuroraBorealisApp {
                                                     resref: resref.clone(), tag: tag.clone(),
                                                     x: nwn_x, y: nwn_y, z: nwn_z, bearing: 0.0,
                                                     appearance: 0, model_name: None,
+                                                    has_light: false, light_color: [255, 255, 255, 255], light_radius: 5.0,
                                                 });
                                                 placed = true;
                                             }
@@ -3318,6 +3745,7 @@ impl eframe::App for AuroraBorealisApp {
                                                     resref: resref.clone(), tag: tag.clone(),
                                                     x: nwn_x, y: nwn_y, z: nwn_z, bearing: 0.0,
                                                     appearance: 0, model_name: None,
+                                                    has_light: false, light_color: [255, 255, 255, 255], light_radius: 5.0,
                                                 });
                                                 placed = true;
                                             }
@@ -3354,7 +3782,7 @@ impl eframe::App for AuroraBorealisApp {
                                         // Ctrl+Click on an already-selected object: deselect it
                                         self.selection_list.retain(|x| *x != key);
                                         if let Some(last) = self.selection_list.last().cloned() {
-                                            select_single_object(area, self.module.as_ref(), &mut self.selected_object, &mut self.selected_obj_info, &last.0, last.1);
+                                            select_single_object(area, self.module.as_ref(), &mut self.selected_object, &mut self.selected_obj_info, &mut self.selected_tile, &last.0, last.1);
                                         } else {
                                             self.selected_object = None;
                                             self.selected_obj_info = None;
@@ -3468,17 +3896,8 @@ impl eframe::App for AuroraBorealisApp {
                                         }
                                     }
                                 } else {
-                                    // Tile selection via ground pick
-                                    if let Some(world) = self.viewport.pick_ground(vp_x, vp_y, vp_w, vp_h) {
-                                        if let Some(ref area) = self.current_area {
-                                            let tile_col = (world[0] / 10.0).floor() as usize;
-                                            let tile_row = (-world[2] / 10.0).floor() as usize;
-                                            if tile_col < area.width as usize && tile_row < area.height as usize {
-                                                self.selected_tile = Some((tile_col, tile_row));
-                                                self.status = format!("Selected tile ({}, {})", tile_col, tile_row);
-                                            }
-                                        }
-                                    }
+                                    // Record start of potential drag-select or tile click
+                                    self.drag_select_start = click_pos;
                                 }
                             }
                         }
@@ -3533,6 +3952,64 @@ impl eframe::App for AuroraBorealisApp {
                             self.area_version = self.area_version.wrapping_add(1);
                             self.viewport.set_area(Arc::new(area.clone()), self.area_version, target_format);
                             self.status = format!("Moved {} #{}", drag.obj_type, drag.obj_idx);
+                        }
+                    }
+                }
+
+                // ── Drag-to-select (marquee selection) ──
+                if self.drag_select_start.is_some() && !primary_down {
+                    let start = self.drag_select_start.take().unwrap();
+                    let cur_hover = ctx.input(|i| i.pointer.hover_pos());
+                    let dist = cur_hover.map(|p| (p.x - start.x).abs().max((p.y - start.y).abs())).unwrap_or(0.0);
+                    if dist > 5.0 {
+                        // Drag-select: find objects inside rectangle
+                        if let Some(area) = self.current_area.as_ref() {
+                            let end = cur_hover.unwrap_or(start);
+                            let mut min_x = start.x.min(end.x) - rect.left();
+                            let mut max_x = start.x.max(end.x) - rect.left();
+                            let mut min_y = start.y.min(end.y) - rect.top();
+                            let mut max_y = start.y.max(end.y) - rect.top();
+                            min_x = min_x.clamp(0.0, vp_w);
+                            max_x = max_x.clamp(0.0, vp_w);
+                            min_y = min_y.clamp(0.0, vp_h);
+                            max_y = max_y.clamp(0.0, vp_h);
+                            let hits = self.viewport.screen_rect_select([min_x, min_y], [max_x, max_y], vp_w, vp_h);
+                            let ctrl_held = ctx.input(|i| i.modifiers.ctrl);
+                            if !ctrl_held {
+                                self.selection_list.clear();
+                            }
+                            for (_, obj_type, obj_idx) in hits {
+                                let key = (match obj_type {
+                                    ObjectType::Creature => "creature",
+                                    ObjectType::Door => "door",
+                                    ObjectType::Placeable => "placeable",
+                                    ObjectType::Trigger => "trigger",
+                                    ObjectType::Waypoint => "waypoint",
+                                    ObjectType::Encounter => "encounter",
+                                    ObjectType::SoundEmitter => "sound_emitter",
+                                    ObjectType::Light => "light",
+                                }.to_string(), obj_idx);
+                                if !self.selection_list.contains(&key) {
+                                    self.selection_list.push(key);
+                                }
+                            }
+                            if let Some(last) = self.selection_list.last().cloned() {
+                                select_single_object(area, self.module.as_ref(), &mut self.selected_object, &mut self.selected_obj_info, &mut self.selected_tile, &last.0, last.1);
+                            }
+                            self.status = format!("Drag-selected {} object(s)", self.selection_list.len());
+                        }
+                    } else {
+                        // Small click: select tile
+                        let click_in_rect = egui::Pos2 { x: start.x - rect.left(), y: start.y - rect.top() };
+                        if let Some(world) = self.viewport.pick_ground(click_in_rect.x, click_in_rect.y, vp_w, vp_h) {
+                            if let Some(ref area) = self.current_area {
+                                let tile_col = (world[0] / 10.0).floor() as usize;
+                                let tile_row = (-world[2] / 10.0).floor() as usize;
+                                if tile_col < area.width as usize && tile_row < area.height as usize {
+                                    self.selected_tile = Some((tile_col, tile_row));
+                                    self.status = format!("Selected tile ({}, {})", tile_col, tile_row);
+                                }
+                            }
                         }
                     }
                 }
@@ -3634,7 +4111,7 @@ impl eframe::App for AuroraBorealisApp {
                     if keys.2 { nudge_y += 1.0; }
                     if keys.3 { nudge_y -= 1.0; }
                     if keys.4 { rotate_delta -= 0.1; }
-                    if keys.5 || keys.6 { rotate_delta += 0.1; }
+                    if keys.5 { rotate_delta += 0.1; }
                     if keys.7 { do_delete = true; }
 
                     if nudge_x != 0.0 || nudge_y != 0.0 || rotate_delta != 0.0 || do_delete {
@@ -3738,7 +4215,7 @@ impl eframe::App for AuroraBorealisApp {
                     }
                 }
 
-                // Update green highlight on selected object
+                // Update highlights
                 if let Some(ref info) = self.selected_obj_info {
                     if let Some(ref area) = self.current_area {
                         let highlight_pos = get_object_position(area, info);
@@ -3746,8 +4223,19 @@ impl eframe::App for AuroraBorealisApp {
                     } else {
                         self.viewport.set_highlight_object(None, 0.0);
                     }
+                    self.viewport.set_highlight_tile(None, 0, 0, 0.0);
                 } else {
                     self.viewport.set_highlight_object(None, 0.0);
+                    if let Some((col, row)) = self.selected_tile {
+                        if let Some(ref area) = self.current_area {
+                            let idx = row * area.width as usize + col;
+                            let h = area.tiles.get(idx).map(|t| t.height).unwrap_or(0);
+                            let height = h as f32 * 0.25 + 0.05;
+                            self.viewport.set_highlight_tile(Some(1), col, row, height);
+                        }
+                    } else {
+                        self.viewport.set_highlight_tile(None, 0, 0, 0.0);
+                    }
                 }
 
                 let cb = egui_wgpu::Callback::new_paint_callback(rect, self.viewport.clone_arc());
@@ -3775,6 +4263,34 @@ impl eframe::App for AuroraBorealisApp {
                         );
                     }
                 }
+
+                // Drag-select rectangle overlay
+                if let Some(start) = self.drag_select_start {
+                    let cur_hover = ui.ctx().input(|i| i.pointer.hover_pos());
+                    if let Some(end) = cur_hover.filter(|p| rect.contains(*p)) {
+                        let sel_layer = egui::LayerId::new(egui::Order::Foreground, egui::Id::new("drag_select_rect"));
+                        let painter = egui::Painter::new(ui.ctx().clone(), sel_layer, rect);
+                        let min = egui::pos2(start.x.min(end.x), start.y.min(end.y));
+                        let max = egui::pos2(start.x.max(end.x), start.y.max(end.y));
+                        let fill = egui::Color32::from_rgba_premultiplied(100, 150, 255, 40);
+                        let stroke = egui::Stroke::new(1.5, egui::Color32::from_rgb(100, 150, 255));
+                        painter.rect(egui::Rect::from_min_max(min, max), 0.0, fill, stroke, egui::StrokeKind::Inside);
+                    }
+                }
+                // Reticle (crosshair at center of viewport)
+                {
+                    let cx = rect.center().x;
+                    let cy = rect.center().y;
+                    let reticle_layer = egui::LayerId::new(egui::Order::Foreground, egui::Id::new("reticle"));
+                    let rp = egui::Painter::new(ui.ctx().clone(), reticle_layer, rect);
+                    let size = 10.0;
+                    let gap = 3.0;
+                    let color = egui::Color32::WHITE;
+                    rp.line_segment([egui::pos2(cx, cy - gap - size), egui::pos2(cx, cy - gap)], egui::Stroke::new(1.5, color));
+                    rp.line_segment([egui::pos2(cx, cy + gap), egui::pos2(cx, cy + gap + size)], egui::Stroke::new(1.5, color));
+                    rp.line_segment([egui::pos2(cx - gap - size, cy), egui::pos2(cx - gap, cy)], egui::Stroke::new(1.5, color));
+                    rp.line_segment([egui::pos2(cx + gap, cy), egui::pos2(cx + gap + size, cy)], egui::Stroke::new(1.5, color));
+                }
             } else if self.module.is_some() {
                 ui.heading("Select an area from the navigator");
                 ui.separator();
@@ -3797,18 +4313,18 @@ impl eframe::App for AuroraBorealisApp {
             }
         });
 
-        // Escape cancels placement mode and resets tool to Select
-        let esc = ctx.input(|i| i.key_pressed(egui::Key::Escape));
-        if esc {
+        // Tool hotkeys & Escape
+        let pressed = |k| ctx.input(|i| i.key_pressed(k));
+        if pressed(egui::Key::Escape) {
             if matches!(self.placement_state, PlacementState::Pending(..)) {
                 self.placement_state = PlacementState::Inactive;
                 self.status = "Placement cancelled.".to_string();
             }
             self.active_tool = Tool::Select;
+            self.selected_object = None;
+            self.selection_list.clear();
+            self.selected_obj_info = None;
         }
-
-        // Tool hotkeys 1-4
-        let pressed = |k| ctx.input(|i| i.key_pressed(k));
         if pressed(egui::Key::Num1) { self.active_tool = Tool::Select; }
         if pressed(egui::Key::Num2) { self.active_tool = Tool::TerrainRaise; }
         if pressed(egui::Key::Num3) { self.active_tool = Tool::TerrainSmooth; }
@@ -3823,7 +4339,7 @@ impl eframe::App for AuroraBorealisApp {
             self.copy_selected_object();
         }
         if ctrl_v {
-            self.paste_object();
+            self.paste_object(target_format);
         }
         if ctrl_z {
             self.undo(target_format);
@@ -3833,10 +4349,66 @@ impl eframe::App for AuroraBorealisApp {
         }
 
         // ===================== STATUS BAR =====================
+        let now = std::time::Instant::now();
+        let dt = now.duration_since(self.last_frame_time).as_secs_f64();
+        self.last_frame_time = now;
+        self.fps_accum += 1.0;
+        self.fps_timer += dt;
+
+        // Per-frame memory check — hard cap enforcement
+        let rss_kb = current_rss_kb();
+        let rss_mb = rss_kb / 1024;
+        let limit_mb = self.max_ram_mb as u64;
+        let limit_kb = limit_mb * 1024;
+        if rss_kb > limit_kb {
+            // Over hard cap — evict everything we can
+            self.viewport.evict_model_cache();
+            self.viewport.set_texture_mem_limit(64 * 1024 * 1024);
+            if let Some(ref module) = self.module {
+                module.evict_memory_caches();
+            }
+            if self.last_rss_mb <= limit_mb {
+                self.status = format!("OVER MEM LIMIT! {} MB / {} MB — caches flushed", rss_mb, limit_mb);
+            }
+        } else {
+            // Texture budget: 10% of free RAM, clamped 32 MB .. 128 MB
+            let free_mb = limit_mb.saturating_sub(rss_mb);
+            let tex_budget_mb = (free_mb / 10).max(32).min(128);
+            self.viewport.set_texture_mem_limit(tex_budget_mb * 1024 * 1024);
+        }
+        self.last_rss_mb = rss_mb;
+
+        let fps_str = if self.fps_timer >= 1.0 {
+            let fps = (self.fps_accum / self.fps_timer) as usize;
+            self.fps_accum = 0.0;
+            self.fps_timer = 0.0;
+            if rss_kb > limit_kb {
+                self.status = format!("OVER MEM LIMIT! {} MB / {} MB — caches flushed", rss_mb, limit_mb);
+            } else if rss_kb > limit_kb * 85 / 100 {
+                self.status = format!("High memory: {} MB / {} MB", rss_mb, limit_mb);
+            }
+            format!("{} FPS | RAM: {} / {} MB", fps, rss_mb, limit_mb)
+        } else {
+            format!("{:.0} FPS | RAM: {} / {} MB", self.fps_accum / self.fps_timer.max(0.001), self.last_rss_mb, limit_mb)
+        };
         egui::TopBottomPanel::bottom("status").show(ctx, |ui| {
             ui.horizontal(|ui| {
-                ui.label(&self.status);
+                if let Some((ref progress, total)) = self.compile_progress {
+                    let done = progress.load(Ordering::Relaxed);
+                    let pct = done as f64 / total as f64;
+                    ui.label(format!("Compiling {}/{} scripts", done, total));
+                    ui.add(
+                        egui::ProgressBar::new(pct as f32)
+                            .desired_width(120.0)
+                            .show_percentage()
+                            .animate(true)
+                    );
+                } else {
+                    ui.label(&self.status);
+                }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.label(&fps_str);
+                    ui.separator();
                     if let Some(ref module) = self.module {
                         ui.label(format!("{} areas", module.num_areas()));
                         ui.separator();
@@ -4047,89 +4619,7 @@ impl eframe::App for AuroraBorealisApp {
             }
         }
 
-        // ===================== TILE PALETTE =====================
-        if self.tile_palette_open {
-            let tileset_name = self.current_area.as_ref().map(|a| a.tileset.clone()).unwrap_or_default();
-            // Pre-load tileset data outside closure to avoid borrow conflicts
-            let tiles_from_2da: Vec<(i32, String)> = if let Some(ref module) = self.module {
-                module.resource_manager.get_2da(&format!("tileset_apply_{}", tileset_name.to_lowercase()))
-                    .map(|table| {
-                        let rows = table.row_count().min(500);
-                        (0..rows).filter_map(|r| {
-                            let id = table.get_cell_by_label(r, "TileID").and_then(|s| s.parse::<i32>().ok()).unwrap_or(-1);
-                            let name = table.get_cell_by_label(r, "ResRef").unwrap_or("").to_string();
-                            if id < 0 || name.is_empty() { return None; }
-                            Some((id, name))
-                        }).collect::<Vec<_>>()
-                    }).unwrap_or_default()
-            } else { Vec::new() };
-            let mut palette_open = true;
-            egui::Window::new("Tile Palette")
-                .default_size([300.0, 500.0])
-                .open(&mut palette_open)
-                .show(ctx, |ui| {
-                    ui.label(format!("Tileset: {}", tileset_name));
-                    ui.horizontal(|ui| {
-                        ui.label("Filter:");
-                        ui.text_edit_singleline(&mut self.tile_palette_filter);
-                    });
-                    ui.separator();
-                    if tiles_from_2da.is_empty() {
-                        ui.label(format!("No tileset data found for '{}'", tileset_name));
-                    } else {
-                        let mut filtered: Vec<(i32, String)> = tiles_from_2da.iter()
-                            .filter(|(_, name)| {
-                                self.tile_palette_filter.is_empty()
-                                    || name.to_lowercase().contains(&self.tile_palette_filter.to_lowercase())
-                            })
-                            .cloned().collect();
-                        filtered.sort_by_key(|(id, _)| *id);
-                        ui.horizontal(|ui| {
-                            ui.label("Auto:");
-                            let fill_id = filtered.first().map(|(id, _)| *id).unwrap_or(0);
-                            if ui.button("Fill All").clicked() {
-                                self.fill_area_tiles(fill_id);
-                            }
-                            if ui.button("Orient").clicked() {
-                                self.auto_orient_tiles();
-                            }
-                        });
-                        ui.separator();
-                        egui::Grid::new("tile_grid").striped(true).show(ui, |ui| {
-                            for (i, (tile_id, tile_name)) in filtered.iter().enumerate() {
-                                if i % 4 == 0 && i > 0 { ui.end_row(); }
-                                let shift = ui.input(|i| i.modifiers.shift);
-                                if ui.button(format!("{}:{}", tile_id, tile_name)).clicked() {
-                                    let paint_id = *tile_id;
-                                    if shift {
-                                        if let Some((tile_col, tile_row)) = self.selected_tile {
-                                            self.tile_flood_fill(tile_col, tile_row, paint_id);
-                                        }
-                                    } else if let Some((tile_col, tile_row)) = self.selected_tile {
-                                        self.push_undo();
-                                        if let Some(ref mut area) = self.current_area {
-                                            let idx = tile_row * area.width as usize + tile_col;
-                                            let area_mut = Arc::make_mut(area);
-                                            if idx < area_mut.tiles.len() {
-                                                area_mut.tiles[idx].id = paint_id;
-                                                self.status = format!("Painted tile ({},{}) with id {}", tile_col, tile_row, paint_id);
-                                                let resref = area_mut.resref.clone();
-                                                if let Some(ref mut module) = self.module {
-                                                    module.update_area_are(&resref, area_mut);
-                                                }
-                                                self.area_version = self.area_version.wrapping_add(1);
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        });
-                    }
-                });
-            if !palette_open {
-                self.tile_palette_open = false;
-            }
-        }
+
 
         // ===================== NEW OBJECT DIALOG =====================
         if self.new_object_open {
@@ -4152,7 +4642,7 @@ impl eframe::App for AuroraBorealisApp {
                 }
             }
             egui::Window::new("New Object")
-                .default_size([400.0, 400.0])
+                .default_size([400.0, 500.0])
                 .open(&mut still_open)
                 .show(ctx, |ui| {
                     let prev_type = self.new_object_type.clone();
@@ -4177,30 +4667,20 @@ impl eframe::App for AuroraBorealisApp {
                         }
                     }
                     ui.horizontal(|ui| {
+                        ui.label("Search:");
+                        ui.text_edit_singleline(&mut self.new_object_filter);
+                    });
+                    ui.horizontal(|ui| {
                         ui.label("ResRef:");
                         if !two_da_name.is_empty() && !self.new_object_blueprints.is_empty() {
-                            let current = if self.new_object_resref.is_empty() {
+                            let current_label = if self.new_object_resref.is_empty() {
                                 "Select...".to_string()
                             } else {
-                                format!("{} ({})", self.new_object_resref, self.new_object_blueprints.iter()
-                                    .find(|(r, _)| r == &self.new_object_resref)
-                                    .map(|(_, n)| n.as_str())
-                                    .unwrap_or(""))
+                                self.new_object_resref.clone()
                             };
-                            egui::ComboBox::from_id_salt("new_obj_resref")
-                                .selected_text(&current)
-                                .show_ui(ui, |ui| {
-                                    let filter = self.new_object_filter.to_lowercase();
-                                    for (row_label, name) in &self.new_object_blueprints {
-                                        if !filter.is_empty() && !row_label.to_lowercase().contains(&filter) && !name.to_lowercase().contains(&filter) {
-                                            continue;
-                                        }
-                                        let display = format!("{} ({})", name, row_label);
-                                        if ui.selectable_label(self.new_object_resref == *row_label, &display).clicked() {
-                                            self.new_object_resref = row_label.clone();
-                                        }
-                                    }
-                                });
+                            if ui.button(current_label).clicked() {
+                                self.new_object_resref_browse_open = true;
+                            }
                         } else {
                             ui.text_edit_singleline(&mut self.new_object_resref);
                         }
@@ -4264,6 +4744,7 @@ impl eframe::App for AuroraBorealisApp {
                                             x: self.new_object_x, y: self.new_object_y,
                                             z: self.new_object_z, bearing: self.new_object_bearing,
                                             appearance: 0, model_name: None,
+                                            has_light: false, light_color: [255, 255, 255, 255], light_radius: 5.0,
                                         });
                                     }
                                     "trigger" => {
@@ -4315,6 +4796,20 @@ impl eframe::App for AuroraBorealisApp {
                                 }
                                 self.area_version = self.area_version.wrapping_add(1);
                                 self.status = format!("Created {} '{}'", typ, resref);
+                                // Auto-select the newly created object
+                                let idx = match typ.as_str() {
+                                    "creature" => area.creatures.len().wrapping_sub(1),
+                                    "door" => area.doors.len().wrapping_sub(1),
+                                    "placeable" => area.placeables.len().wrapping_sub(1),
+                                    "trigger" => area.triggers.len().wrapping_sub(1),
+                                    "waypoint" => area.waypoints.len().wrapping_sub(1),
+                                    "encounter" => area.encounters.len().wrapping_sub(1),
+                                    "sound_emitter" => area.sound_emitters.len().wrapping_sub(1),
+                                    _ => usize::MAX,
+                                };
+                                if idx != usize::MAX {
+                                    select_single_object(area, self.module.as_ref(), &mut self.selected_object, &mut self.selected_obj_info, &mut self.selected_tile, &typ, idx);
+                                }
                             }
                             created = true;
                         }
@@ -4324,6 +4819,57 @@ impl eframe::App for AuroraBorealisApp {
                 self.new_object_open = false;
             }
         }
+        // Blueprint browser popup (for New Object dialog)
+        if self.new_object_resref_browse_open {
+            let two_da_name: &str = match self.new_object_type.as_str() {
+                "creature" => "creatures",
+                "door" => "doortypes",
+                "placeable" => "placeables",
+                "trigger" => "triggers",
+                "waypoint" => "waypoints",
+                "encounter" => "encounters",
+                _ => "",
+            };
+            let mut selected = false;
+            egui::Window::new("Select Blueprint")
+                .id("resref_browse".into())
+                .default_size([350.0, 450.0])
+                .show(ctx, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label("Filter:");
+                        ui.text_edit_singleline(&mut self.new_object_filter);
+                    });
+                    ui.separator();
+                    if !two_da_name.is_empty() {
+                        if let Some(ref module) = self.module {
+                            let blueprints = module.blueprint_resrefs(two_da_name);
+                            let filter = self.new_object_filter.to_lowercase();
+                            let mut filtered: Vec<&(String, String)> = blueprints.iter()
+                                .filter(|(r, n)| {
+                                    filter.is_empty()
+                                        || r.to_lowercase().contains(&filter)
+                                        || n.to_lowercase().contains(&filter)
+                                })
+                                .collect();
+                            filtered.sort_by(|(r1, _), (r2, _)| r1.cmp(r2));
+                            egui::ScrollArea::vertical()
+                                .show(ui, |ui| {
+                                    for (row_label, name) in &filtered {
+                                        let display = format!("{} ({})", name, row_label);
+                                        if ui.selectable_label(self.new_object_resref == *row_label, &display).clicked() {
+                                            self.new_object_resref = row_label.clone();
+                                            selected = true;
+                                        }
+                                    }
+                                });
+                        }
+                    }
+                });
+            if selected {
+                self.new_object_resref_browse_open = false;
+            }
+        }
+
 
         // ===================== EDITOR WINDOWS =====================
         // Faction Editor
@@ -4433,11 +4979,20 @@ impl eframe::App for AuroraBorealisApp {
         let mut inspector_modified = false;
         let mut delete_requested = false;
         let mut pos_update: Option<(String, usize, f32, f32, f32, f32)> = None;
+        let mut tile_update: Option<(usize, i32, i32, i32, bool)> = None;
+        // Use cached names/tags to avoid re-parsing all GIT data every frame
+        let cached_resrefs = self.module.as_ref().map(module_resref_names).unwrap_or_default();
+        let cached_tags = self.module.as_ref().map(module_tag_names).unwrap_or_default();
+        // Tile ID palette data for dropdown (computed inline in the tile panel below)
         egui::SidePanel::right("inspector")
             .resizable(true)
             .default_width(300.0)
+            .frame(egui::Frame {
+                fill: ctx.style().visuals.panel_fill,
+                ..Default::default()
+            })
             .show(ctx, |ui| {
-                        ui.heading("Properties");
+                ui.heading("Properties");
                 ui.separator();
                 if let Some(ref mut obj) = self.selected_object {
                     // Position & bearing controls
@@ -4546,8 +5101,9 @@ impl eframe::App for AuroraBorealisApp {
                         }
                         ui.separator();
                     }
-                    let resrefs = self.module.as_ref().map(module_resref_names).unwrap_or_default();
-                    inspector_modified = show_inspector(ui, obj, &resrefs);
+                    inspector_modified = show_inspector(ui, obj, &cached_resrefs, &cached_tags);
+                } else if self.selected_tile.is_some() {
+                    ui.colored_label(egui::Color32::GREEN, "Tile selected — use Tile Properties window");
                 } else if matches!(self.placement_state, PlacementState::Pending(..)) {
                     ui.colored_label(egui::Color32::YELLOW, "Placement mode active");
                     ui.label("Click in the viewport to place the object.");
@@ -4556,6 +5112,68 @@ impl eframe::App for AuroraBorealisApp {
                     ui.colored_label(egui::Color32::GRAY, "Select an object to inspect");
                 }
             });
+        // ===================== TILE PROPERTIES WINDOW =====================
+        if self.selected_tile.is_some() {
+            let mut tile_props_open = true;
+            egui::Window::new("Tile Properties")
+                .id("tile_props_window".into())
+                .default_width(280.0)
+                .open(&mut tile_props_open)
+                .show(ctx, |ui| {
+                    if let Some((col, row)) = self.selected_tile {
+                        if let Some(ref area) = self.current_area {
+                            let tile_idx = row * area.width as usize + col;
+                            if let Some(tile) = area.tiles.get(tile_idx) {
+                                ui.label(format!("Tile ({}, {})", col, row));
+                                if let Some(model_name) = area.tile_models.get(tile_idx).and_then(|m| m.as_ref()) {
+                                    ui.label(format!("Model: {}", model_name));
+                                }
+                                ui.separator();
+                                let orig_id = tile.id;
+                                let orig_orient = tile.orientation;
+                                let orig_h = tile.height;
+                                let orig_w = tile.walkable;
+                                let mut tid = orig_id;
+                                let mut torient = orig_orient;
+                                let mut th = orig_h;
+                                let mut tw = orig_w;
+                                // Tile ID dropdown
+                                ui.label("Tile ID");
+                                let tile_palette: Vec<(i32, String)> = self.module.as_ref()
+                                    .map(|m| get_tile_palette(m, &area.tileset))
+                                    .unwrap_or_default();
+                                egui::ComboBox::from_id_source("tile_id_combo")
+                                    .selected_text(tile_palette.iter()
+                                        .find(|(id, _)| *id == tid)
+                                        .map(|(id, name)| format!("{}:{}", id, name))
+                                        .unwrap_or_else(|| format!("{}", tid)))
+                                    .width(180.0)
+                                    .show_ui(ui, |ui| {
+                                        for (pid, pname) in &tile_palette {
+                                            ui.selectable_value(&mut tid, *pid, format!("{}:{}", pid, pname));
+                                        }
+                                    });
+                                ui.horizontal(|ui| {
+                                    ui.label("Orientation");
+                                    ui.add(egui::DragValue::new(&mut torient).speed(1).range(0..=3));
+                                });
+                                ui.horizontal(|ui| {
+                                    ui.label("Height");
+                                    ui.add(egui::DragValue::new(&mut th).speed(1).range(0..=255));
+                                });
+                                ui.checkbox(&mut tw, "Walkable");
+                                if tid != orig_id || torient != orig_orient || th != orig_h || tw != orig_w {
+                                    tile_update = Some((tile_idx, tid, torient, th, tw));
+                                }
+                            }
+                        }
+                    }
+                });
+            if !tile_props_open {
+                self.selected_tile = None;
+            }
+        }
+
         // Handle position update from inspector
         if let Some((obj_type, obj_idx, px, py, pz, pb)) = pos_update {
             self.update_obj_pos(&obj_type, obj_idx, px, py, pz, pb);
@@ -4563,6 +5181,45 @@ impl eframe::App for AuroraBorealisApp {
         // Handle delete button
         if delete_requested {
             self.delete_selected_object();
+        }
+        // Handle tile property updates
+        if let Some((tile_idx, tid, torient, th, tw)) = tile_update {
+            self.push_undo();
+            let needs_rebuild = |area: &nwn_gamemodel::Area| -> bool {
+                area.tiles.get(tile_idx).map_or(false, |t| t.id != tid)
+            };
+            let same_id = self.current_area.as_ref().map_or(true, |a| !needs_rebuild(a));
+            if let Some(ref mut area) = self.current_area {
+                let area_mut = Arc::make_mut(area);
+                if tile_idx < area_mut.tiles.len() {
+                    area_mut.tiles[tile_idx].id = tid;
+                    area_mut.tiles[tile_idx].orientation = torient;
+                    area_mut.tiles[tile_idx].height = th;
+                    area_mut.tiles[tile_idx].walkable = tw;
+                    // Keep tile_models in sync
+                    if let Some(ref module) = self.module {
+                        if let Some(ts) = module.tileset_info(&area_mut.tileset) {
+                            if tile_idx < area_mut.tile_models.len() {
+                                area_mut.tile_models[tile_idx] = ts.tile_model(tid as u32).map(|s| s.to_string());
+                            }
+                        }
+                    }
+                    let resref = area_mut.resref.clone();
+                    if let Some(ref mut module) = self.module {
+                        module.update_area_are(&resref, area_mut);
+                    }
+                }
+            }
+            self.area_version = self.area_version.wrapping_add(1);
+            if same_id {
+                if let Some(ref area) = self.current_area {
+                    let col = tile_idx % area.width as usize;
+                    let row = tile_idx / area.width as usize;
+                    self.viewport.set_tile_transform(col, row, th, torient);
+                }
+            } else if let Some(ref area) = self.current_area {
+                self.viewport.set_area(area.clone(), self.area_version, target_format);
+            }
         }
         if inspector_modified {
             let obj_info = self.selected_obj_info.clone();
@@ -4598,24 +5255,42 @@ impl eframe::App for AuroraBorealisApp {
     }
 }
 
+fn current_rss_kb_inline() -> u64 {
+    if let Ok(data) = std::fs::read_to_string("/proc/self/status") {
+        for line in data.lines() {
+            if line.starts_with("VmRSS:") {
+                if let Some(val) = line.split_whitespace().nth(1) {
+                    if let Ok(kb) = val.parse::<u64>() {
+                        return kb;
+                    }
+                }
+            }
+        }
+    }
+    0
+}
+
 impl AuroraBorealisApp {
     fn load_module_at_path(&mut self, _p: &str) {
+        eprintln!("TRACE: load_module_at_path called with path='{}'", _p);
         #[cfg(not(target_arch = "wasm32"))]
         {
             let path = _p;
+            eprintln!("TRACE: before Module::open, RSS={} KB", current_rss_kb_inline());
             match nwn_gamemodel::Module::open(path) {
                 Ok(mut module) => {
                     let area_count = module.num_areas();
                     let module_name = module.name.clone();
-                    // Load hak 2DAs into resource manager for blueprint palette
+                    eprintln!("TRACE: after Module::open, before load_hak_2das, RSS={} KB", current_rss_kb_inline());
                     module.load_hak_2das();
-                    // Store module data for model loading
+                    module.preload_tilesets();
                     let data = std::fs::read(path).ok();
+                    eprintln!("TRACE: after preload, RSS={} KB", current_rss_kb_inline());
                     self.viewport.set_module_erf(data);
-                    self.viewport.set_hak_info(
-                        Some(std::path::Path::new(path).parent().unwrap_or(std::path::Path::new(".")).to_path_buf()),
-                        module.haks.clone(),
-                    );
+                    let hak_dir = std::path::Path::new(path).parent().map(|p| p.to_path_buf());
+                    if let Some(ref hd) = hak_dir {
+                        self.viewport.set_hak_info(Some(hd.clone()), module.haks.clone());
+                    }
                     self.module = Some(module);
                     self.current_area = None;
                     self.open_areas.clear();
@@ -4625,19 +5300,15 @@ impl AuroraBorealisApp {
                     self.selection_list.clear();
                     self.new_object_blueprints.clear();
                     self.status = format!("Loaded module '{}' with {} areas.", module_name, area_count);
+                    eprintln!("TRACE: module loaded, RSS={} KB", current_rss_kb_inline());
                 }
                 Err(nwn_gamemodel::ModelError::MissingHaks(haks)) => {
-                    let list = haks.join(", ");
-                    self.status = format!("Cannot load module — missing required hak files: {}", list);
+                    self.status = format!("Cannot load module — missing required hak files: {}", haks.join(", "));
                 }
                 Err(e) => {
                     self.status = format!("Failed to load module: {}", e);
                 }
             }
-        }
-        #[cfg(target_arch = "wasm32")]
-        {
-            self.status = "File system loading not available on web.".to_string();
         }
     }
 
@@ -4648,6 +5319,7 @@ impl AuroraBorealisApp {
                 let area_count = module.num_areas();
                 let module_name = module.name.clone();
                 module.load_hak_2das();
+                module.preload_tilesets();
                 self.viewport.set_module_erf(Some(data.to_vec()));
 
                 self.module = Some(module);
@@ -4685,43 +5357,70 @@ impl AuroraBorealisApp {
     }
 
     fn save_module_as(&mut self, path: &str) {
-        if let Some(ref mut module) = self.module {
-            let p = std::path::PathBuf::from(path);
-            module.path = p.clone();
-            match module.save_to(&p) {
-                Ok(_) => {
-                    self.status = format!("Module saved to '{}'.", path);
-                }
-                Err(e) => {
-                    self.status = format!("Failed to save module: {}", e);
-                }
-            }
-        }
+        if self.pending_save.is_some() { return; }
+        let mut module = match self.module.take() {
+            Some(m) => m,
+            None => { self.status = "No module loaded.".to_string(); return; }
+        };
+        let p = std::path::PathBuf::from(path);
+        module.path = p.clone();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        background_tasks::spawn_blocking(move || {
+            let result = module.save_to(&p).map_err(|e| e.to_string());
+            let _ = tx.send((module, result));
+        });
+        self.pending_save = Some(rx);
+        self.status = format!("Saving module...");
     }
 
     fn launch_nwn(&mut self) {
-        if let Some(ref module) = self.module {
-            let mod_name = format!("{}.mod", module.name);
-            let home = std::env::var("HOME").unwrap_or_default();
-            let nwn_modules = std::path::PathBuf::from(&home)
-                .join("Documents")
-                .join("Neverwinter Nights")
-                .join("modules")
-                .join(&mod_name);
+        // Generate test character BIC first (before mutable borrow on module)
+        let home = std::env::var("HOME").unwrap_or_default();
+        let localvault = std::path::PathBuf::from(&home)
+            .join(".local/share/Neverwinter Nights/localvault");
+        let _ = std::fs::create_dir_all(&localvault);
+        let select_bic = localvault.join("__.bic");
+        let nwn_root = std::env::var("NWN").unwrap_or_else(|_| {
+            "/home/grimshackle/.local/share/Steam/steamapps/common/Neverwinter Nights".to_string()
+        });
+        let nwn_binary = std::path::PathBuf::from(&nwn_root)
+            .join("bin/linux-x86/nwmain-linux");
+        let install_vault = std::path::PathBuf::from(&nwn_root)
+            .join("data/lcv/aluviandarkstar.bic");
+        self.create_launch_bic(&select_bic, Some(&install_vault));
 
+        if let Some(ref mut module) = self.module {
+            // Set the starting area to the currently open area
+            if let Some(ref area) = self.current_area {
+                module.entry_area = area.resref.clone();
+            }
+            // Inject test harness script (godmode, noclip visuals)
+            if let Ok(ncs_data) = std::fs::read("/tmp/_ts_test.ncs") {
+                module.compiled.insert("_ts_test".to_string(), ncs_data);
+                module.on_player_enter = "_ts_test".to_string();
+            } else {
+                self.status = "Warning: test harness script not found (_ts_test.ncs)".to_string();
+            }
+            // Save module so IFO is up-to-date, then copy to NWN dir
+            let mod_name = format!("{}.mod", module.name);
+            if let Err(e) = module.save() {
+                self.status = format!("Failed to save module before launch: {}", e);
+                return;
+            }
+            let nwn_modules = std::path::PathBuf::from(&home)
+                .join(".local/share/Neverwinter Nights/modules")
+                .join(&mod_name);
             if let Err(e) = std::fs::copy(&module.path, &nwn_modules) {
                 self.status = format!("Failed to copy module to NWN dir: {}", e);
                 return;
             }
-            let nwn_binary = std::path::PathBuf::from(
-                "/home/grimshackle/.local/share/Steam/steamapps/common/Neverwinter Nights/bin/linux-x86/nwmain-linux"
-            );
             if nwn_binary.exists() {
-                match std::process::Command::new(&nwn_binary)
-                    .arg("+load")
-                    .arg(&module.name)
-                    .spawn()
-                {
+                let nwn_dir = nwn_binary.parent().unwrap_or(std::path::Path::new("."));
+                let mut cmd = std::process::Command::new(&nwn_binary);
+                cmd.current_dir(nwn_dir)
+                    .arg("+TestNewModule")
+                    .arg(&module.name);
+                match cmd.spawn() {
                     Ok(child) => {
                         self.nwn_process_handle = Some(child);
                         self.status = format!("Launched NWN:EE with module '{}'", module.name);
@@ -4736,18 +5435,55 @@ impl AuroraBorealisApp {
         }
     }
 
-    fn compile_script(&mut self, name: &str, source: &str) {
-        let nwnsc_path = std::path::PathBuf::from(
-            std::env::current_exe().unwrap_or_default().parent().unwrap_or(std::path::Path::new("."))
-        ).join("nwnsc");
-        if !nwnsc_path.exists() {
-            self.status = "nwnsc binary not found alongside executable".to_string();
-            return;
+    fn create_launch_bic(&mut self, path: &std::path::Path, install_vault: Option<&std::path::Path>) {
+        let template = include_bytes!("test_character.bic");
+        match nwn_gff::GffFile::from_bytes(template) {
+            Ok(gff) => {
+                if let Err(e) = gff.write_to(path) {
+                    self.status = format!("Failed to write test character: {}", e);
+                }
+                if let Some(vault_path) = install_vault {
+                    if let Some(dir) = vault_path.parent() {
+                        let _ = std::fs::create_dir_all(dir);
+                    }
+                    // Remove all pregen BICs, then put ours
+                    if let Some(vault_dir) = vault_path.parent() {
+                        if let Ok(entries) = std::fs::read_dir(vault_dir) {
+                            for entry in entries.flatten() {
+                                let p = entry.path();
+                                if p.extension().is_some_and(|e| e == "bic") {
+                                    let _ = std::fs::remove_file(&p);
+                                }
+                            }
+                        }
+                    }
+                    let _ = std::fs::write(vault_path, template);
+                }
+            }
+            Err(e) => {
+                self.status = format!("Failed to parse test character template: {}", e);
+            }
         }
+    }
+
+    fn compile_script(&mut self, name: &str, source: &str) {
+        let nwnsc_path = nwnsc_exe();
         let tmp_dir = std::env::temp_dir().join("aurora_nwnsc");
+        let _ = std::fs::remove_dir_all(&tmp_dir);
         let _ = std::fs::create_dir_all(&tmp_dir);
+        for (nwnx_name, data) in NWNX_SCRIPTS {
+            let _ = std::fs::write(tmp_dir.join(nwnx_name), data);
+        }
         let nss_path = tmp_dir.join(format!("{}.nss", name));
         let ncs_path = tmp_dir.join(format!("{}.ncs", name));
+        // Write all NSS files so includes resolve
+        if let Some(ref module) = self.module {
+            for sn in module.script_names() {
+                if let Some(src) = module.get_script_source(sn) {
+                    let _ = std::fs::write(tmp_dir.join(format!("{}.nss", sn)), src);
+                }
+            }
+        }
         if std::fs::write(&nss_path, source).is_err() {
             self.status = format!("Failed to write temp NSS for '{}'", name);
             return;
@@ -4757,6 +5493,8 @@ impl AuroraBorealisApp {
         );
         let output = std::process::Command::new(&nwnsc_path)
             .arg("-n").arg(&nwn_install)
+            .arg("-e")
+            .arg("-i").arg(&tmp_dir)
             .arg("-q")
             .arg("-r").arg(&ncs_path)
             .arg(&nss_path)
@@ -4784,6 +5522,56 @@ impl AuroraBorealisApp {
             }
             Err(e) => {
                 self.status = format!("Failed to run nwnsc for '{}': {}", name, e);
+            }
+        }
+    }
+
+    fn check_pending_tasks(&mut self) {
+        if let Some(rx) = &mut self.pending_compile_all {
+            match rx.try_recv() {
+                Ok(result) => {
+                    self.pending_compile_all = None;
+                    self.compile_progress = None;
+                    let mut compiled = 0;
+                    for (name, ncs_data) in &result.results {
+                        if let Some(ref mut module) = self.module {
+                            module.update_ncs(name, ncs_data);
+                            module.modified = true;
+                            compiled += 1;
+                        }
+                    }
+                    let error_count = result.errors.len();
+                    if error_count > 0 {
+                        self.status = format!("Compiled {} scripts ({} errors).", compiled, error_count);
+                    } else {
+                        self.status = format!("Compiled {} scripts successfully.", compiled);
+                    }
+                }
+                Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
+                    self.pending_compile_all = None;
+                    self.compile_progress = None;
+                    self.status = "Compile task failed.".to_string();
+                }
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {}
+            }
+        }
+        if let Some(rx) = &mut self.pending_save {
+            match rx.try_recv() {
+                Ok((module, Ok(()))) => {
+                    self.pending_save = None;
+                    self.module = Some(module);
+                    self.status = format!("Module saved.");
+                }
+                Ok((module, Err(msg))) => {
+                    self.pending_save = None;
+                    self.module = Some(module);
+                    self.status = format!("Save failed: {}", msg);
+                }
+                Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
+                    self.pending_save = None;
+                    self.status = "Save task failed.".to_string();
+                }
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {}
             }
         }
     }
@@ -4867,6 +5655,7 @@ impl AuroraBorealisApp {
         };
         self.push_undo();
         let area = Arc::make_mut(self.current_area.as_mut().unwrap());
+        let mut changed_indices = Vec::new();
         let mut visited = vec![false; area.tiles.len()];
         let mut stack = vec![(col, row)];
         while let Some((cx, cy)) = stack.pop() {
@@ -4876,10 +5665,21 @@ impl AuroraBorealisApp {
             visited[ci] = true;
             if area.tiles[ci].id != old_id { continue; }
             area.tiles[ci].id = new_id;
+            changed_indices.push(ci);
             if cx > 0 { stack.push((cx - 1, cy)); }
             if cx + 1 < w { stack.push((cx + 1, cy)); }
             if cy > 0 { stack.push((cx, cy - 1)); }
             if cy + 1 < h { stack.push((cx, cy + 1)); }
+        }
+        // Update tile_models for changed tiles
+        if let Some(ref module) = self.module {
+            if let Some(ts) = module.tileset_info(&area.tileset) {
+                for &ci in &changed_indices {
+                    if ci < area.tile_models.len() {
+                        area.tile_models[ci] = ts.tile_model(new_id as u32).map(|s| s.to_string());
+                    }
+                }
+            }
         }
         let resref = area.resref.clone();
         if let Some(ref mut module) = self.module {
@@ -4895,39 +5695,40 @@ impl AuroraBorealisApp {
         let area = Arc::make_mut(self.current_area.as_mut().unwrap());
         let w = area.width as usize;
         let h = area.height as usize;
-        for y in 0..h {
-            for x in 0..w {
-                let idx = y * w + x;
-                let h_self = area.tiles[idx].height;
-                let mut downhill: Option<u8> = None;
-                let mut max_drop: i32 = 0;
-                let dirs: [(i32, i32, u8); 4] = [
-                    (0, -1, 0), (1, 0, 1), (0, 1, 2), (-1, 0, 3),
-                ];
-                for (dx, dy, dir) in dirs {
-                    let nx = x as i32 + dx;
-                    let ny = y as i32 + dy;
-                    if nx >= 0 && nx < w as i32 && ny >= 0 && ny < h as i32 {
-                        let ni = ny as usize * w + nx as usize;
-                        let nh = area.tiles[ni].height;
-                        let drop = h_self - nh;
-                        if drop > max_drop {
-                            max_drop = drop;
-                            downhill = Some(dir);
-                        }
+        let heights: Vec<i32> = area.tiles.iter().map(|t| t.height).collect();
+        use rayon::prelude::*;
+        area.tiles.par_iter_mut().enumerate().for_each(|(idx, tile)| {
+            let y = idx / w;
+            let x = idx % w;
+            let h_self = heights[idx];
+            let mut downhill: Option<u8> = None;
+            let mut max_drop: i32 = 0;
+            let dirs: [(i32, i32, u8); 4] = [
+                (0, -1, 0), (1, 0, 1), (0, 1, 2), (-1, 0, 3),
+            ];
+            for (dx, dy, dir) in dirs {
+                let nx = x as i32 + dx;
+                let ny = y as i32 + dy;
+                if nx >= 0 && nx < w as i32 && ny >= 0 && ny < h as i32 {
+                    let ni = ny as usize * w + nx as usize;
+                    let nh = heights[ni];
+                    let drop = h_self - nh;
+                    if drop > max_drop {
+                        max_drop = drop;
+                        downhill = Some(dir);
                     }
                 }
-                if let Some(dir) = downhill {
-                    area.tiles[idx].orientation = dir as i32;
-                }
             }
-        }
+            if let Some(dir) = downhill {
+                tile.orientation = dir as i32;
+            }
+        });
         let resref = area.resref.clone();
         if let Some(ref mut module) = self.module {
             module.update_area_are(&resref, area);
         }
         self.area_version = self.area_version.wrapping_add(1);
-        self.status = "Auto-oriented tiles to face downhill.".to_string();
+        self.status = "Auto-oriented tiles".to_string();
     }
 
     fn fill_area_tiles(&mut self, tile_id: i32) {
@@ -4936,6 +5737,13 @@ impl AuroraBorealisApp {
         let area = Arc::make_mut(self.current_area.as_mut().unwrap());
         for tile in area.tiles.iter_mut() {
             tile.id = tile_id;
+        }
+        // Keep tile_models in sync
+        let model_name = if let Some(ref module) = self.module {
+            module.tileset_info(&area.tileset).and_then(|ts| ts.tile_model(tile_id as u32).map(|s| s.to_string()))
+        } else { None };
+        if let Some(ref name) = model_name {
+            area.tile_models.iter_mut().for_each(|m| *m = Some(name.clone()));
         }
         let resref = area.resref.clone();
         if let Some(ref mut module) = self.module {
@@ -4958,14 +5766,9 @@ impl AuroraBorealisApp {
             show_lights: self.show_lights,
         };
         self.viewport.set_visibility_filter(filter);
-        if let Some(ref area) = self.current_area {
-            self.area_version = self.area_version.wrapping_add(1);
-            self.viewport.set_area(area.clone(), self.area_version, target_format);
-        }
     }
 
     fn switch_to_area(&mut self, name: &str, target_format: wgpu::TextureFormat) {
-        // No-op if already current
         if self.current_area.as_ref().map_or(false, |a| a.resref == name) {
             return;
         }
@@ -4983,6 +5786,7 @@ impl AuroraBorealisApp {
             self.selected_obj_info = None;
             self.selection_list.clear();
             self.selected_tile = None;
+            self.sync_area_sounds();
             self.status = format!("Loaded area '{}'.", name);
         }
     }
@@ -5025,6 +5829,7 @@ impl AuroraBorealisApp {
             self.selection_list.clear();
             self.status = "Undo".to_string();
             self.area_version = self.area_version.wrapping_add(1);
+            self.sync_area_sounds();
         } else {
             self.status = "Nothing to undo.".to_string();
         }
@@ -5042,8 +5847,37 @@ impl AuroraBorealisApp {
             self.selection_list.clear();
             self.status = "Redo".to_string();
             self.area_version = self.area_version.wrapping_add(1);
+            self.sync_area_sounds();
         } else {
             self.status = "Nothing to redo.".to_string();
+        }
+    }
+
+    fn sync_area_sounds(&self) {
+        if !self.sound_enabled { return; }
+        self.audio_system.stop_all();
+        let Some(ref module) = self.module else { return };
+        let Some(ref area) = self.current_area else { return };
+        eprintln!("sync_area_sounds: {} emitters", area.sound_emitters.len());
+        for emitter in &area.sound_emitters {
+            eprintln!("  emitter tag='{}' sounds={:?}", emitter.tag, emitter.sounds);
+            if let Some(sound_resref) = emitter.sounds.first() {
+                let id = format!("sound_{}", sound_resref);
+                if let Some(data) = module.get_resource_data(sound_resref, resource_types::WAV) {
+                    eprintln!("  found WAV '{}' ({} bytes)", sound_resref, data.len());
+                    self.audio_system.play_wav(&id, &data, true);
+                } else if let Some(mut data) = module.get_resource_data(sound_resref, resource_types::BMU) {
+                    eprintln!("  found BMU '{}' ({} bytes)", sound_resref, data.len());
+                    // Strip BMU V1.0 header (8 bytes) to expose raw MP3
+                    if data.len() > 8 && &data[..8] == b"BMU V1.0" {
+                        data = data[8..].to_vec();
+                        eprintln!("  stripped BMU header, {} bytes remaining", data.len());
+                    }
+                    self.audio_system.play_wav(&id, &data, true);
+                } else {
+                    eprintln!("  no WAV or BMU found for '{}'", sound_resref);
+                }
+            }
         }
     }
 
@@ -5073,18 +5907,33 @@ impl AuroraBorealisApp {
                     self.status = format!("Cannot copy {} objects yet", obj_type);
                 }
             }
+        } else if let Some((tile_col, tile_row)) = self.selected_tile {
+            if let Some(ref area) = self.current_area {
+                let idx = tile_row * area.width as usize + tile_col;
+                if let Some(tile) = area.tiles.get(idx) {
+                    self.status = format!("Copied tile ({},{}) id {}", tile_col, tile_row, tile.id);
+                    self.clipboard = Some(ObjectClipboard {
+                        obj_type: "tile".to_string(),
+                        resref: tile.id.to_string(),
+                        tag: String::new(),
+                        bearing: 0.0,
+                        bag: Default::default(),
+                    });
+                }
+            }
         } else {
-            self.status = "No object selected to copy.".to_string();
+            self.status = "No object or tile selected to copy.".to_string();
         }
     }
 
-    fn paste_object(&mut self) {
+    fn paste_object(&mut self, target_format: wgpu::TextureFormat) {
         self.push_undo();
+        let (cam_x, cam_y, cam_z) = self.viewport.camera_state()
+            .map(|cam| (cam.target[0], -cam.target[2], cam.target[1]))
+            .unwrap_or((0.0, 0.0, 0.0));
         let snap_enabled = self.snap_to_grid_enabled;
         let snap_value = self.snap_to_grid_value;
         if let Some(ref clip) = self.clipboard.clone() {
-            let offset_x = 2.0;
-            let offset_y = 2.0;
             if let Some(area) = self.current_area.as_mut() {
                 let area = Arc::make_mut(area);
                 let tag = format!("{}_{}", clip.obj_type, clip.resref);
@@ -5092,52 +5941,65 @@ impl AuroraBorealisApp {
                     "creature" => {
                         let mut inst = nwn_gamemodel::CreatureInstance::from_property_bag(&clip.bag);
                         inst.tag = tag;
-                        let (sx, sy) = snap_to_grid_pos(inst.x + offset_x, inst.y + offset_y, snap_enabled, snap_value);
-                        inst.x = sx; inst.y = sy;
+                        let (sx, sy) = snap_to_grid_pos(cam_x, cam_y, snap_enabled, snap_value);
+                        inst.x = sx; inst.y = sy; inst.z = cam_z;
+                        if inst.model_name.is_none() {
+                            if let Some(ref module) = self.module {
+                                inst.model_name = module.resolve_creature_model(inst.appearance, &inst.resref);
+                            }
+                        }
                         area.creatures.push(inst);
                     }
                     "door" => {
                         let mut inst = nwn_gamemodel::DoorInstance::from_property_bag(&clip.bag);
                         inst.tag = tag;
-                        let (sx, sy) = snap_to_grid_pos(inst.x + offset_x, inst.y + offset_y, snap_enabled, snap_value);
-                        inst.x = sx; inst.y = sy;
+                        let (sx, sy) = snap_to_grid_pos(cam_x, cam_y, snap_enabled, snap_value);
+                        inst.x = sx; inst.y = sy; inst.z = cam_z;
+                        if inst.model_name.is_none() {
+                            if let Some(ref module) = self.module {
+                                inst.model_name = module.resolve_door_model(inst.appearance, &inst.resref);
+                            }
+                        }
                         area.doors.push(inst);
                     }
                     "placeable" => {
                         let mut inst = nwn_gamemodel::PlaceableInstance::from_property_bag(&clip.bag);
                         inst.tag = tag;
-                        let (sx, sy) = snap_to_grid_pos(inst.x + offset_x, inst.y + offset_y, snap_enabled, snap_value);
-                        inst.x = sx; inst.y = sy;
+                        let (sx, sy) = snap_to_grid_pos(cam_x, cam_y, snap_enabled, snap_value);
+                        inst.x = sx; inst.y = sy; inst.z = cam_z;
+                        if inst.model_name.is_none() {
+                            if let Some(ref module) = self.module {
+                                inst.model_name = module.resolve_placeable_model(inst.appearance, &inst.resref);
+                            }
+                        }
                         area.placeables.push(inst);
                     }
                     "trigger" => {
                         let mut inst = nwn_gamemodel::TriggerInstance::from_property_bag(&clip.bag);
                         inst.tag = tag;
-                        let (sx, sy) = snap_to_grid_pos(inst.x + offset_x, inst.y + offset_y, snap_enabled, snap_value);
-                        inst.x = sx; inst.y = sy;
+                        let (sx, sy) = snap_to_grid_pos(cam_x, cam_y, snap_enabled, snap_value);
+                        inst.x = sx; inst.y = sy; inst.z = cam_z;
                         area.triggers.push(inst);
                     }
                     "waypoint" => {
                         let mut inst = nwn_gamemodel::WayPointInstance::from_property_bag(&clip.bag);
                         inst.tag = tag;
-                        let (sx, sy) = snap_to_grid_pos(inst.x + offset_x, inst.y + offset_y, snap_enabled, snap_value);
-                        inst.x = sx; inst.y = sy;
+                        let (sx, sy) = snap_to_grid_pos(cam_x, cam_y, snap_enabled, snap_value);
+                        inst.x = sx; inst.y = sy; inst.z = cam_z;
                         area.waypoints.push(inst);
                     }
                     "encounter" => {
                         let mut inst = nwn_gamemodel::EncounterInstance::from_property_bag(&clip.bag);
                         inst.tag = tag;
-                        let (sx, sy) = snap_to_grid_pos(inst.x + offset_x, inst.y + offset_y, snap_enabled, snap_value);
-                        inst.x = sx; inst.y = sy;
+                        let (sx, sy) = snap_to_grid_pos(cam_x, cam_y, snap_enabled, snap_value);
+                        inst.x = sx; inst.y = sy; inst.z = cam_z;
                         area.encounters.push(inst);
                     }
                     "sound_emitter" => {
                         let mut inst = nwn_gamemodel::SoundEmitterInstance::from_property_bag(&clip.bag);
                         inst.tag = tag;
-                        if self.snap_to_grid_enabled {
-                            let (sx, sy) = snap_to_grid_pos(inst.x, inst.y, true, self.snap_to_grid_value);
-                            inst.x = sx; inst.y = sy;
-                        }
+                        let (sx, sy) = snap_to_grid_pos(cam_x, cam_y, snap_enabled, snap_value);
+                        inst.x = sx; inst.y = sy; inst.z = cam_z;
                         area.sound_emitters.push(inst);
                     }
                     _ => {
@@ -5154,6 +6016,9 @@ impl AuroraBorealisApp {
                 self.selected_obj_info = None;
                 self.selection_list.clear();
                 self.status = format!("Pasted {} '{}'", clip.obj_type, clip.resref);
+            }
+            if let Some(ref area) = self.current_area {
+                self.viewport.set_area(area.clone(), self.area_version, target_format);
             }
         } else {
             self.status = "Nothing to paste. Copy an object first.".to_string();
@@ -5427,9 +6292,11 @@ fn select_single_object(
     module: Option<&nwn_gamemodel::Module>,
     selected_object: &mut Option<SelectedObject>,
     selected_obj_info: &mut Option<(String, usize)>,
+    selected_tile: &mut Option<(usize, usize)>,
     obj_type: &str,
     idx: usize,
 ) {
+    *selected_tile = None;
     let bag = match obj_type {
         "creature" => area.creatures.get(idx).map(|c| (format!("Creature: {}", c.resref), c.to_property_bag())),
         "door" => area.doors.get(idx).map(|d| (format!("Door: {}", d.resref), d.to_property_bag())),
@@ -5552,7 +6419,7 @@ pub fn run_native() {
         viewport: egui::ViewportBuilder::default().with_inner_size([1400.0, 900.0]),
         wgpu_options: egui_wgpu::WgpuConfiguration {
             desired_maximum_frame_latency: Some(3),
-            present_mode: wgpu::PresentMode::AutoNoVsync,
+            present_mode: wgpu::PresentMode::AutoVsync,
             ..Default::default()
         },
         ..Default::default()

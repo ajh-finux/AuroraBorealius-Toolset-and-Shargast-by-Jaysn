@@ -14,6 +14,7 @@ pub struct Module {
     pub name: String,
     pub description: String,
     pub entry_area: String,
+    pub on_player_enter: String,
     pub tag: String,
     pub haks: Vec<String>,
     pub modified_area_data: HashMap<String, Vec<u8>>,
@@ -33,6 +34,9 @@ pub struct Module {
     pub resource_manager: ResourceManager,
     pub modified: bool,
     pub hak_index: std::sync::OnceLock<nwn_tileset::HakIndex>,
+    pub game_data: Option<crate::game_data::GameData>,
+    cached_all_tags: std::cell::RefCell<Option<Vec<String>>>,
+    cached_resref_list: std::cell::RefCell<Option<Vec<String>>>,
 }
 
 struct AreaCache {
@@ -104,6 +108,7 @@ impl Module {
             name: name.to_string(),
             description: String::new(),
             entry_area: String::new(),
+            on_player_enter: String::new(),
             tag: name.to_string(),
             haks: Vec::new(),
             modified_area_data: std::collections::HashMap::new(),
@@ -123,6 +128,9 @@ impl Module {
             resource_manager: crate::ResourceManager::new(),
             modified: false,
             hak_index: std::sync::OnceLock::new(),
+            game_data: None,
+            cached_all_tags: std::cell::RefCell::new(None),
+            cached_resref_list: std::cell::RefCell::new(None),
         }
     }
 
@@ -193,6 +201,7 @@ impl Module {
         let name = ifo.get_string("Mod_Name").unwrap_or_default();
         let description = ifo.get_string("Mod_Description").unwrap_or_default();
         let entry_area = ifo.get_string("Mod_Entry_Area").unwrap_or_default();
+        let on_player_enter = ifo.get_string("Mod_OnPlayerEnter").unwrap_or_default();
         let tag = ifo.get_string("Mod_Tag").unwrap_or_default();
 
         let mut haks = Vec::new();
@@ -253,6 +262,7 @@ impl Module {
             name,
             description,
             entry_area,
+            on_player_enter,
             tag,
             haks,
             modified_area_data: HashMap::new(),
@@ -272,6 +282,9 @@ impl Module {
             resource_manager,
             modified: false,
             hak_index: std::sync::OnceLock::new(),
+            game_data: crate::game_data::GameData::new(),
+            cached_all_tags: std::cell::RefCell::new(None),
+            cached_resref_list: std::cell::RefCell::new(None),
         })
     }
 
@@ -319,23 +332,25 @@ impl Module {
         if unique_tilesets.is_empty() {
             return;
         }
+        eprintln!("TRACE: preloading {} unique tilesets", unique_tilesets.len());
+        let set_type = nwn_lib_rs::erf::ResourceType::Set as u16;
         use rayon::prelude::*;
+        // Only the module-ERF check runs in parallel (zero-copy, no I/O).
+        // The fallback (find_and_load_tileset, which opens hak files from disk)
+        // is serialized via a Mutex so threads don't collide on memory.
+        let fallback_lock = std::sync::Mutex::new(());
         let results: Vec<_> = unique_tilesets.par_iter().map(|ts_key| {
+            if let Some(ref erf) = self.erf {
+                if let Some(data) = erf.get(ts_key, set_type) {
+                    if let Ok(ts) = nwn_tileset::Tileset::from_bytes(ts_key, &data) {
+                        return (ts_key.clone(), Ok(Some(ts)));
+                    }
+                }
+            }
+            let _guard = fallback_lock.lock().unwrap();
             let result = nwn_tileset::find_and_load_tileset(ts_key, &self.path, &self.haks);
             (ts_key.clone(), result)
         }).collect();
-        for (key, result) in results {
-            let cached = match result {
-                Ok(Some(ts)) => {
-                    eprintln!("Loaded tileset '{}' with {} tile models", key, ts.tiles.len());
-                    ts
-                }
-                _ => {
-                    nwn_tileset::Tileset { name: key.clone(), tiles: std::collections::HashMap::new() }
-                }
-            };
-            self.tileset_cache.borrow_mut().insert(key, cached);
-        }
     }
 
     pub fn get_area(&self, name: &str) -> Option<Arc<Area>> {
@@ -420,7 +435,6 @@ impl Module {
         let mod_dir = self.path.parent();
         let mod_dir_path = mod_dir.unwrap_or(Path::new("."));
         let hak_index = nwn_tileset::HakIndex::new(mod_dir_path, &self.haks);
-        eprintln!("  DEBUG haks: {:?}", self.haks);
 
         for p in &mut area.placeables {
             p.model_name = if p.appearance >= 0 {
@@ -433,16 +447,35 @@ impl Module {
             // Fall back to .utp template ModelName (ERF → haks → game data)
             if p.model_name.is_none() || p.model_name.as_deref() == Some("USER") {
                 let utp_data = erf.get(&p.resref, resource_types::UTP)
-                    .or_else(|| hak_index.get_resource_from_path(&p.resref, resource_types::UTP, mod_dir_path));
+                    .or_else(|| hak_index.get_resource_from_path(&p.resref, resource_types::UTP, mod_dir_path))
+                    .or_else(|| {
+                        let dir = nwn_tileset::game_data_dir()?;
+                        let r = nwnrs_types::resman::ResRef::new(
+                            p.resref.to_lowercase(),
+                            nwnrs_types::resman::ResType(resource_types::UTP),
+                        ).ok()?;
+                        nwn_tileset::load_resource_from_key(&r, &dir).ok().flatten()
+                    });
                 if let Some(data) = utp_data {
                     if let Ok(gff) = nwn_gff::GffFile::from_bytes(&data) {
                         let utp_model = gff.get_string("ModelName").ok();
-                        if utp_model.is_some() && utp_model.as_deref() != Some("USER") {
-                            p.model_name = utp_model;
-                            eprintln!("  DEBUG placeable '{}' model from .utp -> '{}'", p.resref, p.model_name.as_ref().unwrap());
-                        }
+                            if utp_model.is_some() && utp_model.as_deref() != Some("USER") {
+                                    p.model_name = utp_model;
+                                }
                     }
                 }
+            }
+            // Last resort: if model name is still missing or "USER", use a base-game placeable model
+            if p.model_name.as_deref().map_or(true, |n| n == "USER") {
+                let pool = [
+                    "PLC_A01", "PLC_A02", "PLC_A03", "PLC_A04", "PLC_A05",
+                    "PLC_A06", "PLC_A07", "PLC_A08", "PLC_A09", "PLC_A10",
+                    "PLC_B01", "PLC_B02", "PLC_B03", "PLC_B04", "PLC_B05",
+                    "PLC_O01", "PLC_O02", "PLC_O03", "PLC_O04", "PLC_O05",
+                ];
+                let hash: u64 = p.resref.bytes().fold(314159u64, |h, b| h.wrapping_mul(2654435761).wrapping_add(b as u64));
+                let idx = (hash as usize) % pool.len();
+                p.model_name = Some(pool[idx].to_string());
             }
         }
         for d in &mut area.doors {
@@ -499,7 +532,6 @@ impl Module {
                         // If still no appearance, try ModelName directly from .utc
                         if creature_appearance < 0 {
                             if let Ok(m) = gff.get_string("ModelName") {
-                                eprintln!("  DEBUG creature '{}' model from .utc.ModelName -> '{}'", c.resref, m);
                                 c.model_name = Some(m);
                             }
                         }
@@ -534,63 +566,7 @@ impl Module {
             }
         }
 
-        // Debug: show resolved model names
-        {
-            let p_count = area.placeables.iter().filter(|p| p.model_name.is_some()).count();
-            let d_count = area.doors.iter().filter(|d| d.model_name.is_some()).count();
-            let c_count = area.creatures.iter().filter(|c| c.model_name.is_some()).count();
-            eprintln!(
-                "DEBUG area '{}': {} placeables ({} have model), {} doors ({} have model), {} creatures ({} have model)",
-                name, area.placeables.len(), p_count, area.doors.len(), d_count, area.creatures.len(), c_count
-            );
-            // Check if HakIndex found the key 2DAs
-            let hak_has_placeables = hak_index.find_haks("placeables", 2017).is_some();
-            let hak_has_doortypes = hak_index.find_haks("doortypes", 2017).is_some();
-            let hak_has_genericdoors = hak_index.find_haks("genericdoors", 2017).is_some();
-            let hak_has_appearance = hak_index.find_haks("appearance", 2017).is_some();
-            eprintln!("  DEBUG HakIndex: placeables={} doortypes={} genericdoors={} appearance={}",
-                hak_has_placeables, hak_has_doortypes, hak_has_genericdoors, hak_has_appearance);
-            eprintln!("  DEBUG HakIndex allcaps: placeables={} doortypes={} genericdoors={} appearance={}",
-                hak_index.find_haks("PLACEABLES", 2017).is_some(),
-                hak_index.find_haks("DOORTYPES", 2017).is_some(),
-                hak_index.find_haks("GENERICDOORS", 2017).is_some(),
-                hak_index.find_haks("APPEARANCE", 2017).is_some());
-            // Also check if module ERF has them
-            let erf_has_placeables = erf.get("placeables", 2017).is_some();
-            let erf_has_doortypes = erf.get("doortypes", 2017).is_some();
-            let erf_has_genericdoors = erf.get("genericdoors", 2017).is_some();
-            let erf_has_appearance = erf.get("appearance", 2017).is_some();
-            eprintln!("  DEBUG ERF: placeables={} doortypes={} genericdoors={} appearance={}",
-                erf_has_placeables, erf_has_doortypes, erf_has_genericdoors, erf_has_appearance);
-            for p in &area.placeables {
-                if let Some(ref m) = p.model_name {
-                    eprintln!("  DEBUG placeable '{}' appearance={} -> model='{}'", p.resref, p.appearance, m);
-                }
-            }
-            for d in &area.doors {
-                if let Some(ref m) = d.model_name {
-                    eprintln!("  DEBUG door '{}' appearance={} -> model='{}'", d.resref, d.appearance, m);
-                } else {
-                    // Check GenericType from .utd
-                    let gt = erf.get(&d.resref, resource_types::UTD).and_then(|data| {
-                        nwn_gff::GffFile::from_bytes(&data).ok()
-                            .and_then(|gff| gff.get_int("GenericType").ok())
-                    });
-                    eprintln!("  DEBUG door '{}' appearance={} generic_type={:?} NO MODEL", d.resref, d.appearance, gt);
-                }
-            }
-            for c in &area.creatures {
-                if let Some(ref m) = c.model_name {
-                    eprintln!("  DEBUG creature '{}' appearance={} -> model='{}'", c.resref, c.appearance, m);
-                } else {
-                    let utc_app = erf.get(&c.resref, resource_types::UTC).and_then(|data| {
-                        nwn_gff::GffFile::from_bytes(&data).ok()
-                            .and_then(|gff| gff.get_int("Appearance").ok())
-                    });
-                    eprintln!("  DEBUG creature '{}' appearance={} utc_appearance={:?} NO MODEL", c.resref, c.appearance, utc_app);
-                }
-            }
-        }
+
 
         let arc = Arc::new(area);
         self.area_cache.borrow_mut().insert(name.to_string(), arc.clone());
@@ -620,6 +596,7 @@ impl Module {
     pub fn update_ncs(&mut self, name: &str, ncs_data: &[u8]) {
         self.compiled.insert(name.to_string(), ncs_data.to_vec());
         self.modified = true;
+        self.invalidate_caches();
     }
 
     pub fn update_2da(&mut self, name: &str, data: &str) {
@@ -636,11 +613,174 @@ impl Module {
         crate::Conversation::from_gff(&gff).ok()
     }
 
+    pub fn invalidate_caches(&self) {
+        *self.cached_all_tags.borrow_mut() = None;
+        *self.cached_resref_list.borrow_mut() = None;
+    }
+
+    /// Evict all CPU-side memory caches (areas, tilesets, tag/resref caches) to free RAM.
+    pub fn evict_memory_caches(&self) {
+        self.area_cache.borrow_mut().entries.clear();
+        self.area_cache.borrow_mut().order.clear();
+        self.tileset_cache.borrow_mut().clear();
+        self.tileset_order.borrow_mut().clear();
+        *self.cached_all_tags.borrow_mut() = None;
+        *self.cached_resref_list.borrow_mut() = None;
+    }
+
     pub fn update_area_git(&mut self, resref: &str, area: &Area) {
         let gff = build_git_gff(area);
         let data = gff.to_bytes();
         self.raw_git.insert(resref.trim().to_lowercase(), data);
         self.modified = true;
+        self.invalidate_caches();
+    }
+
+    /// Resolve model name for a creature by appearance ID.
+    /// Uses the same chain as area loading: ERF lookup → hak 2da → .utc → fallback pool.
+    pub fn resolve_creature_model(&self, appearance: i32, resref: &str) -> Option<String> {
+        let erf = self.erf.as_ref()?;
+        let mut creature_appearance = appearance;
+        if creature_appearance < 0 {
+            let utc_data = erf.get(resref, resource_types::UTC)
+                .or_else(|| {
+                    let mod_dir = self.path.parent()?;
+                    self.get_hak_index().get_resource_from_path(resref, resource_types::UTC, mod_dir)
+                })
+                .or_else(|| {
+                    let dir = nwn_tileset::game_data_dir()?;
+                    let r = nwnrs_types::resman::ResRef::new(
+                        resref.to_lowercase(),
+                        nwnrs_types::resman::ResType(resource_types::UTC),
+                    ).ok()?;
+                    nwn_tileset::load_resource_from_key(&r, &dir).ok().flatten()
+                });
+            if let Some(data) = utc_data {
+                if let Ok(gff) = nwn_gff::GffFile::from_bytes(&data) {
+                    creature_appearance = gff.get_int("Appearance").unwrap_or(-1);
+                    if creature_appearance < 0 {
+                        if let Ok(m) = gff.get_string("ModelName") {
+                            return Some(m);
+                        }
+                    }
+                }
+            }
+        }
+        if creature_appearance < 0 {
+            creature_appearance = 0;
+        }
+        let mut name = nwn_tileset::lookup_creature_model(creature_appearance, &[erf]);
+        if name.is_none() {
+            let hak_index = self.get_hak_index();
+            if let Some(mod_dir) = self.path.parent() {
+                name = hak_index.parse_2da_across_haks("appearance", creature_appearance, "ModelName", mod_dir);
+                if name.is_none() {
+                    name = hak_index.find_creature_across_haks(creature_appearance, mod_dir);
+                }
+            }
+        }
+        if name.as_deref().map_or(true, |n| n.is_empty() || n.len() <= 2) {
+            // Also try the appearance 2da from resource_manager
+            if let Some(two_da) = self.resource_manager.get_2da("appearance") {
+                let model = two_da.get_cell_by_label(creature_appearance as usize, "Model");
+                if let Some(m) = model {
+                    if !m.is_empty() && m.len() > 2 {
+                        return Some(m.to_string());
+                    }
+                }
+            }
+            let pool = [
+                "c_gnoll", "c_goblinx", "c_basilisk", "c_cat_mpanth",
+                "c_direrat", "c_rat", "c_spidgiant", "c_wagn2",
+                "c_wagn3", "c_behold", "c_jelly", "c_wingbat",
+                "c_wingbut", "c_wyrmlblk", "c_drider", "c_manticore",
+            ];
+            let hash: u64 = resref.bytes()
+                .chain(appearance.to_le_bytes().iter().copied())
+                .fold(314159u64, |h, b| h.wrapping_mul(2654435761).wrapping_add(b as u64));
+            Some(pool[(hash as usize) % pool.len()].to_string())
+        } else { name }
+    }
+
+    /// Resolve model name for a placeable by appearance ID.
+    /// Uses: ERF lookup → hak 2da → .utp → fallback pool.
+    pub fn resolve_placeable_model(&self, appearance: i32, resref: &str) -> Option<String> {
+        let erf = self.erf.as_ref()?;
+        let mut name = if appearance >= 0 {
+            nwn_tileset::lookup_placeable_model(appearance, &[erf])
+        } else { None };
+        if name.as_ref().map_or(true, |n| n == "USER" || n.is_empty()) {
+            let hak_index = self.get_hak_index();
+            if let Some(mod_dir) = self.path.parent() {
+                name = hak_index.parse_2da_across_haks("placeables", appearance, "ModelName", mod_dir);
+            }
+        }
+        if name.as_ref().map_or(true, |n| n == "USER" || n.is_empty()) {
+            if let Some(data) = erf.get(resref, resource_types::UTP)
+                .or_else(|| {
+                    let hak_index = self.get_hak_index();
+                    let mod_dir = self.path.parent()?;
+                    hak_index.get_resource_from_path(resref, resource_types::UTP, mod_dir)
+                })
+            {
+                if let Ok(gff) = nwn_gff::GffFile::from_bytes(&data) {
+                    if let Ok(m) = gff.get_string("ModelName") {
+                        return Some(m);
+                    }
+                }
+            }
+        }
+        if name.as_ref().map_or(true, |n| n == "USER" || n.is_empty()) {
+            let pool = [
+                "PLC_A01", "PLC_A02", "PLC_A03", "PLC_A04", "PLC_A05",
+                "PLC_A06", "PLC_A07", "PLC_A08", "PLC_A09", "PLC_A10",
+                "PLC_B01", "PLC_B02", "PLC_B03", "PLC_B04", "PLC_B05",
+                "PLC_O01", "PLC_O02", "PLC_O03", "PLC_O04", "PLC_O05",
+            ];
+            let hash: u64 = resref.bytes().fold(314159u64, |h, b| h.wrapping_mul(2654435761).wrapping_add(b as u64));
+            Some(pool[(hash as usize) % pool.len()].to_string())
+        } else { name }
+    }
+
+    /// Resolve model name for a door by appearance ID.
+    /// Uses: ERF lookup → hak 2da → .utd → fallback pool.
+    pub fn resolve_door_model(&self, appearance: i32, resref: &str) -> Option<String> {
+        let erf = self.erf.as_ref()?;
+        let mut generic_type: Option<i32> = None;
+        let mut name = if appearance > 0 {
+            nwn_tileset::lookup_door_model(appearance, None, &[erf])
+        } else { None };
+        if name.is_none() {
+            let hak_index = self.get_hak_index();
+            if let Some(mod_dir) = self.path.parent() {
+                name = hak_index.parse_2da_across_haks("doortypes", appearance, "ModelName", mod_dir);
+                if name.is_none() && appearance <= 0 {
+                    if let Some(data) = erf.get(resref, resource_types::UTD)
+                        .or_else(|| {
+                            let hak_index = self.get_hak_index();
+                            let mod_dir = self.path.parent()?;
+                            hak_index.get_resource_from_path(resref, resource_types::UTD, mod_dir)
+                        })
+                    {
+                        if let Ok(gff) = nwn_gff::GffFile::from_bytes(&data) {
+                            let ga = gff.get_int("GenericType").ok();
+                            if let Some(g) = ga { generic_type = Some(g); }
+                            name = gff.get_string("ModelName").ok();
+                            if name.is_none() && appearance <= 0 {
+                                name = if let Some(g) = generic_type {
+                                    hak_index.parse_2da_across_haks("genericdoors", g, "ModelName", mod_dir)
+                                } else { None };
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if name.as_ref().map_or(true, |n| n.is_empty()) {
+            let pool = ["doortype_home001", "doortype_home011", "doortype_castle002", "doortype_keep002"];
+            let hash: u64 = resref.bytes().fold(314159u64, |h, b| h.wrapping_mul(2654435761).wrapping_add(b as u64));
+            Some(pool[(hash as usize) % pool.len()].to_string())
+        } else { name }
     }
 
     pub fn has_fac(&self) -> bool {
@@ -674,11 +814,14 @@ impl Module {
         let data = gff.to_bytes();
         self.conversations.insert(name.to_string(), data);
         self.modified = true;
+        self.invalidate_caches();
     }
 
     pub fn update_blueprint(&mut self, resref: &str, restype: u16, data: Vec<u8>) {
-        self.blueprints.insert((resref.trim().to_lowercase(), restype), data);
+        let key = (resref.trim().to_lowercase(), restype);
+        self.blueprints.insert(key, data);
         self.modified = true;
+        self.invalidate_caches();
     }
 
     pub fn update_tlk(&mut self, tlk_index: usize, data: Vec<u8>) {
@@ -694,6 +837,56 @@ impl Module {
     pub fn update_script(&mut self, name: &str, source: &str) {
         self.scripts.insert(name.to_string(), source.as_bytes().to_vec());
         self.modified = true;
+        self.invalidate_caches();
+    }
+
+    pub fn all_tags(&self) -> Vec<String> {
+        let mut cached = self.cached_all_tags.borrow_mut();
+        if let Some(ref tags) = *cached {
+            return tags.clone();
+        }
+        fn extract_tags_from_list(list: &[nwn_gff::Struct], tags: &mut std::collections::HashSet<String>) {
+            for entry in list {
+                if let Some(nwn_gff::FieldValue::String(tag)) = entry.find("Tag") {
+                    if !tag.is_empty() {
+                        tags.insert(tag.clone());
+                    }
+                }
+            }
+        }
+        let mut tags = std::collections::HashSet::new();
+        for (_, data) in &self.raw_git {
+            if let Ok(gff) = nwn_gff::GffFile::from_bytes(data) {
+                for list_name in &["Creature_List", "Creature List", "Door_List", "Door List",
+                                   "Placeable_List", "Placeable List", "Trigger_List", "TriggerList",
+                                   "Waypoint_List", "WaypointList", "Encounter_List", "Encounter List",
+                                   "SoundList", "Sound_List", "LightList", "Light_List"] {
+                    if let Some(fv) = gff.root().find(list_name) {
+                        if let nwn_gff::FieldValue::List(list) = fv {
+                            extract_tags_from_list(list, &mut tags);
+                        }
+                    }
+                }
+            }
+        }
+        let mut sorted: Vec<String> = tags.into_iter().collect();
+        sorted.sort();
+        *cached = Some(sorted.clone());
+        sorted
+    }
+
+    pub fn all_resref_names(&self) -> Vec<String> {
+        let mut cached = self.cached_resref_list.borrow_mut();
+        if let Some(ref names) = *cached {
+            return names.clone();
+        }
+        let mut names: Vec<String> = self.resource_list().iter()
+            .map(|(r, _)| r.clone())
+            .collect();
+        names.sort();
+        names.dedup();
+        *cached = Some(names.clone());
+        names
     }
 
     pub fn update_area_are(&mut self, resref: &str, area: &Area) {
@@ -870,7 +1063,16 @@ impl Module {
                     .or_else(|| erf_fallback(&name))
             }
         };
-        result.or_else(|| hak_fallback(&name))
+        result.or_else(|| hak_fallback(&name)).or_else(|| {
+            if restype == resource_types::WAV || restype == resource_types::BMU {
+                let res = self.game_data.as_ref().and_then(|gd| gd.get_resource(&name, restype));
+                if res.is_some() { eprintln!("get_resource_data: found via game_data"); }
+                else { eprintln!("get_resource_data: game_data lookup failed for '{}.{}'", name, restype); }
+                res
+            } else {
+                None
+            }
+        })
     }
 
     /// Get or create the hak index (lazily initialized).
@@ -903,6 +1105,10 @@ impl Module {
             if let Some(data) = hak_index.get_resource(name, 2017, mod_dir) {
                 if let Ok(s) = std::str::from_utf8(&data) {
                     let _ = self.resource_manager.load_2da(name, s);
+                }
+            } else if let Some(data) = self.game_data.as_ref().and_then(|gd| gd.get_resource(name, 2017)) {
+                if let Ok(s) = String::from_utf8(data) {
+                    let _ = self.resource_manager.load_2da(name, &s);
                 }
             }
         }
@@ -944,6 +1150,7 @@ impl Module {
                 *s = self.tag.clone();
             }
         }
+        set_or_add_ifo(ifo_struct, "Mod_OnPlayerEnter", nwn_lib_rs::gff::FieldValue::ResRef(self.on_player_enter.clone()));
         // Write IFO
         let ifo_bytes = self.ifo.to_bytes();
         erf.add_resource("module", resource_types::IFO, ifo_bytes);
@@ -1064,6 +1271,15 @@ fn check_missing_haks(haks: &[String], module_path: &Path) -> Vec<String> {
 fn make_field(label: &str, value: nwn_gff::FieldValue) -> nwn_gff::Field {
     let fss: nwn_lib_rs::parsing::FixedSizeString<16> = std::str::FromStr::from_str(label).unwrap_or_default();
     nwn_gff::Field { label: std::rc::Rc::new(fss), value }
+}
+
+fn set_or_add_ifo(root: &mut nwn_gff::Struct, label: &str, value: nwn_gff::FieldValue) {
+    let label_trim = label.trim().to_string();
+    if let Some(idx) = root.fields.iter().position(|f| f.label.as_str().trim() == label_trim) {
+        root.fields[idx].value = value;
+    } else {
+        root.fields.push(make_field(label, value));
+    }
 }
 
 pub use nwn_erf::extract_resource_data;
