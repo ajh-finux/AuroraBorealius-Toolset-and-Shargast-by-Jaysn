@@ -61,7 +61,7 @@ impl Token {
 
 static KEYWORDS: &[&str] = &[
     "int", "float", "string", "object", "void", "vector", "action",
-    "struct", "talent", "effect", "itemproperty", "location",
+    "struct", "talent", "effect", "itemproperty", "location", "json", "sqlquery",
     "if", "else", "switch", "case", "default", "break",
     "while", "for", "do", "continue", "return",
     "const", "extern", "static", "intelligent",

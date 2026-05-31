@@ -94,6 +94,7 @@ pub struct ViewportState {
     texture_slots: Vec<TextureSlot>,
     default_instance_buf: wgpu::Buffer,
     pipeline: wgpu::RenderPipeline,
+    tile_pipeline: wgpu::RenderPipeline,
     marker_pipeline: wgpu::RenderPipeline,
     walkmesh_pipeline: wgpu::RenderPipeline,
     viewport_size: (u32, u32),
@@ -114,7 +115,7 @@ pub struct ViewportState {
     tile_hl_ibuf: Option<wgpu::Buffer>,
     tile_hl_count: u32,
     highlight_pipeline: wgpu::RenderPipeline,
-    cached_highlight: Option<([f32; 3], f32)>,
+    cached_highlight: (Vec<[f32; 3]>, f32),
     cached_tile_highlight: Option<(Option<usize>, usize, usize, f32)>,
 
     floor_pipeline: wgpu::RenderPipeline,
@@ -452,12 +453,27 @@ impl ViewportState {
         let skipped_count = tex_names.len().saturating_sub(texture_slots.len());
         eprintln!("  Textures: {} unique, {} loaded, {} skipped (cap={} MB)", tex_names.len(), loaded_count, skipped_count, max_texture_bytes / 1024 / 1024);
 
+
         // Create per-model group resources with instance buffers
         let mut group_resources = Vec::new();
         for (midx, model) in instanced.models.iter().enumerate() {
             let tex_slot = model.texture_name.as_ref()
-                .and_then(|n| tex_slot_map.get(n.as_str()).copied())
-                .unwrap_or(0);
+                .and_then(|n| {
+                    let found = tex_slot_map.contains_key(n.as_str());
+                    if !found {
+                        eprintln!("  MODEL GROUP: texture '{}' not in tex_slot_map (used model_name={:?})", n, model.texture_name);
+                    }
+                    tex_slot_map.get(n.as_str()).copied()
+                })
+                .unwrap_or_else(|| {
+                    if model.texture_name.is_some() {
+                        eprintln!("  MODEL GROUP: texture '{:?}' not found, using slot 0", model.texture_name);
+                    }
+                    0
+                });
+            if tex_slot == 0 && model.texture_name.is_some() {
+                eprintln!("  MODEL GROUP SLOT0: tex_name='{:?}' — using fallback", model.texture_name);
+            }
 
             let vertex_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some("nwn3d_inst_vbuf"),
@@ -589,6 +605,13 @@ impl ViewportState {
             });
 
         let pipeline = pipeline::create_pipeline(device, config, &uniform_bind_group_layout, &texture_bind_group_layout, Some(wgpu::TextureFormat::Depth32Float));
+        let tile_pipeline = pipeline::create_tile_pipeline(
+            device,
+            config.format,
+            &uniform_bind_group_layout,
+            &texture_bind_group_layout,
+            Some(wgpu::TextureFormat::Depth32Float),
+        );
         let marker_pipeline = pipeline::create_marker_pipeline(
             device,
             config.format,
@@ -830,6 +853,7 @@ impl ViewportState {
                 usage: wgpu::BufferUsages::VERTEX,
             }),
             pipeline,
+            tile_pipeline,
             marker_pipeline,
             walkmesh_pipeline,
             viewport_size: (0, 0),
@@ -850,7 +874,7 @@ impl ViewportState {
             tile_hl_ibuf: None,
             tile_hl_count: 0,
             highlight_pipeline,
-            cached_highlight: None,
+            cached_highlight: (Vec::new(), 0.0),
             cached_tile_highlight: None,
 
             floor_pipeline,
@@ -901,7 +925,7 @@ impl ViewportState {
     /// Fast-path: update a single tile's transform (height / orientation) without rebuilding the scene.
     pub fn set_tile_transform(&mut self, queue: &wgpu::Queue, col: usize, row: usize, height: i32, orientation: i32) {
         let Some(entries) = self.tile_instance_map.get(&(col, row)) else { return };
-        let h = height as f32 * 0.25;
+        let h = height as f32 * 4.0;
         for &(gidx, inst_idx) in entries {
             if gidx >= self.tile_group_count { continue; }
             if inst_idx >= self.instance_data[gidx].len() { continue; }
@@ -993,6 +1017,13 @@ impl ViewportState {
 
         // Recreate all pipelines with the offscreen color format
         self.pipeline = pipeline::create_pipeline_with_depth(
+            device,
+            self.color_format,
+            &self.uniform_bind_group_layout,
+            &self.texture_bind_group_layout,
+            Some(wgpu::TextureFormat::Depth32Float),
+        );
+        self.tile_pipeline = pipeline::create_tile_pipeline(
             device,
             self.color_format,
             &self.uniform_bind_group_layout,
@@ -1121,8 +1152,10 @@ impl ViewportState {
             }
         }
 
-        // Render instanced tile groups (depth-tested)
+        // Render instanced tile groups (depth-tested, with back-face culling)
         if self.show_tiles {
+            render_pass.set_pipeline(&self.tile_pipeline);
+            render_pass.set_bind_group(0, &self.uniform_bind_group, &[]);
             let use_fallback = std::env::var("NWN_NO_TEX").is_ok();
             for grp in &self.groups {
                 let bg = if use_fallback {
@@ -1390,9 +1423,8 @@ impl ViewportState {
     }
 
     /// Draw a green wireframe box around a world position (for selected objects).
-    pub fn set_highlight_object(&mut self, device: &wgpu::Device, pos: Option<[f32; 3]>, half_size: f32) {
-        // Cache check: skip if highlight hasn't changed
-        let key = pos.map(|p| (p, half_size));
+    pub fn set_highlight_objects(&mut self, device: &wgpu::Device, positions: &[[f32; 3]], half_size: f32) {
+        let key = (positions.to_vec(), half_size);
         if key == self.cached_highlight {
             return;
         }
@@ -1402,44 +1434,44 @@ impl ViewportState {
         self.highlight_ibuf = None;
         self.highlight_count = 0;
 
-        let [cx, cy, cz] = match pos {
-            Some(p) => p,
-            None => return,
-        };
-        let hs = half_size;
+        if positions.is_empty() { return; }
 
-        let corners: [[f32; 3]; 8] = [
-            [cx - hs, cy - hs, cz - hs],
-            [cx + hs, cy - hs, cz - hs],
-            [cx + hs, cy - hs, cz + hs],
-            [cx - hs, cy - hs, cz + hs],
-            [cx - hs, cy + hs, cz - hs],
-            [cx + hs, cy + hs, cz - hs],
-            [cx + hs, cy + hs, cz + hs],
-            [cx - hs, cy + hs, cz + hs],
-        ];
-
-        let edges: [(u32, u32); 12] = [
+        const EDGES: [(u32, u32); 12] = [
             (0,1),(1,2),(2,3),(3,0),
             (4,5),(5,6),(6,7),(7,4),
             (0,4),(1,5),(2,6),(3,7),
         ];
+        const COLOR: [f32; 4] = [0.0, 1.0, 0.2, 0.8];
 
-        let color: [f32; 4] = [0.0, 1.0, 0.2, 0.8];
         let mut verts: Vec<f32> = Vec::new();
-        for &(a, b) in &edges {
-            for &ci in &[a, b] {
-                verts.push(corners[ci as usize][0]);
-                verts.push(corners[ci as usize][1]);
-                verts.push(corners[ci as usize][2]);
-                verts.push(color[0]);
-                verts.push(color[1]);
-                verts.push(color[2]);
-                verts.push(color[3]);
+        let mut idx_offset = 0u32;
+        for &[cx, cy, cz] in positions {
+            let hs = half_size;
+            let corners: [[f32; 3]; 8] = [
+                [cx - hs, cy - hs, cz - hs],
+                [cx + hs, cy - hs, cz - hs],
+                [cx + hs, cy - hs, cz + hs],
+                [cx - hs, cy - hs, cz + hs],
+                [cx - hs, cy + hs, cz - hs],
+                [cx + hs, cy + hs, cz - hs],
+                [cx + hs, cy + hs, cz + hs],
+                [cx - hs, cy + hs, cz + hs],
+            ];
+            for &(a, b) in &EDGES {
+                for &ci in &[a, b] {
+                    verts.push(corners[ci as usize][0]);
+                    verts.push(corners[ci as usize][1]);
+                    verts.push(corners[ci as usize][2]);
+                    verts.push(COLOR[0]);
+                    verts.push(COLOR[1]);
+                    verts.push(COLOR[2]);
+                    verts.push(COLOR[3]);
+                }
             }
+            idx_offset += EDGES.len() as u32 * 2;
         }
-        let indices: Vec<u32> = (0..(edges.len() * 2) as u32).collect();
 
+        let indices: Vec<u32> = (0..idx_offset).collect();
         if verts.is_empty() { return; }
 
         self.highlight_vbuf = Some(device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -1533,15 +1565,17 @@ pub struct ViewportPersist {
 }
 
 fn current_rss_kb() -> u64 {
-    std::fs::read_to_string("/proc/self/status")
-        .ok()
-        .and_then(|data| {
-            data.lines()
-                .find(|l| l.starts_with("VmRSS:"))
-                .and_then(|l| l.split_whitespace().nth(1))
-                .and_then(|v| v.parse().ok())
-        })
-        .unwrap_or(0)
+    #[cfg(target_os = "linux")]
+    if let Ok(data) = std::fs::read_to_string("/proc/self/status") {
+        if let Some(line) = data.lines().find(|l| l.starts_with("VmRSS:")) {
+            if let Some(val) = line.split_whitespace().nth(1) {
+                if let Ok(v) = val.parse::<u64>() {
+                    return v;
+                }
+            }
+        }
+    }
+    0
 }
 
 pub struct WgpuViewport {
@@ -1926,15 +1960,23 @@ impl WgpuViewport {
         Vec::new()
     }
 
-    pub fn set_highlight_object(&self, pos: Option<[f32; 3]>, half_size: f32) {
+    pub fn set_highlight_objects(&self, positions: &[[f32; 3]], half_size: f32) {
         let device_guard = self.device.lock().ok();
         let device = device_guard.as_ref().and_then(|d| d.as_ref());
         let Some(device) = device else { return };
         if let Ok(mut guard) = self.inner.lock() {
             if let Some(ref mut state) = *guard {
-                state.set_highlight_object(device, pos, half_size);
+                state.set_highlight_objects(device, positions, half_size);
             }
         }
+    }
+
+    pub fn set_highlight_object(&self, pos: Option<[f32; 3]>, half_size: f32) {
+        let positions = match pos {
+            Some(p) => vec![p],
+            None => vec![],
+        };
+        self.set_highlight_objects(&positions, half_size);
     }
 
     pub fn set_highlight_tile(&self, tile_idx: Option<usize>, col: usize, row: usize, height: f32) {

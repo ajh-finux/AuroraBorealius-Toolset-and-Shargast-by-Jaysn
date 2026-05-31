@@ -421,23 +421,25 @@ pub fn update_are_lighting(gff: &mut nwn_gff::GffFile, area: &Area) {
     set_or_add(root, make_field("IsNight", FieldValue::Byte(if area.is_night { 1 } else { 0 })));
 }
 
+fn int_from_field(field: &nwn_gff::FieldValue) -> Option<i32> {
+    match field {
+        nwn_gff::FieldValue::Int(i) => Some(*i),
+        nwn_gff::FieldValue::DWord(d) => Some(*d as i32),
+        nwn_gff::FieldValue::Byte(b) => Some(*b as i32),
+        nwn_gff::FieldValue::Short(s) => Some(*s as i32),
+        nwn_gff::FieldValue::Word(w) => Some(*w as i32),
+        _ => None,
+    }
+}
+
 fn parse_tile_list(gff: &nwn_gff::GffFile) -> Vec<TileInfo> {
     let mut tiles = Vec::new();
     if let Some(nwn_gff::FieldValue::List(list)) = gff.root().find("Tile_List") {
         for entry in list.iter() {
             tiles.push(TileInfo {
-                id: entry.find("Tile_ID").and_then(|v| match v {
-                    nwn_gff::FieldValue::Int(i) => Some(*i),
-                    _ => None,
-                }).unwrap_or(0),
-                orientation: entry.find("Tile_Orientation").and_then(|v| match v {
-                    nwn_gff::FieldValue::Int(i) => Some(*i),
-                    _ => None,
-                }).unwrap_or(0),
-                height: entry.find("Tile_Height").and_then(|v| match v {
-                    nwn_gff::FieldValue::Int(i) => Some(*i),
-                    _ => None,
-                }).unwrap_or(0),
+                id: entry.find("Tile_ID").and_then(int_from_field).unwrap_or(0),
+                orientation: entry.find("Tile_Orientation").and_then(int_from_field).unwrap_or(0),
+                height: entry.find("Tile_Height").and_then(int_from_field).unwrap_or(0),
                 walkable: entry.find("Walkable").and_then(|v| match v {
                     nwn_gff::FieldValue::Byte(b) => Some(*b != 0),
                     _ => None,

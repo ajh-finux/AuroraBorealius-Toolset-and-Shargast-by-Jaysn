@@ -166,7 +166,15 @@ pub fn find_tileset_in_game_data(name: &str) -> Result<Option<Tileset>> {
         Err(_) => return Ok(None),
     };
     match load_resource_from_key(&set_resref, &data_dir)? {
-        Some(data) => Tileset::from_bytes(name, &data).map(Some),
+        Some(data) => {
+            match Tileset::from_bytes(name, &data) {
+                Ok(ts) => Ok(Some(ts)),
+                Err(e) => {
+                    eprintln!("Warning: failed to parse tileset '{}' from game data: {}", name, e);
+                    Ok(None)
+                }
+            }
+        }
         None => Ok(None),
     }
 }
@@ -336,6 +344,13 @@ pub fn load_model_meshes_from_data(model_name: &str, data: &[u8]) -> Result<Opti
 
     let mut groups: Vec<TexGroup> = Vec::new();
 
+    // Detect tile models by name convention: <tileset>_<id> (e.g. "tcn01_a02_01").
+    // Tile model vertex-colored primitives (no texture) are always collision/helper
+    // geometry and should be skipped — only textured primitives are visual surfaces.
+    let is_tile_model = model_name.len() > 5
+        && model_name.as_bytes().get(5) == Some(&b'_')
+        && model_name.as_bytes()[0] == b't';
+
     // First pass: check if any primitive in this model has a texture reference.
     // If at least one does, then None-textured primitives are truly vertex-colored.
     // If none do, they may be creature models whose texture name was filtered out
@@ -365,7 +380,19 @@ pub fn load_model_meshes_from_data(model_name: &str, data: &[u8]) -> Result<Opti
             // NWN convention: "None" means vertex colors only, no texture
             let mut tex_name = tex_name.filter(|n| n.to_ascii_lowercase() != "none");
             if tex_name.is_none() && !any_textured {
-                tex_name = Some(model_name.to_string());
+                // Model-name-as-texture fallback for creature models (e.g. c_basilisk
+                // whose texture "c_basilisk" was dropped by normalize_texture_name).
+                // Skip for tile models (which won't have a matching texture).
+                if !is_tile_model {
+                    tex_name = Some(model_name.to_string());
+                }
+            }
+            let has_texture = tex_name.is_some();
+
+            // Tile model vertex-colored primitives are collision/helper geometry,
+            // never visual surfaces. Skip them entirely.
+            if is_tile_model && !has_texture {
+                continue;
             }
 
             // Find or create group for this texture
@@ -429,11 +456,28 @@ pub fn load_model_meshes_from_data(model_name: &str, data: &[u8]) -> Result<Opti
                     };
                     group.uvs.push(uv);
 
-                    let color = if vi < prim.color_rows.len() && prim.color_rows[vi].len() >= 4 {
+                    let default_color = if has_texture {
+                        [1.0, 1.0, 1.0, 1.0]
+                    } else if let Some(mi) = prim.material {
+                        if let Some(mat) = baked.materials.get(mi) {
+                            // Use material diffuse * 0.5 for vertex-colored primitives.
+                            // The shader applies (ambient + diffuse + point_lights) ≈ 1.166x,
+                            // which over-brightens white vertex colors. Halving the diffuse
+                            // compensates so that final color approximates NWN's ambient-only look.
+                            [(mat.diffuse[0] * 0.5).min(1.0).max(0.0), (mat.diffuse[1] * 0.5).min(1.0).max(0.0), (mat.diffuse[2] * 0.5).min(1.0).max(0.0), mat.alpha.min(1.0).max(0.0)]
+                        } else {
+                            [0.35, 0.35, 0.35, 1.0]
+                        }
+                    } else {
+                        [0.35, 0.35, 0.35, 1.0]
+                    };
+                    // For vertex-colored primitives, skip prim.color_rows — they store meaningless
+                    // [1,1,1,1] defaults. Use the material color directly instead.
+                    let color = if has_texture && vi < prim.color_rows.len() && prim.color_rows[vi].len() >= 4 {
                         let c = &prim.color_rows[vi];
                         [c[0].min(1.0).max(0.0), c[1].min(1.0).max(0.0), c[2].min(1.0).max(0.0), c[3].min(1.0).max(0.0)]
                     } else {
-                        [1.0, 1.0, 1.0, 1.0]
+                        default_color
                     };
                     group.colors.push(color);
 
@@ -779,10 +823,22 @@ pub fn find_and_load_tileset(name: &str, module_path: &Path, haks: &[String]) ->
     let set_lower = name.to_lowercase();
     let set_type = nwn_lib_rs::erf::ResourceType::Set as u16;
 
+    fn try_parse(name: &str, data: &[u8]) -> Result<Option<Tileset>> {
+        match Tileset::from_bytes(name, data) {
+            Ok(ts) => Ok(Some(ts)),
+            Err(e) => {
+                eprintln!("Warning: failed to parse tileset '{}': {}", name, e);
+                Ok(None)
+            }
+        }
+    }
+
     // First try the module itself
     if let Ok(data) = extract_resource_from_erf(module_path, &set_lower, set_type) {
         if let Some(d) = data {
-            return Tileset::from_bytes(name, &d).map(Some);
+            if let Some(ts) = try_parse(name, &d)? {
+                return Ok(Some(ts));
+            }
         }
     }
 
@@ -795,7 +851,9 @@ pub fn find_and_load_tileset(name: &str, module_path: &Path, haks: &[String]) ->
         for p in &paths {
             if let Ok(data) = extract_resource_from_erf(p, &set_lower, set_type) {
                 if let Some(d) = data {
-                    return Tileset::from_bytes(name, &d).map(Some);
+                    if let Some(ts) = try_parse(name, &d)? {
+                        return Ok(Some(ts));
+                    }
                 }
             }
         }
@@ -809,7 +867,9 @@ pub fn find_and_load_tileset(name: &str, module_path: &Path, haks: &[String]) ->
                 let hak_path = hak_dir.join(format!("{}.hak", hak_name));
                 if let Ok(data) = extract_resource_from_erf(&hak_path, &set_lower, set_type) {
                     if let Some(d) = data {
-                        return Tileset::from_bytes(name, &d).map(Some);
+                        if let Some(ts) = try_parse(name, &d)? {
+                            return Ok(Some(ts));
+                        }
                     }
                 }
             }
@@ -817,7 +877,13 @@ pub fn find_and_load_tileset(name: &str, module_path: &Path, haks: &[String]) ->
     }
 
     // Finally, try NWN game data (KEY/BIF files)
-    find_tileset_in_game_data(name)
+    match find_tileset_in_game_data(name) {
+        Ok(ts) => Ok(ts),
+        Err(e) => {
+            eprintln!("Warning: game data tileset lookup failed for '{}': {}", name, e);
+            Ok(None)
+        }
+    }
 }
 
 /// Build a 4x4 column-major matrix from an NWN node transform (Z-up, axis-angle rotation).

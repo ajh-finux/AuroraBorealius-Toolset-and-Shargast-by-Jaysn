@@ -189,10 +189,10 @@ fn parse_key(data: &[u8], root: &Path, lookup: &mut HashMap<(String, u16), (usiz
     let existing_count = bif_paths.len();
     bif_paths.extend(bif_filenames);
 
-    // Parse key entries (26 bytes each)
+    // Parse key entries (22 bytes each: ResRef(16) + Restype(2) + ResourceID(4))
     for i in 0..key_count {
-        let base = off_key_tbl + i * 26;
-        if base + 26 > data.len() { break; }
+        let base = off_key_tbl + i * 22;
+        if base + 22 > data.len() { break; }
         // ResRef: 16 bytes, null-terminated
         let resref_bytes = &data[base..base + 16];
         let end = resref_bytes.iter().position(|&b| b == 0).unwrap_or(16);

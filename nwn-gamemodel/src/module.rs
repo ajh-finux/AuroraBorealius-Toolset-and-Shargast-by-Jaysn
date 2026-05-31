@@ -343,14 +343,21 @@ impl Module {
             if let Some(ref erf) = self.erf {
                 if let Some(data) = erf.get(ts_key, set_type) {
                     if let Ok(ts) = nwn_tileset::Tileset::from_bytes(ts_key, &data) {
-                        return (ts_key.clone(), Ok(Some(ts)));
+                        return (ts_key.clone(), Some(ts));
                     }
                 }
             }
             let _guard = fallback_lock.lock().unwrap();
-            let result = nwn_tileset::find_and_load_tileset(ts_key, &self.path, &self.haks);
-            (ts_key.clone(), result)
+            match nwn_tileset::find_and_load_tileset(ts_key, &self.path, &self.haks) {
+                Ok(Some(ts)) => (ts_key.clone(), Some(ts)),
+                _ => (ts_key.clone(), None),
+            }
         }).collect();
+        for (key, ts) in results {
+            if let Some(ts) = ts {
+                self.tileset_cache.borrow_mut().insert(key, ts);
+            }
+        }
     }
 
     pub fn get_area(&self, name: &str) -> Option<Arc<Area>> {

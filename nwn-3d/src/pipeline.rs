@@ -90,6 +90,7 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
         let factor = clamp(view_dist / fog_dist, 0.0, 1.0) * fog_amount;
         final_color = mix(final_color, uniforms.fog_color, factor);
     }
+    if final_color.a < 0.01 { discard; }
     return final_color;
 }
 "#;
@@ -135,7 +136,7 @@ pub fn create_pipeline(
     texture_bind_group_layout: &wgpu::BindGroupLayout,
     depth_format: Option<wgpu::TextureFormat>,
 ) -> wgpu::RenderPipeline {
-    _create_pipeline(device, config.format, uniform_bind_group_layout, texture_bind_group_layout, depth_format)
+    _create_pipeline_with_cull(device, config.format, uniform_bind_group_layout, texture_bind_group_layout, depth_format, None)
 }
 
 pub fn create_pipeline_with_depth(
@@ -145,7 +146,17 @@ pub fn create_pipeline_with_depth(
     texture_bind_group_layout: &wgpu::BindGroupLayout,
     depth_format: Option<wgpu::TextureFormat>,
 ) -> wgpu::RenderPipeline {
-    _create_pipeline(device, color_format, uniform_bind_group_layout, texture_bind_group_layout, depth_format)
+    _create_pipeline_with_cull(device, color_format, uniform_bind_group_layout, texture_bind_group_layout, depth_format, None)
+}
+
+pub fn create_tile_pipeline(
+    device: &wgpu::Device,
+    color_format: wgpu::TextureFormat,
+    uniform_bind_group_layout: &wgpu::BindGroupLayout,
+    texture_bind_group_layout: &wgpu::BindGroupLayout,
+    depth_format: Option<wgpu::TextureFormat>,
+) -> wgpu::RenderPipeline {
+    _create_pipeline_with_cull(device, color_format, uniform_bind_group_layout, texture_bind_group_layout, depth_format, Some(wgpu::Face::Back))
 }
 
 fn create_overlay_pipeline_impl(
@@ -269,12 +280,13 @@ pub fn create_walkmesh_pipeline(
     create_overlay_pipeline_impl("walkmesh", device, color_format, uniform_bind_group_layout, texture_bind_group_layout, depth_format, create_depth_stencil_walkmesh(depth_format))
 }
 
-fn _create_pipeline(
+fn _create_pipeline_with_cull(
     device: &wgpu::Device,
     color_format: wgpu::TextureFormat,
     uniform_bind_group_layout: &wgpu::BindGroupLayout,
     texture_bind_group_layout: &wgpu::BindGroupLayout,
     depth_format: Option<wgpu::TextureFormat>,
+    cull_mode: Option<wgpu::Face>,
 ) -> wgpu::RenderPipeline {
     let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some("nwn3d_shader"),
@@ -338,7 +350,7 @@ fn _create_pipeline(
             topology: wgpu::PrimitiveTopology::TriangleList,
             strip_index_format: None,
             front_face: wgpu::FrontFace::Ccw,
-            cull_mode: None,
+            cull_mode,
             polygon_mode: wgpu::PolygonMode::Fill,
             unclipped_depth: false,
             conservative: false,

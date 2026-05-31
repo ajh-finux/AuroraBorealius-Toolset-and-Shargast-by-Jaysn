@@ -18,6 +18,7 @@ pub struct MeshData {
 
 #[derive(Debug, Clone)]
 pub struct ModelGroup {
+    pub model_name: Option<String>,
     pub texture_name: Option<String>,
     pub data: MeshData,
 }
@@ -140,7 +141,7 @@ pub fn build_instanced_tiles(area: &Area, model_cache: &mut ModelCache) -> Insta
         let col = i % cols;
         let row = i / cols;
         let model_name = area.tile_models.get(i).and_then(|m| m.as_deref()).unwrap_or("");
-        let height = tile.height as f32 * 0.25;
+        let height = tile.height as f32 * 4.0;
 
         if let Some(meshes) = model_cache.get_or_load(model_name) {
             if meshes.is_empty() { continue; }
@@ -170,6 +171,7 @@ pub fn build_instanced_tiles(area: &Area, model_cache: &mut ModelCache) -> Insta
                         }
                     }
                     models.push(ModelGroup {
+                        model_name: Some(model_name.to_string()),
                         texture_name: mesh.texture_name.clone(),
                         data: MeshData { vertices, indices },
                     });
@@ -227,6 +229,7 @@ pub fn build_instanced_tiles(area: &Area, model_cache: &mut ModelCache) -> Insta
         }
 
         models.push(ModelGroup {
+            model_name: None,
             texture_name: None,
             data: MeshData { vertices: box_vertices, indices: box_indices },
         });
@@ -325,6 +328,7 @@ pub fn build_object_models(area: &Area, model_cache: &mut ModelCache, filter: &V
                     }
                 }
                 models.push(ModelGroup {
+                    model_name: Some(model_name.to_string()),
                     texture_name: mesh.texture_name.clone(),
                     data: MeshData { vertices, indices },
                 });
@@ -444,7 +448,7 @@ pub fn build_tile_mesh(area: &Area) -> MeshData {
         if row >= rows { break; }
         let tx = col as f32 * tile_w;
         let ty = -(row as f32) * tile_h;
-        let height = tile.height as f32 * 0.25;
+        let height = tile.height as f32 * 4.0;
 
         let base_index = vertices.len() as u32;
         let verts: [[f32; 5]; 4] = [
@@ -817,7 +821,7 @@ fn build_paint_overlay_inner(area: &Area, water_level: i32, show_water: bool, wa
             let col = ti % cols;
             let row = ti / cols;
             let h = area.tiles.get(ti).map(|t| t.height).unwrap_or(0);
-            let height = h as f32 * 0.25 + 0.05; // slight offset above tile
+            let height = h as f32 * 4.0 + 0.05; // slight offset above tile
             let x0 = col as f32 * tile_w;
             let z0 = -(row as f32) * tile_w;
             let x1 = x0 + tile_w;
@@ -835,7 +839,7 @@ fn build_paint_overlay_inner(area: &Area, water_level: i32, show_water: bool, wa
     // Water level overlay
     if show_water && water_level > 0 {
         let water_color = [water_color[0] as f32 / 255.0, water_color[1] as f32 / 255.0, water_color[2] as f32 / 255.0, water_color[3] as f32 / 255.0];
-        let water_height = water_level as f32 * 0.25;
+        let water_height = water_level as f32 * 4.0;
         for ti in 0..(cols * rows) {
             let col = ti % cols;
             let row = ti / cols;
@@ -884,7 +888,7 @@ pub fn build_walkmesh(area: &Area) -> MeshData {
         let col = i % cols;
         let tx = col as f32 * tile_w;
         let tz = -(row as f32) * tile_w;
-        let height = tile.height as f32 * 0.25;
+        let height = tile.height as f32 * 4.0;
 
         let walk_color = if tile.walkable {
             [0.0, 0.6, 0.0, 0.25]
@@ -909,7 +913,7 @@ pub fn build_walkmesh(area: &Area) -> MeshData {
         for col in 0..cols {
             let i = row * cols + col;
             if i >= area.tiles.len() { break; }
-            let h = area.tiles[i].height as f32 * 0.25;
+            let h = area.tiles[i].height as f32 * 4.0;
             let oi = orientations.get(i).copied().unwrap_or(0);
             let tx = col as f32 * tile_w;
             let tz = -(row as f32) * tile_w;
@@ -918,7 +922,7 @@ pub fn build_walkmesh(area: &Area) -> MeshData {
             if col + 1 < cols {
                 let ri = row * cols + col + 1;
                 if ri < area.tiles.len() {
-                    let rh = area.tiles[ri].height as f32 * 0.25;
+                    let rh = area.tiles[ri].height as f32 * 4.0;
                     let ori = orientations.get(ri).copied().unwrap_or(0);
                     let has_wall = wall_set.contains(&(i, physical_to_local_edge(0, oi))) ||
                                    wall_set.contains(&(ri, physical_to_local_edge(2, ori)));
@@ -937,7 +941,7 @@ pub fn build_walkmesh(area: &Area) -> MeshData {
             if row + 1 < rows {
                 let bi = (row + 1) * cols + col;
                 if bi < area.tiles.len() {
-                    let bh = area.tiles[bi].height as f32 * 0.25;
+                    let bh = area.tiles[bi].height as f32 * 4.0;
                     let obi = orientations.get(bi).copied().unwrap_or(0);
                     let has_wall = wall_set.contains(&(i, physical_to_local_edge(1, oi))) ||
                                    wall_set.contains(&(bi, physical_to_local_edge(3, obi)));
@@ -979,7 +983,7 @@ pub fn build_walkmesh_edges(area: &Area) -> (Vec<f32>, Vec<u32>) {
         let col = i % cols;
         let tx = col as f32 * tile_w;
         let tz = -(row as f32) * tile_w;
-        let h = tile.height as f32 * 0.25;
+        let h = tile.height as f32 * 4.0;
 
         let color = if tile.walkable { [0.0, 1.0, 0.0, 0.6] } else { [1.0, 0.0, 0.0, 0.7] };
         // Tile quad perimeter: 4 corners -> 4 edges
@@ -1011,7 +1015,7 @@ pub fn build_walkmesh_edges(area: &Area) -> (Vec<f32>, Vec<u32>) {
         for col in 0..cols {
             let i = row * cols + col;
             if i >= area.tiles.len() { break; }
-            let h = area.tiles[i].height as f32 * 0.25;
+            let h = area.tiles[i].height as f32 * 4.0;
             let oi = orientations.get(i).copied().unwrap_or(0);
             let tx = col as f32 * tile_w;
             let tz = -(row as f32) * tile_w;
@@ -1020,7 +1024,7 @@ pub fn build_walkmesh_edges(area: &Area) -> (Vec<f32>, Vec<u32>) {
             if col + 1 < cols {
                 let ri = row * cols + col + 1;
                 if ri < area.tiles.len() {
-                    let rh = area.tiles[ri].height as f32 * 0.25;
+                    let rh = area.tiles[ri].height as f32 * 4.0;
                     let ori = orientations.get(ri).copied().unwrap_or(0);
                     let has_wall = wall_set.contains(&(i, physical_to_local_edge(0, oi))) ||
                                    wall_set.contains(&(ri, physical_to_local_edge(2, ori)));
@@ -1049,7 +1053,7 @@ pub fn build_walkmesh_edges(area: &Area) -> (Vec<f32>, Vec<u32>) {
             if row + 1 < rows {
                 let bi = (row + 1) * cols + col;
                 if bi < area.tiles.len() {
-                    let bh = area.tiles[bi].height as f32 * 0.25;
+                    let bh = area.tiles[bi].height as f32 * 4.0;
                     let obi = orientations.get(bi).copied().unwrap_or(0);
                     let has_wall = wall_set.contains(&(i, physical_to_local_edge(1, oi))) ||
                                    wall_set.contains(&(bi, physical_to_local_edge(3, obi)));

@@ -53,7 +53,7 @@ impl Parser {
             Some(Token::Keyword(kw)) if kw == "int" || kw == "float" || kw == "string"
                 || kw == "object" || kw == "void" || kw == "vector" || kw == "action"
                 || kw == "struct" || kw == "talent" || kw == "effect" || kw == "itemproperty"
-                || kw == "location" => {
+                || kw == "location" || kw == "json" || kw == "sqlquery" => {
                 self.parse_var_or_func_decl()
             }
             Some(Token::Keyword(kw)) if kw == "if" => self.parse_if(),

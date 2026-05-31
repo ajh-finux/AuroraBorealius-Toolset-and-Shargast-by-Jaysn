@@ -68,7 +68,7 @@ void NWNX_SQL_PreparedNULL(int position);
 /// Convenience function to match other Prepared(type) functions.
 /// @param position The nth ? in a prepared statement.
 /// @param value The value to set.
-void NWNX_SQL_PreparedJson(int position, json value);
+void NWNX_SQL_PreparedJson(int position, string value);
 
 /// @brief Like NWNX_SQL_ReadDataInActiveRow, but for full serialized objects.
 ///
@@ -194,11 +194,9 @@ void NWNX_SQL_PreparedNULL(int position)
     NWNXPushInt(position);
     NWNXCall(NWNX_SQL, "PreparedNULL");
 }
-void NWNX_SQL_PreparedJson(int position, json value)
+void NWNX_SQL_PreparedJson(int position, string value)
 {
-    // Dump to string and continue as a string from here.
-    // Famously assuming we're sent valid Json here.
-    NWNX_SQL_PreparedString(position, JsonDump(value));
+    NWNX_SQL_PreparedString(position, value);
 }
 
 
