@@ -1,5 +1,5 @@
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 
 use egui_wgpu::{CallbackTrait, CallbackResources, ScreenDescriptor};
@@ -460,7 +460,7 @@ impl ViewportState {
                 mip_level_count: 1,
                 sample_count: 1,
                 dimension: wgpu::TextureDimension::D2,
-                format: wgpu::TextureFormat::Rgba8UnormSrgb,
+                format: wgpu::TextureFormat::Rgba8Unorm,
                 usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
                 view_formats: &[],
             });
@@ -483,61 +483,6 @@ impl ViewportState {
         }
         let skipped_count = tex_names.len().saturating_sub(texture_slots.len());
         eprintln!("  Textures: {} unique, {} loaded, {} skipped (cap={} MB)", tex_names.len(), loaded_count, skipped_count, max_texture_bytes / 1024 / 1024);
-        for tn in &tex_names {
-            if tn.contains("plt") || tn.contains("p_") || tn.contains("a_") {
-                eprintln!("  TEX_NAME: {}", tn);
-            }
-        }
-
-        // Create per-model group resources with instance buffers
-        let mut group_resources = Vec::new();
-        for (midx, model) in instanced.models.iter().enumerate() {
-            let tex_slot = model.texture_name.as_ref()
-                .and_then(|n| {
-                    let found = tex_slot_map.contains_key(n.as_str());
-                    if !found {
-                        eprintln!("  MODEL GROUP: texture '{}' not in tex_slot_map (used model_name={:?})", n, model.texture_name);
-                    }
-                    tex_slot_map.get(n.as_str()).copied()
-                })
-                .unwrap_or_else(|| {
-                    if model.texture_name.is_some() {
-                        eprintln!("  MODEL GROUP: texture '{:?}' not found, using slot 0", model.texture_name);
-                    }
-                    0
-                });
-            if tex_slot == 0 && model.texture_name.is_some() {
-                eprintln!("  MODEL GROUP SLOT0: tex_name='{:?}' — using fallback", model.texture_name);
-            }
-            if model.texture_name.as_ref().map_or(false, |n| n.contains('#')) {
-                eprintln!("  DEBUG_TEX: slot={} tex_name='{:?}' model='{:?}'", tex_slot, model.texture_name, model.model_name);
-            }
-
-            let vertex_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("nwn3d_inst_vbuf"),
-                contents: bytemuck::cast_slice(&model.data.vertices),
-                usage: wgpu::BufferUsages::VERTEX,
-            });
-            let index_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("nwn3d_inst_ibuf"),
-                contents: bytemuck::cast_slice(&model.data.indices),
-                usage: wgpu::BufferUsages::INDEX,
-            });
-            let instance_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("nwn3d_inst_instance_buf"),
-                contents: bytemuck::cast_slice(&instanced.instance_data[midx]),
-                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-            });
-
-            group_resources.push(GroupResources {
-                num_indices: model.data.indices.len() as u32,
-                num_instances: instanced.instance_data[midx].len() as u32,
-                vertex_buf,
-                index_buf,
-                instance_buf,
-                texture_slot: tex_slot,
-            });
-        }
 
         // Add a fallback texture slot at index 0 (2x2 white)
         let fb_tex = device.create_texture(&wgpu::TextureDescriptor {
@@ -546,7 +491,7 @@ impl ViewportState {
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba8UnormSrgb,
+            format: wgpu::TextureFormat::Rgba8Unorm,
             usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
             view_formats: &[],
         });
@@ -602,6 +547,37 @@ impl ViewportState {
         // Fix up sprite batch texture slots
         for batch in &mut sprite_batches {
             batch.texture_slot = sprite_slot_start + batch.texture_slot;
+        }
+
+        // Create per-model group resources (vertex/index/instance buffers) for tile + object models
+        let mut group_resources = Vec::new();
+        for (midx, model) in instanced.models.iter().enumerate() {
+            let tex_slot = model.texture_name.as_ref()
+                .and_then(|n| tex_slot_map.get(n.as_str()).copied())
+                .unwrap_or(0);
+            let vertex_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("nwn3d_inst_vbuf"),
+                contents: bytemuck::cast_slice(&model.data.vertices),
+                usage: wgpu::BufferUsages::VERTEX,
+            });
+            let index_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("nwn3d_inst_ibuf"),
+                contents: bytemuck::cast_slice(&model.data.indices),
+                usage: wgpu::BufferUsages::INDEX,
+            });
+            let instance_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("nwn3d_inst_instance_buf"),
+                contents: bytemuck::cast_slice(&instanced.instance_data[midx]),
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            });
+            group_resources.push(GroupResources {
+                num_indices: model.data.indices.len() as u32,
+                num_instances: instanced.instance_data[midx].len() as u32,
+                vertex_buf,
+                index_buf,
+                instance_buf,
+                texture_slot: tex_slot,
+            });
         }
 
         let uniform_bind_group_layout =
@@ -842,7 +818,7 @@ impl ViewportState {
             }
         }
 
-        Self {
+        let mut state = Self {
             camera,
             area_version,
             area_resref: area.resref.clone(),
@@ -956,8 +932,15 @@ impl ViewportState {
             lights,
             last_camera_right_up: None,
             sprite_instance_dirty: true,
+        };
+
+        // Ensure offscreen textures and blit bind groups exist so paint() always has valid bind groups.
+        // This prevents a frame where blit_bind_group is None (skipping the blit draw).
+        if config.width > 0 && config.height > 0 {
+            state.ensure_scene_textures(device, config.width, config.height);
         }
 
+        state
     }
 
     /// Fast-path: update a single tile's transform (height / orientation) without rebuilding the scene.
@@ -1168,7 +1151,7 @@ impl ViewportState {
     }
 
     pub fn render_3d(&self, render_pass: &mut wgpu::RenderPass) {
-        render_pass.set_pipeline(&self.pipeline);
+        render_pass.set_pipeline(&self.tile_pipeline);
         render_pass.set_bind_group(0, &self.uniform_bind_group, &[]);
 
         let fb_bg = self.texture_slots[0].bind_group.as_ref();
@@ -1195,18 +1178,15 @@ impl ViewportState {
             render_pass.set_pipeline(&self.tile_pipeline);
             render_pass.set_bind_group(0, &self.uniform_bind_group, &[]);
             let use_fallback = std::env::var("NWN_NO_TEX").is_ok();
-            for (gi, grp) in self.groups.iter().enumerate() {
+            for (_gi, grp) in self.groups.iter().enumerate() {
+                let slot_ok = grp.texture_slot < self.texture_slots.len();
                 let bg = if use_fallback {
                     fb_bg
                 } else {
-                    if grp.texture_slot >= self.texture_slots.len() {
-                        eprintln!("  RENDER: group {} texture_slot {} out of range ({} slots)", gi, grp.texture_slot, self.texture_slots.len());
+                    if !slot_ok {
                         continue;
                     }
                     let tex_slot = &self.texture_slots[grp.texture_slot];
-                    if tex_slot.bind_group.is_none() {
-                        eprintln!("  RENDER: group {} slot {} bind_group is None", gi, grp.texture_slot);
-                    }
                     tex_slot.bind_group.as_ref()
                 };
                 let bg = match bg {
@@ -1533,32 +1513,11 @@ impl ViewportState {
     }
 
     fn ensure_textures(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) {
-        for (si, slot) in self.texture_slots.iter_mut().enumerate() {
+        for slot in self.texture_slots.iter_mut() {
             if slot.bind_group.is_some() {
                 continue;
             }
-            let has_pending = slot.pending.is_some();
-            eprintln!("  ENSURE_TEX: slot={} bind_group={} has_pending={}", si, slot.bind_group.is_some(), has_pending);
             if let Some((width, height, ref data)) = slot.pending.take() {
-                if data.len() > 16 && (si > 50 || si == 1) && si % 10 == 0 {
-                    let r_sum: u64 = data.chunks_exact(4).map(|p| p[0] as u64).sum();
-                    let g_sum: u64 = data.chunks_exact(4).map(|p| p[1] as u64).sum();
-                    let b_sum: u64 = data.chunks_exact(4).map(|p| p[2] as u64).sum();
-                    let total_pix = data.len() / 4;
-                    eprintln!("  TEX_DATA: slot={} {}x{} first=({},{},{},{}) avg=({},{},{})",
-                        si, width, height,
-                        data[0], data[1], data[2], data[3],
-                        r_sum / total_pix as u64, g_sum / total_pix as u64, b_sum / total_pix as u64);
-                }
-                use std::io::Write;
-                // Save every 20th slot's raw data starting from slot 20 for analysis
-                if si > 0 && si % 20 == 0 && data.len() <= 1024*1024 {
-                    let fname = format!("/tmp/tex_slot_{:04}_{}x{}.rgba", si, width, height);
-                    if let Ok(mut f) = std::fs::File::create(&fname) {
-                        let _ = f.write_all(data);
-                        eprintln!("  TEX_SAVE: {} ({} bytes)", fname, data.len());
-                    }
-                }
                 queue.write_texture(
                     wgpu::TexelCopyTextureInfo {
                         texture: &slot.texture,
@@ -1575,7 +1534,6 @@ impl ViewportState {
                     wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
                 );
             } else {
-                // Default 2x2 white for fallback/no-data
                 let white: [u8; 16] = [255; 16];
                 queue.write_texture(
                     wgpu::TexelCopyTextureInfo {
@@ -2192,6 +2150,8 @@ impl CallbackTrait for WgpuViewport {
         _egui_encoder: &mut wgpu::CommandEncoder,
         _callback_resources: &mut CallbackResources,
     ) -> Vec<wgpu::CommandBuffer> {
+        use std::sync::atomic::Ordering;
+
         // Store device/queue for background rebuild usage
         if let Ok(mut d) = self.device.lock() { *d = Some(device.clone()); }
         if let Ok(mut q) = self.queue.lock() { *q = Some(queue.clone()); }
@@ -2243,7 +2203,6 @@ impl CallbackTrait for WgpuViewport {
                 let max_tex_bytes = self.texture_mem_limit.lock().map(|g| *g).unwrap_or(u64::MAX);
                 let ram_limit_kb = (max_tex_bytes / 1024).saturating_mul(2);
                 let already_over = rss_kb > ram_limit_kb && rss_kb > 512 * 1024;
-                eprintln!("  prepare: pending rebuild, rss={} MB, max_tex={} MB, limit={} MB, already_over={}", rss_kb/1024, max_tex_bytes/1024/1024, ram_limit_kb/1024, already_over);
                 if !already_over {
                     let pending = pending_guard.take().unwrap();
                     self.rebuild_in_progress.store(true, Ordering::SeqCst);
@@ -2301,12 +2260,8 @@ impl CallbackTrait for WgpuViewport {
                                 poisoned.into_inner()
                             }
                         };
-                        // Clear old models BEFORE rebuilding to free memory for new allocations
-                        let evicted = cache_guard.cache.len();
-                        cache_guard.cache.clear();
-                        if evicted > 0 {
-                            eprintln!("  Cleared {} model caches before rebuild", evicted);
-                        }
+                        // Keep existing model cache to avoid reloading from disk
+                        // (memory overhead is small — cached meshes are ~3MB for 100 models)
                         let water_level = persist.water_level;
                         let water_color = persist.water_color;
                         let mut state = ViewportState::new(device, &config, &pending.area, pending.version, vf, existing_camera,
@@ -2399,31 +2354,31 @@ impl CallbackTrait for WgpuViewport {
             label: Some("nwn3d_scene_encoder"),
         });
 
-        {
-            let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("nwn3d_scene_pass"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &color_view,
-                    resolve_target: None,
+            {
+                let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("nwn3d_scene_pass"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &color_view,
+                        resolve_target: None,
                         ops: wgpu::Operations {
-                            load: wgpu::LoadOp::Clear(state.clear_color),
+                            load: wgpu::LoadOp::Clear(wgpu::Color { r: 0.1, g: 0.1, b: 0.12, a: 1.0 }),
                             store: wgpu::StoreOp::Store,
                         },
-                })],
-                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                    view: &depth_view,
-                    depth_ops: Some(wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(1.0),
-                        store: wgpu::StoreOp::Store,
+                    })],
+                    depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                        view: &depth_view,
+                        depth_ops: Some(wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(1.0),
+                            store: wgpu::StoreOp::Store,
+                        }),
+                        stencil_ops: None,
                     }),
-                    stencil_ops: None,
-                }),
-                timestamp_writes: None,
-                occlusion_query_set: None,
-            });
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                });
 
-            state.render_3d(&mut rpass);
-        }
+                state.render_3d(&mut rpass);
+            }
 
         vec![encoder.finish()]
     }
@@ -2444,11 +2399,16 @@ impl CallbackTrait for WgpuViewport {
         };
 
         let clip = info.clip_rect_in_pixels();
+        let cw = clip.width_px.max(0) as u32;
+        let ch = clip.height_px.max(0) as u32;
+        if cw == 0 || ch == 0 {
+            return;
+        }
         render_pass.set_scissor_rect(
             clip.left_px.max(0) as u32,
             clip.top_px.max(0) as u32,
-            clip.width_px.max(0) as u32,
-            clip.height_px.max(0) as u32,
+            cw,
+            ch,
         );
 
         if let Some(ref bg) = state.blit_bind_group[state.frame_index] {
@@ -2578,6 +2538,7 @@ fn vs_main(@builtin(vertex_index) vi: u32) -> VertexOutput {
 
 @fragment
 fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
-    return textureSample(blit_texture, blit_sampler, input.uv);
+    let tex = textureSample(blit_texture, blit_sampler, input.uv);
+    return tex;
 }
 "#;

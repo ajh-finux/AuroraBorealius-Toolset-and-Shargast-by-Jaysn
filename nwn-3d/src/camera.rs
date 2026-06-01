@@ -150,8 +150,8 @@ fn perspective(fov_y: f32, aspect: f32, near: f32, far: f32) -> [[f32; 4]; 4] {
     [
         [f / aspect, 0.0, 0.0, 0.0],
         [0.0, f, 0.0, 0.0],
-        [0.0, 0.0, far * range_inv, -1.0],
-        [0.0, 0.0, far * near * range_inv, 0.0],
+        [0.0, 0.0, (far + near) * range_inv, -1.0],
+        [0.0, 0.0, 2.0 * far * near * range_inv, 0.0],
     ]
 }
 

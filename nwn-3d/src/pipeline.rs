@@ -60,38 +60,8 @@ fn vs_main(input: VertexInput) -> VertexOutput {
 @fragment
 fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     let tex_color = textureSample(texture, texture_sampler, input.uv);
-    var final_color = input.color * tex_color;
-    if uniforms.ambient_color.w > 0.5 {
-        // Full lighting: directional sun + ambient + point lights
-        let light_dir = normalize(vec3<f32>(0.5, 1.0, 0.3));
-        let ambient = uniforms.ambient_color.xyz;
-        let diffuse = max(dot(normalize(input.world_normal), light_dir), 0.0) * uniforms.diffuse_color.xyz;
-        var lighting = ambient + diffuse;
-        let num_lights = min(u32(uniforms.fog_params.z), MAX_LIGHTS);
-        let world_norm = normalize(input.world_normal);
-        for (var i = 0u; i < num_lights; i++) {
-            let pl = uniforms.lights[i];
-            let to_light = pl.position_radius.xyz - input.world_pos;
-            let dist_sq = dot(to_light, to_light);
-            let radius = pl.position_radius.w;
-            let atten = radius / (radius + dist_sq);
-            let ndotl = max(dot(world_norm, normalize(to_light)), 0.0);
-            lighting += pl.color_pad.rgb * ndotl * atten;
-        }
-        final_color = vec4<f32>(final_color.rgb * lighting, final_color.a);
-    } else {
-        // Dim scene when lighting is off so the toggle is visible
-        final_color = vec4<f32>(final_color.rgb * vec3<f32>(0.5), final_color.a);
-    }
-    let fog_amount = uniforms.fog_params.x;
-    let fog_dist = uniforms.fog_params.y;
-    if fog_amount > 0.0 && fog_dist > 0.0 {
-        let view_dist = distance(input.world_pos, uniforms.camera_pos.xyz);
-        let factor = clamp(view_dist / fog_dist, 0.0, 1.0) * fog_amount;
-        final_color = mix(final_color, uniforms.fog_color, factor);
-    }
-    if final_color.a < 0.01 { discard; }
-    return final_color;
+    // DEBUG: output raw texture sample to see if GPU data matches CPU data
+    return tex_color;
 }
 "#;
 

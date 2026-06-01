@@ -699,12 +699,10 @@ impl Module {
                                 }
                             }
                         }
-                        // If still no appearance, try ModelName directly from .utc
-                        if creature_appearance < 0 {
-                            if let Ok(m) = gff.get_string("ModelName") {
-                                if !m.is_empty() && !m.eq_ignore_ascii_case("character_model") && !m.chars().all(|c| c.is_ascii_digit()) {
-                                    c.model_name = Some(m);
-                                }
+                        // ModelName from .utc takes priority over appearance-based 2DA lookup
+                        if let Ok(m) = gff.get_string("ModelName") {
+                            if !m.is_empty() && !m.eq_ignore_ascii_case("character_model") && !m.chars().all(|c| c.is_ascii_digit()) {
+                                c.model_name = Some(m);
                             }
                         }
                     }
@@ -734,13 +732,13 @@ impl Module {
                     }
                 }
                 if name.is_none() {
-                    name = nwn_tileset::lookup_creature_model(creature_appearance, &[erf]);
-                }
-                if name.is_none() {
                     name = hak_index.parse_2da_across_haks("appearance", creature_appearance, "ModelName", mod_dir_path);
                     if name.is_none() {
                         name = hak_index.find_creature_across_haks(creature_appearance, mod_dir_path);
                     }
+                }
+                if name.is_none() {
+                    name = nwn_tileset::lookup_creature_model(creature_appearance, &[erf]);
                 }
                 let bad_name = |n: &str| {
                     n.is_empty() || n.len() <= 2 || n.eq_ignore_ascii_case("Character_model")
@@ -916,7 +914,7 @@ impl Module {
         if creature_appearance < 0 {
             creature_appearance = 0;
         }
-        // Check resource_manager (hak-loaded 2DA, e.g. PRC8 override) BEFORE game data
+        // Priority 1: resource_manager (hak-loaded 2DA)
         let mut name = None;
         if let Some(two_da) = self.resource_manager.get_2da("appearance") {
             for col in &["ModelName", "RACE", "model", "Model"] {
@@ -928,24 +926,7 @@ impl Module {
                 }
             }
         }
-        // Try base game appearance.2da for ModelName/model/Model columns
-        if name.is_none() {
-            if let Some(two_da) = self.resource_manager.get_2da("appearance_base") {
-                for col in &["ModelName", "RACE", "model", "Model"] {
-                    if let Some(m) = two_da.get_cell_by_label(creature_appearance as usize, col) {
-                        if !m.is_empty() && m.len() > 2 && m != "****" {
-                            name = Some(m.to_string());
-                            break;
-                        }
-                    }
-                }
-            }
-        }
-        // Fallback: check game data base appearance.2da
-        if name.is_none() {
-            name = nwn_tileset::lookup_creature_model(creature_appearance, &[erf]);
-        }
-        // Fallback: parse 2da from haks directly
+        // Priority 2: parse 2da from all haks (merges rows across haks)
         if name.as_deref().map_or(true, |n| n.is_empty() || n.len() <= 2) {
             let hak_index = self.get_hak_index();
             if let Some(mod_dir) = self.path.parent() {
@@ -954,6 +935,10 @@ impl Module {
                     name = hak_index.find_creature_across_haks(creature_appearance, mod_dir);
                 }
             }
+        }
+        // Priority 3: check game data base appearance.2da
+        if name.as_deref().map_or(true, |n| n.is_empty() || n.len() <= 2) {
+            name = nwn_tileset::lookup_creature_model(creature_appearance, &[erf]);
         }
         if name.as_deref().map_or(true, |n| n.is_empty() || n.len() <= 2) {
             let pool = [

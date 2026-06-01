@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use eframe::egui;
 use egui::load::SizedTexture;
 
-const ICON_SIZE: u32 = 24;
+const ICON_SIZE: u32 = 12;
 
 pub struct Icons {
     textures: HashMap<String, egui::TextureHandle>,
@@ -85,15 +85,15 @@ impl Icons {
     }
 
     fn text_icon_layout(&self, ui: &mut egui::Ui, label: &str, icon: &str, selected: bool, size: f32) -> egui::Response {
-        let font_id = egui::FontId::proportional(12.0);
+        let font_id = egui::FontId::proportional(9.0);
         let text_w = ui.fonts(|f| {
             let g = f.layout_no_wrap(label.to_string(), font_id.clone(), egui::Color32::WHITE);
             g.size().x
         });
-        let icon_gap = if icon.is_empty() { 0.0 } else { 18.0 };
-        let total_w = text_w + 8.0 + icon_gap;
-        let height = (size + 4.0).max(20.0);
-        let (id, rect) = ui.allocate_space(egui::vec2(total_w.max(24.0), height));
+        let icon_gap = if icon.is_empty() { 0.0 } else { 12.0 };
+        let total_w = text_w + 4.0 + icon_gap;
+        let height = (size + 2.0).max(14.0);
+        let (id, rect) = ui.allocate_space(egui::vec2(total_w.max(18.0), height));
         let resp = ui.interact(rect, id, egui::Sense::click());
         let painter = ui.painter_at(rect);
         if selected || resp.hovered() {
@@ -119,14 +119,14 @@ impl Icons {
     }
 
     pub fn big_label_button(&self, ui: &mut egui::Ui, label: &str, icon: &str) -> egui::Response {
-        let font_id = egui::FontId::proportional(16.0);
+        let font_id = egui::FontId::proportional(11.0);
         let text_w = ui.fonts(|f| {
             let g = f.layout_no_wrap(label.to_string(), font_id.clone(), egui::Color32::WHITE);
             g.size().x
         });
-        let icon_gap = if icon.is_empty() { 0.0 } else { 22.0 };
-        let total_w = text_w + 12.0 + icon_gap;
-        let height = 30.0;
+        let icon_gap = if icon.is_empty() { 0.0 } else { 12.0 };
+        let total_w = text_w + 6.0 + icon_gap;
+        let height = 18.0;
         let (id, rect) = ui.allocate_space(egui::vec2(total_w.max(48.0), height));
         let resp = ui.interact(rect, id, egui::Sense::click());
         let painter = ui.painter_at(rect);

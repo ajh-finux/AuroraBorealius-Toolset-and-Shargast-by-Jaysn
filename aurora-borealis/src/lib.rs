@@ -1220,6 +1220,7 @@ impl AuroraBorealisApp {
 
 impl eframe::App for AuroraBorealisApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        ctx.set_zoom_factor(0.50);
         self.check_pending_tasks();
         if self.pending_compile_all.is_some() || self.pending_save.is_some() {
             ctx.request_repaint();
@@ -1244,13 +1245,13 @@ impl eframe::App for AuroraBorealisApp {
         }
 
         // ===================== TOP TOOLBARS =====================
-        const S: f32 = 12.0;
+        const S: f32 = 8.0;
         let has_mod = self.module.is_some();
         let has_area = self.current_area.is_some();
         let mut filter_changed = false;
 
         // ---- FILE BAR ----
-        egui::TopBottomPanel::top("menu_file").min_height(22.0).show(ctx, |ui| {
+        egui::TopBottomPanel::top("menu_file").min_height(14.0).show(ctx, |ui| {
             ui.style_mut().spacing.item_spacing = egui::vec2(1.0, 0.0);
             egui::ScrollArea::horizontal().id_salt("toolbar_file").show(ui, |ui| {
                 ui.horizontal(|ui| {
@@ -1321,7 +1322,7 @@ impl eframe::App for AuroraBorealisApp {
         });
 
         // ---- VIEW BAR ----
-        egui::TopBottomPanel::top("menu_view").min_height(22.0).show(ctx, |ui| {
+        egui::TopBottomPanel::top("menu_view").min_height(14.0).show(ctx, |ui| {
             ui.style_mut().spacing.item_spacing = egui::vec2(1.0, 0.0);
             egui::ScrollArea::horizontal().id_salt("toolbar_view").show(ui, |ui| {
                 ui.horizontal(|ui| {
@@ -1459,7 +1460,7 @@ impl eframe::App for AuroraBorealisApp {
         });
 
         // ---- TOOLS BAR ----
-        egui::TopBottomPanel::top("menu_tools").min_height(22.0).show(ctx, |ui| {
+        egui::TopBottomPanel::top("menu_tools").min_height(14.0).show(ctx, |ui| {
             ui.style_mut().spacing.item_spacing = egui::vec2(1.0, 0.0);
             egui::ScrollArea::horizontal().id_salt("toolbar_tools").show(ui, |ui| {
                 ui.horizontal(|ui| {
