@@ -34,7 +34,7 @@ pub fn show_item_browser(ui: &mut egui::Ui, rm: &ResourceManager) {
 
     ui.separator();
 
-    if let Some(iprp_2da) = rm.get_2da("iprp") {
+    if let Some(iprp_2da) = rm.get_2da("itemprops") {
         egui::CollapsingHeader::new("Item Properties")
             .default_open(false)
             .show(ui, |ui| {
@@ -68,20 +68,20 @@ pub fn show_item_browser(ui: &mut egui::Ui, rm: &ResourceManager) {
             }
         });
 
-    egui::CollapsingHeader::new("Weapons")
+    egui::CollapsingHeader::new("Weapons (from baseitems.2da)")
         .default_open(false)
         .show(ui, |ui| {
-            if let Some(weapons_2da) = rm.get_2da("weapons") {
-                let rows = weapons_2da.row_count().min(50);
+            if let Some(items_2da) = rm.get_2da("baseitems") {
+                let rows = items_2da.row_count().min(200);
                 for r in 0..rows {
-                    let label = weapons_2da.get_cell_by_label(r, "Label").unwrap_or("");
-                    let name = weapons_2da.get_cell_by_label(r, "Name").unwrap_or(label);
+                    let label = items_2da.get_cell_by_label(r, "Label").unwrap_or("");
+                    let name = items_2da.get_cell_by_label(r, "Name").unwrap_or(label);
                     if !label.is_empty() {
                         ui.label(format!("[{}] {} ({})", r, name, label));
                     }
                 }
             } else {
-                ui.colored_label(egui::Color32::GRAY, "No weapons.2da loaded");
+                ui.colored_label(egui::Color32::GRAY, "No baseitems.2da loaded");
             }
         });
 }

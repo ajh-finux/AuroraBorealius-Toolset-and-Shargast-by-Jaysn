@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 
 pub struct AudioSystem {
+    #[allow(dead_code)]
     handle: Option<rodio::OutputStreamHandle>,
     _stream: Option<rodio::OutputStream>,
     active_sounds: Mutex<HashMap<String, rodio::Sink>>,
@@ -26,6 +27,7 @@ impl AudioSystem {
         }
     }
 
+    #[allow(dead_code)]
     pub fn play_wav(&self, id: &str, data: &[u8], loop_: bool) {
         let Some(ref handle) = self.handle else { eprintln!("play_wav: no handle (no audio device)"); return; };
         let cursor = std::io::Cursor::new(data.to_vec());
@@ -53,6 +55,7 @@ impl AudioSystem {
         }
     }
 
+    #[allow(dead_code)]
     pub fn stop(&self, id: &str) {
         if let Ok(mut active) = self.active_sounds.lock() {
             if let Some(sink) = active.remove(id) {
@@ -69,6 +72,7 @@ impl AudioSystem {
         }
     }
 
+    #[allow(dead_code)]
     pub fn cleanup_finished(&self) {
         if let Ok(mut active) = self.active_sounds.lock() {
             active.retain(|_, sink| !sink.empty());

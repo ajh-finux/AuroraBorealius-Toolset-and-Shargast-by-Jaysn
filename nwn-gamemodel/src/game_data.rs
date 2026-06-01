@@ -64,7 +64,7 @@ impl GameData {
             let count = u32::from_le_bytes([hdr[8], hdr[9], hdr[10], hdr[11]]) as usize;
             if count > 10_000_000 { continue; }
             let var_offset = u32::from_le_bytes([hdr[16], hdr[17], hdr[18], hdr[19]]) as usize;
-            let entries_bytes = count.saturating_mul(12);
+            let entries_bytes = count.saturating_mul(16);
             let total_read = var_offset + entries_bytes;
             if total_read > file_size as usize { continue; }
             let mut data = vec![0u8; total_read];
@@ -215,9 +215,9 @@ fn parse_bif_header(data: &[u8], path: &Path) -> Option<BifFile> {
     if count > 10_000_000 { return None; }
     let var_offset = u32::from_le_bytes([data[16], data[17], data[18], data[19]]) as usize;
     let mut entries = Vec::with_capacity(count.min(1_000_000));
-    // Each entry is 12 bytes: id(u32) + offset(u32) + size(u32)
+    // Each entry is 16 bytes: id(u32) + offset(u32) + size(u32) + type(u32)
     for i in 0..count {
-        let base = var_offset + i * 12;
+        let base = var_offset + i * 16;
         if base + 12 > data.len() { break; }
         let offset = u32::from_le_bytes([data[base+4], data[base+5], data[base+6], data[base+7]]);
         let size = u32::from_le_bytes([data[base+8], data[base+9], data[base+10], data[base+11]]);

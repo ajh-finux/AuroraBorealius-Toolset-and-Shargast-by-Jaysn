@@ -32,7 +32,7 @@ impl TlkFile {
     }
 
     pub fn from_bytes(data: &[u8]) -> Result<Self> {
-        match tlk::Tlk::from_bytes(data, false) {
+        match tlk::Tlk::from_bytes(data, true) {
             Ok((_, inner)) => Ok(Self { inner }),
             Err(e) => Err(TlkError::Parse(match e {
                 nom::Err::Error(e) | nom::Err::Failure(e) => e.to_string(),

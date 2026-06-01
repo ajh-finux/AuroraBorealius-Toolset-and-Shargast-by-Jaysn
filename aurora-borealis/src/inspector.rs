@@ -7,7 +7,7 @@ pub struct SelectedObject {
     pub bag: PropertyBag,
 }
 
-pub fn show_inspector(ui: &mut egui::Ui, obj: &mut SelectedObject, resrefs: &[String], tags: &[String]) -> bool {
+pub fn show_inspector(ui: &mut egui::Ui, obj: &mut SelectedObject, resrefs: &[String], tags: &[String], rm: Option<&nwn_gamemodel::ResourceManager>) -> bool {
     let mut modified = false;
     egui::ScrollArea::vertical().show(ui, |ui| {
         ui.heading(&obj.title);
@@ -34,7 +34,7 @@ pub fn show_inspector(ui: &mut egui::Ui, obj: &mut SelectedObject, resrefs: &[St
                                 title: label,
                                 bag: *inner,
                             };
-                            modified |= show_inspector(ui, &mut inner_obj, resrefs, tags);
+                            modified |= show_inspector(ui, &mut inner_obj, resrefs, tags, rm);
                         });
                 }
                 PropertyValue::List(items) => {
@@ -50,7 +50,7 @@ pub fn show_inspector(ui: &mut egui::Ui, obj: &mut SelectedObject, resrefs: &[St
                                 egui::CollapsingHeader::new(format!("#{}", j))
                                     .default_open(false)
                                     .show(ui, |ui| {
-                                        modified |= show_inspector(ui, &mut item_obj, resrefs, tags);
+                                        modified |= show_inspector(ui, &mut item_obj, resrefs, tags, rm);
                                     });
                             }
                         });
@@ -134,10 +134,19 @@ pub fn show_inspector(ui: &mut egui::Ui, obj: &mut SelectedObject, resrefs: &[St
                     }
                 }
                 PropertyValue::CExoLocString(ls) => {
-                    if let Some(sub) = ls.substrings.first() {
+                    let shown = if let Some(sub) = ls.substrings.first() {
                         ui.label(&sub.text);
+                        true
                     } else {
-                        ui.colored_label(egui::Color32::GRAY, format!("[strref={}]", ls.strref));
+                        false
+                    };
+                    if !shown {
+                        let resolved = rm.and_then(|rm| rm.resolve_string(ls.strref));
+                        if let Some(text) = resolved {
+                            ui.label(text);
+                        } else {
+                            ui.colored_label(egui::Color32::GRAY, format!("[strref={}]", ls.strref));
+                        }
                     }
                 }
                 _ => {
@@ -158,7 +167,7 @@ fn set_prop(bag: &mut PropertyBag, i: usize, value: PropertyValue) {
 }
 
 /// A recursive property bag editor that properly writes back nested changes.
-pub fn show_bag_editor(ui: &mut egui::Ui, bag: &mut PropertyBag, resrefs: &[String], tags: &[String]) -> bool {
+pub fn show_bag_editor(ui: &mut egui::Ui, bag: &mut PropertyBag, resrefs: &[String], tags: &[String], rm: Option<&nwn_gamemodel::ResourceManager>) -> bool {
     let mut modified = false;
     let indices: Vec<usize> = (0..bag.properties.len()).collect();
     for i in indices {
@@ -178,7 +187,7 @@ pub fn show_bag_editor(ui: &mut egui::Ui, bag: &mut PropertyBag, resrefs: &[Stri
                     .default_open(false)
                     .show(ui, |ui| {
                         if let PropertyValue::Struct(inner_bag) = &mut bag.properties[i].value {
-                            modified |= show_bag_editor(ui, inner_bag.as_mut(), resrefs, tags);
+                            modified |= show_bag_editor(ui, inner_bag.as_mut(), resrefs, tags, rm);
                         }
                     });
             }
@@ -192,7 +201,7 @@ pub fn show_bag_editor(ui: &mut egui::Ui, bag: &mut PropertyBag, resrefs: &[Stri
                                 egui::CollapsingHeader::new(format!("#{}", j))
                                     .default_open(false)
                                     .show(ui, |ui| {
-                                        modified |= show_bag_editor(ui, item.as_mut(), resrefs, tags);
+                                        modified |= show_bag_editor(ui, item.as_mut(), resrefs, tags, rm);
                                     });
                             }
                         }
@@ -307,7 +316,11 @@ pub fn show_bag_editor(ui: &mut egui::Ui, bag: &mut PropertyBag, resrefs: &[Stri
                 }
             }
             PropertyValue::CExoLocString(ls) => {
+                let resolved = rm.and_then(|rm| rm.resolve_string(ls.strref));
                 ui.label(format!("[StrRef={}]", ls.strref));
+                if let Some(text) = resolved {
+                    ui.colored_label(egui::Color32::GREEN, &text);
+                }
                 if let Some(sub) = ls.substrings.first() {
                     let mut val = sub.text.clone();
                     if ui.text_edit_singleline(&mut val).changed() {

@@ -460,6 +460,24 @@ pub struct CreatureInstance {
     pub bearing: f32,
     pub appearance: i32,
     pub model_name: Option<String>,
+    pub gender: i32,
+    pub plt_layers: [u8; 10],  // palette row indices for each of 10 PLT layers
+}
+
+impl CreatureInstance {
+    pub fn default_plt_layers() -> [u8; 10] {
+        [62, 62, 0, 0, 0, 0, 0, 0, 63, 63]
+    }
+
+    pub fn build_texture_key(name: &str, plt_layers: &[u8; 10]) -> String {
+        // Create a unique texture key that includes PLT layer colors
+        // so creatures with different colors get different GPU textures
+        format!("{}#{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+            name,
+            plt_layers[0], plt_layers[1], plt_layers[2], plt_layers[3], plt_layers[4],
+            plt_layers[5], plt_layers[6], plt_layers[7], plt_layers[8], plt_layers[9],
+        )
+    }
 }
 
 pub(crate) fn make_field(label: &str, value: nwn_gff::FieldValue) -> nwn_gff::Field {
@@ -555,6 +573,7 @@ impl CreatureInstance {
                 float_field("XOrientation", self.bearing.sin()),
                 float_field("YOrientation", self.bearing.cos()),
                 int_field("Appearance", self.appearance),
+                int_field("Gender", self.gender),
             ],
         }
     }
@@ -569,6 +588,7 @@ impl CreatureInstance {
                 Property { label: "ZPosition".into(), value: PropertyValue::Float(self.z), field_type: 8, category: String::new(), description: String::new() },
                 Property { label: "Bearing".into(), value: PropertyValue::Float(self.bearing), field_type: 8, category: String::new(), description: String::new() },
                 Property { label: "Appearance".into(), value: PropertyValue::Int(self.appearance), field_type: 5, category: String::new(), description: String::new() },
+                Property { label: "Gender".into(), value: PropertyValue::Int(self.gender), field_type: 5, category: String::new(), description: String::new() },
             ],
         }
     }
@@ -583,6 +603,8 @@ impl CreatureInstance {
             bearing: bag.get_float("Bearing").unwrap_or(0.0),
             appearance: bag.get_int("Appearance").unwrap_or(-1),
             model_name: None,
+            gender: bag.get_int("Gender").unwrap_or(0),
+            plt_layers: Self::default_plt_layers(),
         }
     }
 
@@ -597,6 +619,8 @@ impl CreatureInstance {
             bearing: gff_bearing(s),
             appearance: app,
             model_name: None,
+            gender: gff_int(s, "Gender", 0),
+            plt_layers: Self::default_plt_layers(),
         }
     }
 }

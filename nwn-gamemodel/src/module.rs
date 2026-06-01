@@ -21,6 +21,7 @@ pub struct Module {
     pub raw_git: HashMap<String, Vec<u8>>,
     pub raw_fac: Option<Vec<u8>>,
     pub area_names_list: Vec<String>,
+    pub area_display_names: HashMap<String, String>,
     area_cache: RefCell<AreaCache>,
     tileset_cache: RefCell<HashMap<String, nwn_tileset::Tileset>>,
     tileset_order: RefCell<VecDeque<String>>,
@@ -115,6 +116,7 @@ impl Module {
             raw_git: std::collections::HashMap::new(),
             raw_fac: None,
             area_names_list: Vec::new(),
+            area_display_names: HashMap::new(),
             area_cache: RefCell::new(AreaCache::new(MAX_CACHED_AREAS)),
             tileset_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
             tileset_order: std::cell::RefCell::new(VecDeque::new()),
@@ -161,6 +163,7 @@ impl Module {
         if !self.area_names_list.contains(&key) {
             self.area_names_list.push(key.clone());
         }
+        self.area_display_names.insert(key.clone(), name.to_string());
         // Create empty GIT
         let git_struct = nwn_gff::Struct {
             id: u32::MAX,
@@ -216,6 +219,7 @@ impl Module {
                 }
             }
         }
+        
         let mut area_names_list = Vec::new();
         let mut scripts = HashMap::new();
         let mut conversations = HashMap::new();
@@ -256,6 +260,78 @@ impl Module {
             }
         }
 
+        let area_display_names: HashMap<String, String> = area_names_list.iter().filter_map(|resref| {
+            let data = erf.get(resref, resource_types::ARE)?;
+            let gff = nwn_gff::GffFile::from_bytes(&data).ok()?;
+            let mut name = String::new();
+            // Collect all available field names
+            if *resref == area_names_list[0] {
+                let field_names: Vec<String> = gff.root().fields.iter().map(|f| {
+                    let t = match &f.value {
+                        nwn_gff::FieldValue::Byte(_) => "Byte",
+                        nwn_gff::FieldValue::Char(_) => "Char",
+                        nwn_gff::FieldValue::Word(_) => "Word",
+                        nwn_gff::FieldValue::Short(_) => "Short",
+                        nwn_gff::FieldValue::DWord(_) => "DWord",
+                        nwn_gff::FieldValue::Int(_) => "Int",
+                        nwn_gff::FieldValue::DWord64(_) => "DWord64",
+                        nwn_gff::FieldValue::Int64(_) => "Int64",
+                        nwn_gff::FieldValue::Float(_) => "Float",
+                        nwn_gff::FieldValue::Double(_) => "Double",
+                        nwn_gff::FieldValue::String(_) => "String",
+                        nwn_gff::FieldValue::ResRef(_) => "ResRef",
+                        nwn_gff::FieldValue::LocString(_) => "LocString",
+                        nwn_gff::FieldValue::Void(_) => "Void",
+                        nwn_gff::FieldValue::Struct(_) => "Struct",
+                        nwn_gff::FieldValue::List(_) => "List",
+                    };
+                    format!("{} ({})", f.label, t)
+                }).collect();
+                eprintln!("DEBUG: {} fields: {:?}", resref, field_names);
+            }
+            // Try Area_Name first
+            if let Some(fv) = gff.root().find("Area_Name") {
+                match fv {
+                    nwn_gff::FieldValue::LocString(ls) => {
+                        if !ls.strings.is_empty() {
+                            name = ls.strings[0].1.clone();
+                        } else if ls.strref != 0xFFFFFFFF {
+                            for tlk in &resource_manager.tlks {
+                                if let Some(s) = tlk.strref(ls.strref) {
+                                    name = s.to_string();
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    nwn_gff::FieldValue::String(s) => name = s.clone(),
+                    nwn_gff::FieldValue::ResRef(r) => name = r.clone(),
+                    _ => {}
+                }
+            }
+            // Fallback: try "Name" field
+            if name.is_empty() {
+                if let Some(fv) = gff.root().find("Name") {
+                    match fv {
+                        nwn_gff::FieldValue::LocString(ls) => {
+                            if !ls.strings.is_empty() {
+                                name = ls.strings[0].1.clone();
+                            }
+                        }
+                        nwn_gff::FieldValue::String(s) => name = s.clone(),
+                        _ => {}
+                    }
+                }
+            }
+            if name.is_empty() || name == *resref {
+                None
+            } else {
+                eprintln!("DEBUG: display name found: {} -> '{}'", resref, name);
+                Some((resref.clone(), name))
+            }
+        }).collect();
+        eprintln!("DEBUG: {} display names out of {} areas", area_display_names.len(), area_names_list.len());
+
         Ok(Self {
             path,
             ifo,
@@ -269,6 +345,7 @@ impl Module {
             raw_git: HashMap::new(),
             raw_fac: None,
             area_names_list,
+            area_display_names,
             area_cache: RefCell::new(AreaCache::new(MAX_CACHED_AREAS)),
             tileset_cache: RefCell::new(HashMap::new()),
             tileset_order: RefCell::new(VecDeque::new()),
@@ -290,6 +367,10 @@ impl Module {
 
     pub fn area_names(&self) -> &[String] {
         &self.area_names_list
+    }
+
+    pub fn area_display_name(&self, resref: &str) -> String {
+        self.area_display_names.get(resref).cloned().unwrap_or_else(|| resref.to_string())
     }
 
     pub fn num_areas(&self) -> usize {
@@ -445,7 +526,20 @@ impl Module {
 
         for p in &mut area.placeables {
             p.model_name = if p.appearance >= 0 {
-                let mut name = nwn_tileset::lookup_placeable_model(p.appearance, &[erf]);
+                let mut name = None;
+                if let Some(two_da) = self.resource_manager.get_2da("placeables") {
+                    for col in &["ModelName", "model", "Model"] {
+                        if let Some(m) = two_da.get_cell_by_label(p.appearance as usize, col) {
+                            if !m.is_empty() && m.len() > 2 && m != "****" {
+                                name = Some(m.to_string());
+                                break;
+                            }
+                        }
+                    }
+                }
+                if name.is_none() {
+                    name = nwn_tileset::lookup_placeable_model(p.appearance, &[erf]);
+                }
                 if name.is_none() {
                     name = hak_index.parse_2da_across_haks("placeables", p.appearance, "ModelName", mod_dir_path);
                 }
@@ -502,11 +596,40 @@ impl Module {
                 }
                 gt.or(Some(0))
             };
-            d.model_name = nwn_tileset::lookup_door_model(d.appearance, generic_type, &[erf]);
-            if d.model_name.is_none() {
-                if d.appearance > 0 {
+            d.model_name = None;
+            if d.appearance > 0 {
+                // Check resource_manager (hak-loaded 2DAs) first
+                if let Some(two_da) = self.resource_manager.get_2da("doortypes") {
+                    for col in &["ModelName", "model", "Model"] {
+                        if let Some(m) = two_da.get_cell_by_label(d.appearance as usize, col) {
+                            if !m.is_empty() && m.len() > 2 && m != "****" {
+                                d.model_name = Some(m.to_string());
+                                break;
+                            }
+                        }
+                    }
+                }
+                if d.model_name.is_none() {
+                    d.model_name = nwn_tileset::lookup_door_model(d.appearance, generic_type, &[erf]);
+                }
+                if d.model_name.is_none() {
                     d.model_name = hak_index.parse_2da_across_haks("doortypes", d.appearance, "ModelName", mod_dir_path);
-                } else if d.appearance == 0 {
+                }
+            } else if d.appearance == 0 {
+                if let Some(two_da) = self.resource_manager.get_2da("genericdoors") {
+                    for col in &["ModelName", "model", "Model"] {
+                        if let Some(m) = two_da.get_cell_by_label(generic_type.unwrap_or(0) as usize, col) {
+                            if !m.is_empty() && m.len() > 2 && m != "****" {
+                                d.model_name = Some(m.to_string());
+                                break;
+                            }
+                        }
+                    }
+                }
+                if d.model_name.is_none() {
+                    d.model_name = nwn_tileset::lookup_door_model(d.appearance, generic_type, &[erf]);
+                }
+                if d.model_name.is_none() {
                     d.model_name = hak_index.parse_2da_across_haks("genericdoors", generic_type.unwrap_or(0), "ModelName", mod_dir_path);
                 }
             }
@@ -519,8 +642,11 @@ impl Module {
                 }
             }
         }
+        let mut utc_race_ids: HashMap<String, i32> = HashMap::new();
         for c in &mut area.creatures {
             let mut creature_appearance = c.appearance;
+            eprintln!("DEBUG_CR: raw creature '{}' c.appearance={}", c.resref, c.appearance);
+            let mut utc_race_id = -1;
             if creature_appearance < 0 {
                 // Try .utc from module ERF → haks → game data
                 let utc_data = erf.get(&c.resref, resource_types::UTC)
@@ -536,29 +662,127 @@ impl Module {
                 if let Some(data) = utc_data {
                     if let Ok(gff) = nwn_gff::GffFile::from_bytes(&data) {
                         creature_appearance = gff.get_int("Appearance").unwrap_or(-1);
+                        utc_race_id = gff.get_int("Race").unwrap_or(-1);
+                        c.gender = gff.get_int("Gender").unwrap_or(0);
+                        // Read PLT layer color palette indices from .utc
+                        let color_fields = [
+                            ("Color_Skin", 0usize), ("Color_Hair", 1),
+                            ("Color_Metal1", 2), ("Color_Metal2", 3),
+                            ("Color_Cloth1", 4), ("Color_Cloth2", 5),
+                            ("Color_Leather1", 6), ("Color_Leather2", 7),
+                            ("Color_Tattoo1", 8), ("Color_Tattoo2", 9),
+                        ];
+                        for (field, layer) in &color_fields {
+                            if let Ok(v) = gff.get_int(field) {
+                                c.plt_layers[*layer] = v as u8;
+                            }
+                        }
+                        eprintln!("DEBUG_CR:   .utc FOUND, Appearance={} Race={} Gender={} layers={:?}",
+                            creature_appearance, utc_race_id, c.gender, &c.plt_layers[..4]);
+                        // If Appearance is -1 (use default), compute from Race field
+                        if creature_appearance < 0 && utc_race_id >= 0 && utc_race_id <= 6 {
+                            creature_appearance = utc_race_id;
+                        }
+                        // For non-player races (race > 6), map race ID → appearance ID via racialtypes.2da
+                        if creature_appearance < 0 && utc_race_id > 6 {
+                            if let Some(rt) = self.resource_manager.get_2da("racialtypes") {
+                                if let Some(app_col) = rt.columns().iter().position(|c| c == "Appearance") {
+                                    let rid = utc_race_id as usize;
+                                    if rid < rt.row_count() {
+                                        if let Some(app_str) = rt.get_cell(rid, app_col) {
+                                            if let Ok(app_id) = app_str.trim().parse::<i32>() {
+                                                eprintln!("DEBUG_CR:   racialtypes.2da race={} -> Appearance={}", utc_race_id, app_id);
+                                                creature_appearance = app_id;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
                         // If still no appearance, try ModelName directly from .utc
                         if creature_appearance < 0 {
                             if let Ok(m) = gff.get_string("ModelName") {
-                                c.model_name = Some(m);
+                                if !m.is_empty() && !m.eq_ignore_ascii_case("character_model") && !m.chars().all(|c| c.is_ascii_digit()) {
+                                    c.model_name = Some(m);
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    eprintln!("DEBUG_CR:   .utc NOT FOUND for '{}'", c.resref);
+                }
+            }
+            utc_race_ids.insert(c.resref.clone(), utc_race_id);
+            if c.model_name.is_none() {
+                // Only force appearance=0 for player races; non-player races
+                // that didn't resolve via .utc ModelName should fall through
+                // to the creature model pool instead of mapping to Dwarf.
+                if creature_appearance < 0 && utc_race_id >= 0 && utc_race_id <= 6 {
+                    creature_appearance = utc_race_id;
+                }
+                eprintln!("DEBUG_CR: creature '{}' appearance={}", c.resref, creature_appearance);
+                let mut name = None;
+                if let Some(two_da) = self.resource_manager.get_2da("appearance") {
+                    for col in &["ModelName", "RACE", "model", "Model"] {
+                        if let Some(m) = two_da.get_cell_by_label(creature_appearance as usize, col) {
+                            if !m.is_empty() && m.len() > 2 && m != "****" {
+                                eprintln!("DEBUG_CR:   col '{}' -> '{}'", col, m);
+                                name = Some(m.to_string());
+                                break;
                             }
                         }
                     }
                 }
-            }
-            if c.model_name.is_none() {
-                // If creature_appearance was -1 (no appearance data), try default appearance 0
-                if creature_appearance < 0 {
-                    creature_appearance = 0;
+                if name.is_none() {
+                    name = nwn_tileset::lookup_creature_model(creature_appearance, &[erf]);
                 }
-                let mut name = nwn_tileset::lookup_creature_model(creature_appearance, &[erf]);
                 if name.is_none() {
                     name = hak_index.parse_2da_across_haks("appearance", creature_appearance, "ModelName", mod_dir_path);
                     if name.is_none() {
                         name = hak_index.find_creature_across_haks(creature_appearance, mod_dir_path);
                     }
                 }
-                // Final fallback: use hash of resref to pick a diverse model
-                if name.as_deref().map_or(true, |n| n.is_empty() || n.len() <= 2) {
+                let bad_name = |n: &str| {
+                    n.is_empty() || n.len() <= 2 || n.eq_ignore_ascii_case("Character_model")
+                        || n.chars().all(|c| c.is_ascii_digit())
+                        || matches!(n, "Dwarf" | "Elf" | "Gnome" | "Halfling" | "Half-Elf" | "Half-Orc" | "Human"
+                            | "DWARF" | "ELF" | "GNOME" | "HALFLING" | "HALF-ELF" | "HALF-ORC" | "HUMAN")
+                };
+                if name.as_deref().map_or(true, bad_name) {
+                    // Map race ID (0-6) and gender to player body model
+                    let race_model = |race: i32, gender: i32| -> Option<String> {
+                        let prefix = if gender == 1 { "pf" } else { "pm" };
+                        let suffix = match race {
+                            0 => "d0",
+                            1 => "e0",
+                            2 => "g0",
+                            3 => return None,
+                            4 => "a0",
+                            5 => "h0",
+                            6 => "o0",
+                            _ => return None,
+                        };
+                        Some(format!("{}{}", prefix, suffix))
+                    };
+                    // Prefer .utc race_id when available
+                    if let Some(&rid) = utc_race_ids.get(&c.resref) {
+                        if let Some(model) = race_model(rid, c.gender) {
+                            eprintln!("DEBUG_CR: creature '{}' utc_race_id={} gender={} -> player_model {:?}", c.resref, rid, c.gender, model);
+                            name = Some(model);
+                        }
+                    }
+                    // Fallback: try 2DA RACE column
+                    if name.as_deref().map_or(true, bad_name) && creature_appearance >= 0 {
+                        if let Some(two_da) = self.resource_manager.get_2da("appearance") {
+                            if let Some(race) = two_da.get_cell_by_label(creature_appearance as usize, "RACE") {
+                                let model = nwn_tileset::race_to_player_model(&race);
+                                eprintln!("DEBUG_CR: creature_appearance={} RACE='{}' -> player_model={:?}", creature_appearance, race, model);
+                                name = model;
+                            }
+                        }
+                    }
+                }
+                if name.as_deref().map_or(true, bad_name) {
                     let pool = [
                         "c_gnoll", "c_goblinx", "c_basilisk", "c_cat_mpanth",
                         "c_direrat", "c_rat", "c_spidgiant", "c_wagn2",
@@ -570,10 +794,9 @@ impl Module {
                     name = Some(pool[idx].to_string());
                 }
                 c.model_name = name;
+                eprintln!("DEBUG_CR: creature '{}' final model_name={:?}", c.resref, c.model_name);
             }
         }
-
-
 
         let arc = Arc::new(area);
         self.area_cache.borrow_mut().insert(name.to_string(), arc.clone());
@@ -665,9 +888,26 @@ impl Module {
             if let Some(data) = utc_data {
                 if let Ok(gff) = nwn_gff::GffFile::from_bytes(&data) {
                     creature_appearance = gff.get_int("Appearance").unwrap_or(-1);
+                    let utc_race_id = gff.get_int("Race").unwrap_or(-1);
                     if creature_appearance < 0 {
                         if let Ok(m) = gff.get_string("ModelName") {
                             return Some(m);
+                        }
+                        // Map race ID → Appearance via racialtypes.2da
+                        if utc_race_id > 6 {
+                            if let Some(rt) = self.resource_manager.get_2da("racialtypes") {
+                                if let Some(app_col) = rt.columns().iter().position(|c| c == "Appearance") {
+                                    let rid = utc_race_id as usize;
+                                    if rid < rt.row_count() {
+                                        if let Some(app_str) = rt.get_cell(rid, app_col) {
+                                            if let Ok(app_id) = app_str.trim().parse::<i32>() {
+                                                eprintln!("DEBUG_CR: resolve: racialtypes race={} -> Appearance={}", utc_race_id, app_id);
+                                                creature_appearance = app_id;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
                         }
                     }
                 }
@@ -676,8 +916,37 @@ impl Module {
         if creature_appearance < 0 {
             creature_appearance = 0;
         }
-        let mut name = nwn_tileset::lookup_creature_model(creature_appearance, &[erf]);
+        // Check resource_manager (hak-loaded 2DA, e.g. PRC8 override) BEFORE game data
+        let mut name = None;
+        if let Some(two_da) = self.resource_manager.get_2da("appearance") {
+            for col in &["ModelName", "RACE", "model", "Model"] {
+                if let Some(m) = two_da.get_cell_by_label(creature_appearance as usize, col) {
+                    if !m.is_empty() && m.len() > 2 && m != "****" {
+                        name = Some(m.to_string());
+                        break;
+                    }
+                }
+            }
+        }
+        // Try base game appearance.2da for ModelName/model/Model columns
         if name.is_none() {
+            if let Some(two_da) = self.resource_manager.get_2da("appearance_base") {
+                for col in &["ModelName", "RACE", "model", "Model"] {
+                    if let Some(m) = two_da.get_cell_by_label(creature_appearance as usize, col) {
+                        if !m.is_empty() && m.len() > 2 && m != "****" {
+                            name = Some(m.to_string());
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        // Fallback: check game data base appearance.2da
+        if name.is_none() {
+            name = nwn_tileset::lookup_creature_model(creature_appearance, &[erf]);
+        }
+        // Fallback: parse 2da from haks directly
+        if name.as_deref().map_or(true, |n| n.is_empty() || n.len() <= 2) {
             let hak_index = self.get_hak_index();
             if let Some(mod_dir) = self.path.parent() {
                 name = hak_index.parse_2da_across_haks("appearance", creature_appearance, "ModelName", mod_dir);
@@ -687,15 +956,6 @@ impl Module {
             }
         }
         if name.as_deref().map_or(true, |n| n.is_empty() || n.len() <= 2) {
-            // Also try the appearance 2da from resource_manager
-            if let Some(two_da) = self.resource_manager.get_2da("appearance") {
-                let model = two_da.get_cell_by_label(creature_appearance as usize, "Model");
-                if let Some(m) = model {
-                    if !m.is_empty() && m.len() > 2 {
-                        return Some(m.to_string());
-                    }
-                }
-            }
             let pool = [
                 "c_gnoll", "c_goblinx", "c_basilisk", "c_cat_mpanth",
                 "c_direrat", "c_rat", "c_spidgiant", "c_wagn2",
@@ -1071,14 +1331,11 @@ impl Module {
             }
         };
         result.or_else(|| hak_fallback(&name)).or_else(|| {
-            if restype == resource_types::WAV || restype == resource_types::BMU {
-                let res = self.game_data.as_ref().and_then(|gd| gd.get_resource(&name, restype));
-                if res.is_some() { eprintln!("get_resource_data: found via game_data"); }
-                else { eprintln!("get_resource_data: game_data lookup failed for '{}.{}'", name, restype); }
-                res
-            } else {
-                None
+            let res = self.game_data.as_ref().and_then(|gd| gd.get_resource(&name, restype));
+            if res.is_some() {
+                eprintln!("get_resource_data: found '{}.{}' via game_data", name, restype);
             }
+            res
         })
     }
 
@@ -1107,17 +1364,96 @@ impl Module {
     pub fn load_hak_2das(&mut self) {
         let mod_dir = self.path.parent().unwrap_or(Path::new("."));
         let hak_index = nwn_tileset::HakIndex::new(mod_dir, &self.haks);
-        for name in &["placeables", "doortypes", "baseitems", "appearance", "creatures", "genericdoors", "triggers", "waypoints", "encounters", "iprp", "armor", "weapons"] {
-            if self.resource_manager.get_2da(name).is_some() { continue; }
+        for name in &["placeables", "doortypes", "baseitems", "appearance", "genericdoors", "armor", "waypoint", "itemprops", "traps", "racialtypes", "feats", "spells"] {
+            if self.resource_manager.get_2da(name).is_some() {
+                eprintln!("2DA: '{}' already loaded in resource_manager (from module ERF)", name);
+                continue;
+            }
             if let Some(data) = hak_index.get_resource(name, 2017, mod_dir) {
                 if let Ok(s) = std::str::from_utf8(&data) {
                     let _ = self.resource_manager.load_2da(name, s);
+                    eprintln!("2DA: '{}' loaded from haks ({} bytes)", name, data.len());
                 }
             } else if let Some(data) = self.game_data.as_ref().and_then(|gd| gd.get_resource(name, 2017)) {
                 if let Ok(s) = String::from_utf8(data) {
                     let _ = self.resource_manager.load_2da(name, &s);
+                    eprintln!("2DA: '{}' loaded from game data", name);
+                }
+            } else {
+                eprintln!("2DA: '{}' NOT FOUND in haks or game data", name);
+            }
+        }
+        // Generate 2DAs that don't exist in NWN1 base game data from available sources
+        if self.resource_manager.get_2da("creatures").is_none() {
+            let creature_text = self.resource_manager.get_2da("appearance").map(|app_2da| {
+                let mut text = String::from("2DA V2.0\n  Label\n");
+                for row in 0..app_2da.row_count() {
+                    if let Some(label) = app_2da.get_cell_by_label(row, "LABEL") {
+                        text.push_str(&format!("{} {}\n", row, label));
+                    }
+                }
+                let count = app_2da.row_count();
+                (text, count)
+            });
+            if let Some((text, count)) = creature_text {
+                let _ = self.resource_manager.load_2da("creatures", &text);
+                eprintln!("2DA: 'creatures' generated from appearance.2da ({} rows)", count);
+            }
+        }
+        if self.resource_manager.get_2da("triggers").is_none() {
+            let mut text = String::from("2DA V2.0\n  Label\n");
+            let mut count = 0usize;
+            for (resref, restype) in self.resource_list().iter() {
+                if *restype == resource_types::UTT {
+                    text.push_str(&format!("{} {}\n", count, resref));
+                    count += 1;
                 }
             }
+            if count > 0 {
+                let _ = self.resource_manager.load_2da("triggers", &text);
+                eprintln!("2DA: 'triggers' generated from module .utt blueprints ({} entries)", count);
+            }
+        }
+        if self.resource_manager.get_2da("encounters").is_none() {
+            let mut text = String::from("2DA V2.0\n  Label\n");
+            let mut count = 0usize;
+            for (resref, restype) in self.resource_list().iter() {
+                if *restype == resource_types::UTE {
+                    text.push_str(&format!("{} {}\n", count, resref));
+                    count += 1;
+                }
+            }
+            if count > 0 {
+                let _ = self.resource_manager.load_2da("encounters", &text);
+                eprintln!("2DA: 'encounters' generated from module .ute blueprints ({} entries)", count);
+            }
+        }
+        // Generate PLT palette 2DAs for creature rendering
+        let plt_names = ["skin", "hair", "metal", "cloth", "leather", "tattoo"];
+        for &name in &plt_names {
+            if self.resource_manager.get_2da(name).is_some() { continue; }
+            let mut text = String::from("2DA V2.0\n  R  G  B\n");
+            for i in 0..256u16 {
+                let idx = i as u8;
+                let t = idx as f32 / 255.0;
+                let pi = std::f32::consts::PI;
+                let (r, g, b) = match name {
+                    "skin" =>    (255.0 - 150.0*t, 230.0 - 150.0*t, 200.0 - 150.0*t),
+                    "hair" =>    (220.0 - 185.0*t, 180.0 - 160.0*t, 140.0 - 130.0*t),
+                    "metal" =>   (200.0 -  80.0*t, 200.0 - 120.0*t, 210.0 - 140.0*t),
+                    "cloth" =>   (128.0 + 127.0*(t*pi*2.0*0.8        ).sin(),
+                                  128.0 + 127.0*(t*pi*2.0*0.8 + 2.094).sin(),
+                                  128.0 + 127.0*(t*pi*2.0*0.8 + 4.189).sin()),
+                    "leather" => (200.0 - 150.0*t, 150.0 - 110.0*t,  90.0 -  70.0*t),
+                    "tattoo" =>  (128.0 + 127.0*(t*pi*2.0*0.6 + 0.500).sin(),
+                                  128.0 + 127.0*(t*pi*2.0*0.6 + 2.594).sin(),
+                                  128.0 + 127.0*(t*pi*2.0*0.6 + 4.489).sin()),
+                    _ => unreachable!(),
+                };
+                text.push_str(&format!("{} {} {} {}\n", i, r as u8, g as u8, b as u8));
+            }
+            let _ = self.resource_manager.load_2da(name, &text);
+            eprintln!("2DA: '{}' generated for PLT rendering (256 palette entries)", name);
         }
     }
 
@@ -1129,9 +1465,12 @@ impl Module {
     pub fn save_to(&mut self, path: &Path) -> Result<()> {
         let path = path.to_path_buf();
         let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+        // nwn_lib_rs 0.4.0 to_bytes_head always writes 16-byte resrefs regardless
+        // of nwn1 flag. Must use nwn1=true for V1.0 header so parsers expect
+        // 16-byte key entries; V1.1 + 16-byte entries corrupts NWN:EE module loading.
         let mut erf = nwn_erf::ErfFile::new(
             if ext == "hak" || ext == "HAK" { "HAK " } else { "MOD " },
-            false,
+            true,
             None,
         );
 

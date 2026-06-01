@@ -149,8 +149,11 @@ pub fn build_instanced_tiles(area: &Area, model_cache: &mut ModelCache) -> Insta
             if all_empty { continue; }
 
             let mut entries = Vec::new();
-            for (mi, mesh) in meshes.iter().enumerate() {
-                if mesh.indices.is_empty() { continue; }
+        for (mi, mesh) in meshes.iter().enumerate() {
+            if mesh.indices.is_empty() { continue; }
+            // Skip untextured meshes — they are base body geometry that should be
+            // invisible (covered by textured body part meshes like chest, arms, legs).
+            if mesh.texture_name.is_none() { continue; }
                 let gidx = if let Some(&idx) = group_map.get(&(model_name.to_string(), mi)) {
                     idx
                 } else {
@@ -286,14 +289,15 @@ pub fn build_object_models(area: &Area, model_cache: &mut ModelCache, filter: &V
         }
     }
 
-    let mut group_map: HashMap<(String, usize), usize> = HashMap::new();
+    let mut group_map: HashMap<(String, usize, String), usize> = HashMap::new();
     let mut models: Vec<ModelGroup> = Vec::new();
     let mut instance_data: Vec<Vec<InstanceData>> = Vec::new();
 
     let mut add_object_instances = |model_name: &str, x: f32, y: f32, z: f32, bearing: f32,
+                                     plt_key: &str,
                                      models: &mut Vec<ModelGroup>,
                                      instance_data: &mut Vec<Vec<InstanceData>>,
-                                     group_map: &mut HashMap<(String, usize), usize>| {
+                                     group_map: &mut HashMap<(String, usize, String), usize>| {
         let meshes = match model_cache.get_or_load(model_name) {
             Some(ms) if !ms.is_empty() => ms,
             _other => {
@@ -308,11 +312,11 @@ pub fn build_object_models(area: &Area, model_cache: &mut ModelCache, filter: &V
 
         for (mi, mesh) in meshes.iter().enumerate() {
             if mesh.indices.is_empty() { continue; }
-            let gidx = if let Some(&idx) = group_map.get(&(model_name.to_string(), mi)) {
+            let gidx = if let Some(&idx) = group_map.get(&(model_name.to_string(), mi, plt_key.to_string())) {
                 idx
             } else {
                 let idx = models.len();
-                group_map.insert((model_name.to_string(), mi), idx);
+                group_map.insert((model_name.to_string(), mi, plt_key.to_string()), idx);
                 let vertices: Vec<Vertex> = mesh.positions.iter().enumerate().map(|(i, p)| {
                     let n = mesh.normals.get(i).copied().unwrap_or([0.0, 1.0, 0.0]);
                     let u = mesh.uvs.get(i).copied().unwrap_or([0.0, 0.0]);
@@ -327,9 +331,14 @@ pub fn build_object_models(area: &Area, model_cache: &mut ModelCache, filter: &V
                         *idx = (*idx).min(vcount - 1);
                     }
                 }
+                // Build texture name with PLT key suffix for per-creature color variation
+                let tex_name = mesh.texture_name.as_ref().map(|tn| {
+                    if plt_key.is_empty() { tn.clone() }
+                    else { format!("{}#{}", tn, plt_key) }
+                });
                 models.push(ModelGroup {
                     model_name: Some(model_name.to_string()),
-                    texture_name: mesh.texture_name.clone(),
+                    texture_name: tex_name,
                     data: MeshData { vertices, indices },
                 });
                 instance_data.push(Vec::new());
@@ -347,21 +356,24 @@ pub fn build_object_models(area: &Area, model_cache: &mut ModelCache, filter: &V
     if filter.show_placeables {
         for p in &area.placeables {
             if let Some(ref name) = p.model_name {
-                add_object_instances(name, p.x, p.y, p.z, p.bearing, &mut models, &mut instance_data, &mut group_map);
+                add_object_instances(name, p.x, p.y, p.z, p.bearing, "", &mut models, &mut instance_data, &mut group_map);
             }
         }
     }
     if filter.show_doors {
         for d in &area.doors {
             if let Some(ref name) = d.model_name {
-                add_object_instances(name, d.x, d.y, d.z, d.bearing, &mut models, &mut instance_data, &mut group_map);
+                add_object_instances(name, d.x, d.y, d.z, d.bearing, "", &mut models, &mut instance_data, &mut group_map);
             }
         }
     }
     if filter.show_creatures {
         for c in &area.creatures {
             if let Some(ref name) = c.model_name {
-                add_object_instances(name, c.x, c.y, c.z, c.bearing, &mut models, &mut instance_data, &mut group_map);
+                let plt_key = format!("{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+                    c.plt_layers[0], c.plt_layers[1], c.plt_layers[2], c.plt_layers[3], c.plt_layers[4],
+                    c.plt_layers[5], c.plt_layers[6], c.plt_layers[7], c.plt_layers[8], c.plt_layers[9]);
+                add_object_instances(name, c.x, c.y, c.z, c.bearing, &plt_key, &mut models, &mut instance_data, &mut group_map);
             }
         }
     }
@@ -373,13 +385,11 @@ pub fn build_object_models(area: &Area, model_cache: &mut ModelCache, filter: &V
 pub fn build_object_instance_map(area: &Area, obj_inst: &InstancedTiles, model_cache: &ModelCache, filter: &VisibilityFilter) -> HashMap<(String, usize), Vec<(usize, usize)>> {
     let mut map: HashMap<(String, usize), Vec<(usize, usize)>> = HashMap::new();
     let mut group_counts = vec![0usize; obj_inst.instance_data.len()];
-    // Reconstruct group_map: (model_name, mesh_idx) → group_idx, in first-encounter order
-    let mut group_map: HashMap<(String, usize), usize> = HashMap::new();
-    // Track how many groups have been "seen" to match models.len() ordering
+    let mut group_map: HashMap<(String, usize, String), usize> = HashMap::new();
     let mut next_group = 0usize;
 
-    let add_mapping = |model_name: &str, obj_type: &str, obj_idx: usize,
-                           group_map: &mut HashMap<(String, usize), usize>,
+    let add_mapping = |model_name: &str, plt_key: &str, obj_type: &str, obj_idx: usize,
+                           group_map: &mut HashMap<(String, usize, String), usize>,
                            next_group: &mut usize,
                            group_counts: &mut Vec<usize>,
                            map: &mut HashMap<(String, usize), Vec<(usize, usize)>>,
@@ -391,12 +401,13 @@ pub fn build_object_instance_map(area: &Area, obj_inst: &InstancedTiles, model_c
         let mut entries = Vec::new();
         for (mi, mesh) in meshes.iter().enumerate() {
             if mesh.indices.is_empty() { continue; }
-            if !group_map.contains_key(&(model_name.to_string(), mi)) {
-                group_map.insert((model_name.to_string(), mi), *next_group);
+            let key = (model_name.to_string(), mi, plt_key.to_string());
+            if !group_map.contains_key(&key) {
+                group_map.insert(key, *next_group);
                 *next_group += 1;
             }
-            let gidx = group_map[&(model_name.to_string(), mi)];
-            if group_counts[gidx] < obj_inst.instance_data[gidx].len() {
+            let gidx = group_map[&(model_name.to_string(), mi, plt_key.to_string())];
+            if gidx < group_counts.len() && group_counts[gidx] < obj_inst.instance_data.len().checked_sub(gidx).map(|_| obj_inst.instance_data[gidx].len()).unwrap_or(0) {
                 entries.push((gidx, group_counts[gidx]));
                 group_counts[gidx] += 1;
             }
@@ -409,21 +420,24 @@ pub fn build_object_instance_map(area: &Area, obj_inst: &InstancedTiles, model_c
     if filter.show_placeables {
         for (i, p) in area.placeables.iter().enumerate() {
             if let Some(ref name) = p.model_name {
-                add_mapping(name, "placeable", i, &mut group_map, &mut next_group, &mut group_counts, &mut map, model_cache);
+                add_mapping(name, "", "placeable", i, &mut group_map, &mut next_group, &mut group_counts, &mut map, model_cache);
             }
         }
     }
     if filter.show_doors {
         for (i, d) in area.doors.iter().enumerate() {
             if let Some(ref name) = d.model_name {
-                add_mapping(name, "door", i, &mut group_map, &mut next_group, &mut group_counts, &mut map, model_cache);
+                add_mapping(name, "", "door", i, &mut group_map, &mut next_group, &mut group_counts, &mut map, model_cache);
             }
         }
     }
     if filter.show_creatures {
         for (i, c) in area.creatures.iter().enumerate() {
             if let Some(ref name) = c.model_name {
-                add_mapping(name, "creature", i, &mut group_map, &mut next_group, &mut group_counts, &mut map, model_cache);
+                let plt_key = format!("{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+                    c.plt_layers[0], c.plt_layers[1], c.plt_layers[2], c.plt_layers[3], c.plt_layers[4],
+                    c.plt_layers[5], c.plt_layers[6], c.plt_layers[7], c.plt_layers[8], c.plt_layers[9]);
+                add_mapping(name, &plt_key, "creature", i, &mut group_map, &mut next_group, &mut group_counts, &mut map, model_cache);
             }
         }
     }
@@ -1085,6 +1099,7 @@ pub fn build_walkmesh_edges(area: &Area) -> (Vec<f32>, Vec<u32>) {
 }
 
 /// Add a box with 6 faces (24 verts, 36 indices)
+#[allow(dead_code)]
 fn add_box_marker(vertices: &mut Vec<Vertex>, indices: &mut Vec<u32>,
     cx: f32, cy: f32, cz: f32, sx: f32, sy: f32, sz: f32, color: [f32; 4],
     transform: impl Fn(f32, f32, f32) -> (f32, f32, f32))

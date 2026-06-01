@@ -1,7 +1,6 @@
 #![allow(incomplete_features)]
 #![feature(generic_const_exprs)]
 use std::sync::Arc;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use eframe::egui;
 #[cfg(target_arch = "wasm32")]
@@ -195,6 +194,7 @@ fn nwn_steam_linux_path() -> Option<std::path::PathBuf> {
     None
 }
 
+#[cfg(target_os = "windows")]
 fn nwn_windows_steam_path() -> Option<std::path::PathBuf> {
     #[cfg(target_os = "windows")]
     {
@@ -245,7 +245,7 @@ fn nwn_binary_path(root: &std::path::Path) -> std::path::PathBuf {
     { root.join("Neverwinter Nights.app/Contents/MacOS/nwmain") }
 }
 
-fn nwn_local_vault_dir(root: &std::path::Path) -> std::path::PathBuf {
+fn nwn_local_vault_dir(_root: &std::path::Path) -> std::path::PathBuf {
     #[cfg(target_os = "windows")]
     {
         nwn_user_dir().join("localvault")
@@ -262,25 +262,34 @@ fn nwn_local_vault_dir(root: &std::path::Path) -> std::path::PathBuf {
     }
 }
 
-fn nwn_modules_dir() -> String {
-    nwn_user_dir().join("modules").to_string_lossy().to_string()
-}
-
-fn nwn_game_tlk_path() -> std::path::PathBuf {
+fn nwn_game_tlk_path() -> Option<std::path::PathBuf> {
     #[cfg(target_os = "windows")]
-    { nwn_user_dir().join("dialog.tlk") }
-    #[cfg(target_os = "linux")]
+    { return Some(nwn_user_dir().join("dialog.tlk")); }
+    #[cfg(not(target_os = "windows"))]
     {
-        std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default())
-            .join(".local/share/Neverwinter Nights/dialog.tlk")
-    }
-    #[cfg(target_os = "macos")]
-    {
-        std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default())
-            .join("Documents/Neverwinter Nights/dialog.tlk")
+        let home = std::env::var("HOME").ok()?;
+        // Check standard user dir first
+        let user_path = std::path::PathBuf::from(&home).join("Documents/Neverwinter Nights/dialog.tlk");
+        if user_path.exists() {
+            return Some(user_path);
+        }
+        // Steam install (English)
+        let steam_path = std::path::PathBuf::from(&home)
+            .join(".local/share/Steam/steamapps/common/Neverwinter Nights/lang/en/data/dialog.tlk");
+        if steam_path.exists() {
+            return Some(steam_path);
+        }
+        // Fallback to Steam root data (non-English)
+        let steam_root = std::path::PathBuf::from(&home)
+            .join(".local/share/Steam/steamapps/common/Neverwinter Nights/data/dialog.tlk");
+        if steam_root.exists() {
+            return Some(steam_root);
+        }
+        None
     }
 }
 
+#[cfg(target_os = "windows")]
 fn dirs_fallback() -> Option<String> {
     #[cfg(target_os = "windows")]
     {
@@ -801,7 +810,7 @@ static NWNSC: &[u8] = include_bytes!("../../nwnsc");
 static NWSCRIPT_NSS: &[u8] = include_bytes!("../scripts/nwscript.nss");
 
 /// PRC constants missing from EE nwscript.nss, written to tmp dir as an include file.
-const PRC_CONSTANTS_NSS: &[u8] = b"const int SAVING_THROW_TYPE_PARALYSE = 20;\n";
+const PRC_CONSTANTS_NSS: &[u8] = b"const int SAVING_THROW_TYPE_PARALYSE = 20;\nobject GetLastOpener();\n";
 
 include!(concat!(env!("OUT_DIR"), "/nwnx_scripts.rs"));
 
@@ -887,7 +896,7 @@ fn load_item_list(module: Option<&nwn_gamemodel::Module>, area_resref: &str, obj
     let git_data = module.raw_git.get(&git_key);
     let git_gff = git_data.and_then(|d| nwn_gff::GffFile::from_bytes(d).ok());
     let fv_list_name = git_list_name(obj_type);
-    git_gff.as_ref().and_then(|gff| {
+    let result = git_gff.as_ref().and_then(|gff| {
         let list_fv = gff.root().find(fv_list_name)?;
         let list = match list_fv {
             nwn_gff::FieldValue::List(l) => l,
@@ -899,9 +908,77 @@ fn load_item_list(module: Option<&nwn_gamemodel::Module>, area_resref: &str, obj
             nwn_gff::FieldValue::List(l) => l,
             _ => return None,
         };
+        if item_list.is_empty() { return None; }
         let items: Vec<PropertyBag> = item_list.iter().map(|s| PropertyBag::from_gff_struct(s)).collect();
         Some(items)
-    }).unwrap_or_default()
+    });
+    if let Some(items) = result { return items; }
+    // Fallback: try blueprint .utc (creature) or .utp (placeable)
+    let blueprint_restype = match obj_type {
+        "creature" => resource_types::UTC,
+        "placeable" => resource_types::UTP,
+        _ => return vec![],
+    };
+    let fallback_result: Option<Vec<PropertyBag>> = git_gff.as_ref().and_then(|gff| {
+        let list_fv = gff.root().find(fv_list_name)?;
+        let list = match list_fv {
+            nwn_gff::FieldValue::List(l) => l,
+            _ => return None,
+        };
+        let obj_struct = list.get(obj_idx)?;
+        let template_resref = obj_struct.find("TemplateResRef").and_then(|v| match v {
+            nwn_gff::FieldValue::ResRef(s) => { eprintln!("INV_FALLBACK: TemplateResRef ResRef='{}'", s); Some(s.clone()) }
+            nwn_gff::FieldValue::String(s) => { eprintln!("INV_FALLBACK: TemplateResRef String='{}'", s); Some(s.clone()) }
+            _ => { eprintln!("INV_FALLBACK: TemplateResRef not found in GIT struct"); None }
+        })?;
+        let data = module.get_resource_data(&template_resref, blueprint_restype);
+        if data.is_none() {
+            eprintln!("INV_FALLBACK: '{}' .{} not found via get_resource_data", template_resref, if blueprint_restype == resource_types::UTC { "utc" } else { "utp" });
+            // Try direct ERF access
+            if let Some(ref erf) = module.erf {
+                eprintln!("INV_FALLBACK: trying direct ERF lookup");
+                let erf_data = (|| -> Option<Vec<u8>> {
+                    let nl = template_resref.trim().to_lowercase();
+                    let idx = erf.inner.resources.iter().position(|r|
+                        r.file_name.to_string().trim().to_lowercase() == nl && r.resource_type == blueprint_restype
+                    )?;
+                    erf.read_resource_data(&erf.inner.resources[idx])
+                })();
+                if let Some(erf_data) = erf_data {
+                    eprintln!("INV_FALLBACK: found in ERF directly!");
+                    if let Ok(gff) = nwn_gff::GffFile::from_bytes(&erf_data) {
+                        if let Some(item_list_fv) = gff.root().find("ItemList") {
+                            if let nwn_gff::FieldValue::List(item_list) = item_list_fv {
+                                eprintln!("INV_FALLBACK: ERF .utc has {} items", item_list.len());
+                                let items: Vec<PropertyBag> = item_list.iter().map(|s| PropertyBag::from_gff_struct(s)).collect();
+                                return Some(items);
+                            }
+                        }
+                    }
+                }
+            }
+            return None;
+        }
+        let data = data.unwrap();
+        let gff = nwn_gff::GffFile::from_bytes(&data).ok()?;
+        let item_list_fv = gff.root().find("ItemList")?;
+        let item_list = match item_list_fv {
+            nwn_gff::FieldValue::List(l) => l,
+            _ => { eprintln!("INV_FALLBACK: ItemList not a List field in .utc"); return None; }
+        };
+        if item_list.is_empty() {
+            eprintln!("INV_FALLBACK: .utc ItemList is empty");
+            return None;
+        }
+        eprintln!("INV_FALLBACK: .utc has {} items", item_list.len());
+        let items: Vec<PropertyBag> = item_list.iter().map(|s| PropertyBag::from_gff_struct(s)).collect();
+        Some(items)
+    });
+    let result = fallback_result.unwrap_or_default();
+    if result.is_empty() {
+        eprintln!("INV_FALLBACK: no items found for {} #{}", obj_type, obj_idx);
+    }
+    result
 }
 
 fn save_item_list(module: Option<&mut nwn_gamemodel::Module>, area_resref: &str, obj_type: &str, obj_idx: usize, items: &[PropertyBag]) {
@@ -961,6 +1038,7 @@ fn save_item_list(module: Option<&mut nwn_gamemodel::Module>, area_resref: &str,
 }
 
 impl AuroraBorealisApp {
+    #[cfg(target_arch = "wasm32")]
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
         Self::new_with_cli(cc, CliArgs::default())
     }
@@ -1015,7 +1093,18 @@ impl AuroraBorealisApp {
             snap_to_grid_enabled: true,
             show_navigator: true,
             recent_files,
-            tlk_file: None,
+            tlk_file: nwn_game_tlk_path().and_then(|p| {
+                match nwn_tlk::TlkFile::open(&p) {
+                    Ok(tlk) => {
+                        eprintln!("TLK: loaded '{}' with {} strrefs", p.display(), tlk.count());
+                        Some(Arc::new(tlk))
+                    }
+                    Err(e) => {
+                        eprintln!("TLK: failed to load '{}': {}", p.display(), e);
+                        None
+                    }
+                }
+            }),
             area_list_cache: Vec::new(),
             area_search: String::new(),
             show_minimap: false,
@@ -1481,8 +1570,8 @@ impl eframe::App for AuroraBorealisApp {
                         let scripts: Vec<(String, String)> = self.module.as_ref().map(|m| {
                             // Files that should use the user include dir version instead of
                             // the module ERF stub (which may lack needed declarations).
-                            let skip = ["nwscript", "prc_inc_spells", "nw_i0_generic", "x0_i0_spawncond", "x3_inc_horse", "x2_inc_compon", "se_respawn_inc", "staticspawn", "shardrecovery", "shardrecovery1", "bosskill", "pc_eviladjust"];
-                            m.script_names().into_iter().filter_map(|name| {
+let skip = ["nwscript", "prc_inc_spells", "nw_i0_generic", "x0_i0_spawncond", "x3_inc_horse", "x2_inc_compon", "se_respawn_inc", "staticspawn", "shardrecovery", "shardrecovery1", "bosskill", "pc_eviladjust", "nw_o2_coninclude", "sd_ai_inc_spawn"];
+                                m.script_names().into_iter().filter_map(|name| {
                                 if skip.contains(&name) { return None; }
                                 let source = m.get_script_source(name)?;
                                 let nss_path = tmp_dir.join(format!("{}.nss", name));
@@ -1515,6 +1604,21 @@ impl eframe::App for AuroraBorealisApp {
                             let _ = std::fs::write(tmp_dir.join(name), data);
                         }
                         let _ = std::fs::write(tmp_dir.join("_prc_constants.nss"), PRC_CONSTANTS_NSS);
+                        if let Some(ref module) = self.module {
+                            let nn_dir = std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default()).join("Documents/Neverwinter Nights");
+                            let sd_paths = [
+                                nn_dir.join("development/sd_ai_inc_spawn.nss"),
+                                nn_dir.join("development_ch2/sd_ai_inc_spawn.nss"),
+                            ];
+                            let sd_content = sd_paths.iter().find_map(|p| std::fs::read_to_string(p).ok())
+                                .or_else(|| {
+                                    let d = module.get_resource_data("sd_ai_inc_spawn", nwn_gamemodel::resource_types::NSS);
+                                    d.map(|b| String::from_utf8_lossy(&b).to_string())
+                                });
+                            if let Some(c) = sd_content {
+                                let _ = std::fs::write(tmp_dir.join("sd_ai_inc_spawn.nss"), format!("#include \"x2_inc_switches\"\n{}", c).as_bytes());
+                            }
+                        }
                         // Resolve #include "..." from haks/game data and write to temp dir
                         let loose_nss_dirs: Vec<std::path::PathBuf> = self.module.as_ref().map(|m| {
                             let parent = m.path.parent().unwrap_or(std::path::Path::new("."));
@@ -1556,7 +1660,7 @@ impl eframe::App for AuroraBorealisApp {
                                     }
                                     continue;
                                 }
-let prefer_user_include = ["x0_i0_spawncond", "x3_inc_horse", "x2_inc_compon", "prc_inc_spells", "nw_i0_generic", "se_respawn_inc", "staticspawn", "shardrecovery", "shardrecovery1", "bosskill", "pc_eviladjust"];
+let prefer_user_include = ["x0_i0_spawncond", "x3_inc_horse", "x2_inc_compon", "prc_inc_spells", "nw_i0_generic", "se_respawn_inc", "staticspawn", "shardrecovery", "shardrecovery1", "bosskill", "pc_eviladjust", "prc_inc_leadersh", "nw_o2_coninclude"];
                                 let src = if prefer_user_include.contains(&name.as_str()) && std::fs::read(user_include_dir.join(format!("{}.nss", name))).is_ok() {
                                     let data = if name == "prc_inc_spells" {
                                         // Use full version but filter out conflicts with EE nwscript.nss,
@@ -1594,6 +1698,10 @@ let prefer_user_include = ["x0_i0_spawncond", "x3_inc_horse", "x2_inc_compon", "
                                             .collect::<Vec<_>>()
                                             .join("\n");
                                         content = format!("#include \"_prc_constants\"\n{}", content);
+                                        content.into_bytes()
+                                    } else if name == "prc_inc_leadersh" {
+                                        let mut content = std::fs::read_to_string(user_include_dir.join("prc_inc_leadersh.nss")).unwrap();
+                                        content = content.replace("GenerateBossTreasure(oCohort);", "GenerateBossTreasure(oCohort, OBJECT_SELF);");
                                         content.into_bytes()
                                     } else {
                                         std::fs::read(user_include_dir.join(format!("{}.nss", name))).unwrap()
@@ -1682,7 +1790,8 @@ let prefer_user_include = ["x0_i0_spawncond", "x3_inc_horse", "x2_inc_compon", "
                                             .arg("-i").arg(&inc_paths)
                                             .arg("-n").arg(detect_nwn_install().map(|p| p.to_string_lossy().to_string()).unwrap_or_default())
                                             .arg("-q")
-                                                .arg("-r").arg(&out_path)
+                                            .arg("-w")
+                                            .arg("-r").arg(&out_path)
                                                 .arg(&in_path)
                                                 .stdin(std::process::Stdio::null())
                                                 .stdout(std::process::Stdio::piped())
@@ -2085,7 +2194,7 @@ let prefer_user_include = ["x0_i0_spawncond", "x3_inc_horse", "x2_inc_compon", "
                         if let Some(item) = inv.items.get_mut(edit_idx) {
                             ui.heading(format!("Item #{}", edit_idx));
                             ui.separator();
-                            let modified = show_bag_editor(ui, item, &inv_resrefs, &inv_tags);
+                            let modified = show_bag_editor(ui, item, &inv_resrefs, &inv_tags, self.module.as_ref().map(|m| &m.resource_manager));
                             if modified {
                                 let resref = self.current_area.as_ref().map(|a| a.resref.clone()).unwrap_or_default();
                                 save_item_list(self.module.as_mut(), &resref, &inv.obj_type, inv.obj_idx, &inv.items);
@@ -2783,7 +2892,7 @@ let prefer_user_include = ["x0_i0_spawncond", "x3_inc_horse", "x2_inc_compon", "
         if self.module_tree_open {
             let mut open = true;
             egui::Window::new("Module Tree View")
-                .default_size([350.0, 600.0])
+                .default_size([450.0, 600.0])
                 .open(&mut open)
                 .show(ctx, |ui| {
                     if let Some(ref module) = self.module {
@@ -2799,7 +2908,8 @@ let prefer_user_include = ["x0_i0_spawncond", "x3_inc_horse", "x2_inc_compon", "
                                 .default_open(true)
                                 .show(ui, |ui| {
                                     for name in area_names {
-                                        if !area_filter.is_empty() && !name.to_lowercase().contains(&area_filter) { continue; }
+                                        let display = module.area_display_name(name);
+                                        if !area_filter.is_empty() && !name.to_lowercase().contains(&area_filter) && !display.to_lowercase().contains(&area_filter) { continue; }
                                         let git_key = name.trim().to_lowercase();
                                         let counts = module.raw_git.get(&git_key).and_then(|d| {
                                             nwn_gff::GffFile::from_bytes(d).ok()
@@ -2813,7 +2923,12 @@ let prefer_user_include = ["x0_i0_spawncond", "x3_inc_horse", "x2_inc_compon", "
                                             }
                                             parts.join(" ")
                                         }).unwrap_or_default();
-                                        if ui.selectable_label(false, format!("  {}  [{}]", name, counts)).clicked() {
+                                        let label = if display == *name {
+                                            format!("  {}  [{}]", name, counts)
+                                        } else {
+                                            format!("  {} ({})  [{}]", display, name, counts)
+                                        };
+                                        if ui.selectable_label(false, label).clicked() {
                                             // We can't switch areas here easily due to borrows, just show a status
                                             self.status = format!("Double-click area '{}' in area list to switch.", name);
                                         }
@@ -3645,7 +3760,7 @@ let prefer_user_include = ["x0_i0_spawncond", "x3_inc_horse", "x2_inc_compon", "
                 .show(ctx, |ui| {
                     ui.label(format!("ResRef: {}  Type: {}", resref_clone, ext));
                     ui.separator();
-                    show_bag_editor(ui, bag, &bp_resrefs, &bp_tags);
+                    show_bag_editor(ui, bag, &bp_resrefs, &bp_tags, self.module.as_ref().map(|m| &m.resource_manager));
                     ui.separator();
                     if ui.button("Save to Module").clicked() {
                         if let Some(ref mut module) = self.module {
@@ -3713,7 +3828,7 @@ let prefer_user_include = ["x0_i0_spawncond", "x3_inc_horse", "x2_inc_compon", "
         let current_resref = self.current_area.as_ref().map(|a| a.resref.clone());
         egui::SidePanel::left("navigator")
             .resizable(true)
-            .default_width(220.0)
+            .default_width(380.0)
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
                     ui.heading("Areas");
@@ -3725,6 +3840,12 @@ let prefer_user_include = ["x0_i0_spawncond", "x3_inc_horse", "x2_inc_compon", "
                 });
                 ui.separator();
                 let names: Vec<String> = self.module.as_ref().map(|m| m.area_names().iter().map(|s| s.to_string()).collect()).unwrap_or_default();
+                let area_labels: Vec<String> = self.module.as_ref().map(|m| {
+                    names.iter().map(|n| {
+                        let d = m.area_display_name(n);
+                        if d == *n { n.clone() } else { format!("{} ({})", d, n) }
+                    }).collect()
+                }).unwrap_or_default();
                 if names.is_empty() {
                     ui.label("No module loaded.");
                 } else {
@@ -3732,11 +3853,12 @@ let prefer_user_include = ["x0_i0_spawncond", "x3_inc_horse", "x2_inc_compon", "
                     let area_filter = self.area_search.to_lowercase();
                     egui::ScrollArea::vertical().show(ui, |ui| {
                         let mut delete_name: Option<String> = None;
-                        for name in &names {
-                            if !area_filter.is_empty() && !name.to_lowercase().contains(&area_filter) { continue; }
+                        for (i, name) in names.iter().enumerate() {
+                            let label = &area_labels[i];
+                            if !area_filter.is_empty() && !name.to_lowercase().contains(&area_filter) && !label.to_lowercase().contains(&area_filter) { continue; }
                             let selected = current_resref.as_ref().map(|r| r == name).unwrap_or(false);
                             ui.horizontal(|ui| {
-                                if ui.selectable_label(selected, name).clicked() {
+                                if ui.selectable_label(selected, label.as_str()).clicked() {
                                     self.switch_to_area(name, target_format);
                                 }
                                 if selected {
@@ -4037,6 +4159,7 @@ let prefer_user_include = ["x0_i0_spawncond", "x3_inc_horse", "x2_inc_compon", "
                                                     resref: resref.clone(), tag: tag.clone(),
                                                     x: nwn_x, y: nwn_y, z: nwn_z, bearing: 0.0,
                                                     appearance: 0, model_name: None,
+                                                    gender: 0, plt_layers: nwn_gamemodel::CreatureInstance::default_plt_layers(),
                                                 });
                                                 placed = true;
                                             }
@@ -5058,6 +5181,7 @@ let prefer_user_include = ["x0_i0_spawncond", "x3_inc_horse", "x2_inc_compon", "
                                             x: self.new_object_x, y: self.new_object_y,
                                             z: self.new_object_z, bearing: self.new_object_bearing,
                                             appearance: 0, model_name: None,
+                                            gender: 0, plt_layers: nwn_gamemodel::CreatureInstance::default_plt_layers(),
                                         });
                                     }
                                     "door" => {
@@ -5391,12 +5515,27 @@ let prefer_user_include = ["x0_i0_spawncond", "x3_inc_horse", "x2_inc_compon", "
                             if self.icons.icon_button(ui, "eye-target", "Appearance Picker", 20.0).clicked() {
                                 let appearances = self.module.as_ref().and_then(|m| {
                                     let two_da = m.resource_manager.get_2da("appearance")?;
+                                    let base_two_da = m.resource_manager.get_2da("appearance_base");
                                     let mut entries = Vec::new();
                                     for i in 0..two_da.row_count() {
                                         let id = i as i32;
                                         if id > 0 {
-                                            let label = two_da.get_cell_by_label(i, "Label").unwrap_or("").to_string();
-                                            let model = two_da.get_cell_by_label(i, "Model").unwrap_or("").to_string();
+                                            let label = two_da.get_cell_by_label(i, "Label")
+                                                .or_else(|| two_da.get_cell_by_label(i, "NAME"))
+                                                .or_else(|| {
+                                                    base_two_da.and_then(|b| b.get_cell_by_label(i, "Label"))
+                                                })
+                                                .unwrap_or("").to_string();
+                                            let mut model = two_da.get_cell_by_label(i, "ModelName")
+                                                .or_else(|| two_da.get_cell_by_label(i, "model"))
+                                                .or_else(|| two_da.get_cell_by_label(i, "Model"))
+                                                .or_else(|| two_da.get_cell_by_label(i, "RACE"))
+                                                .unwrap_or("").to_string();
+                                            if model.is_empty() {
+                                                model = base_two_da.and_then(|b| b.get_cell_by_label(i, "ModelName")
+                                                    .or_else(|| b.get_cell_by_label(i, "model"))
+                                                    .or_else(|| b.get_cell_by_label(i, "Model"))).unwrap_or("").to_string();
+                                            }
                                             entries.push(AppearanceEntry { id, label, model });
                                         }
                                     }
@@ -5431,7 +5570,7 @@ let prefer_user_include = ["x0_i0_spawncond", "x3_inc_horse", "x2_inc_compon", "
                         }
                         ui.separator();
                     }
-                    inspector_modified = show_inspector(ui, obj, &cached_resrefs, &cached_tags);
+                    inspector_modified = show_inspector(ui, obj, &cached_resrefs, &cached_tags, self.module.as_ref().map(|m| &m.resource_manager));
                 } else if self.selected_tile.is_some() {
                     ui.colored_label(egui::Color32::GREEN, "Tile selected — use Tile Properties window");
                 } else if matches!(self.placement_state, PlacementState::Pending(..)) {
@@ -5472,7 +5611,7 @@ let prefer_user_include = ["x0_i0_spawncond", "x3_inc_horse", "x2_inc_compon", "
                                 let tile_palette: Vec<(i32, String)> = self.module.as_ref()
                                     .map(|m| get_tile_palette(m, &area.tileset))
                                     .unwrap_or_default();
-                                egui::ComboBox::from_id_source("tile_id_combo")
+                                egui::ComboBox::from_id_salt("tile_id_combo")
                                     .selected_text(tile_palette.iter()
                                         .find(|(id, _)| *id == tid)
                                         .map(|(id, name)| format!("{}:{}", id, name))
@@ -5602,7 +5741,32 @@ impl AuroraBorealisApp {
                     let module_name = module.name.clone();
                     eprintln!("TRACE: after Module::open, before load_hak_2das, RSS={} KB", current_rss_kb_inline());
                     module.load_hak_2das();
+                    // Populate PLT palette globals from generated 2DAs
+                    {
+                        use nwn_tileset::{PltPalette, PLT_PALETTES};
+                        let plt_2da_names = ["skin", "hair", "metal", "cloth", "leather", "tattoo"];
+                        let mut palettes: [PltPalette; 6] = std::array::from_fn(|_| [[128, 128, 128, 255]; 256]);
+                        for (i, name) in plt_2da_names.iter().enumerate() {
+                            if let Some(two_da) = module.resource_manager.get_2da(name) {
+                                for row in 0..two_da.row_count().min(256) {
+                                    let r = two_da.get_cell(row, 0).and_then(|s| s.trim().parse::<u8>().ok()).unwrap_or(128);
+                                    let g = two_da.get_cell(row, 1).and_then(|s| s.trim().parse::<u8>().ok()).unwrap_or(128);
+                                    let b = two_da.get_cell(row, 2).and_then(|s| s.trim().parse::<u8>().ok()).unwrap_or(128);
+                                    palettes[i][row] = [r, g, b, 255];
+                                }
+                            }
+                        }
+                        let _ = PLT_PALETTES.set(palettes);
+                        eprintln!("PLT: loaded palette 2DAs for creature rendering");
+                    }
                     module.preload_tilesets();
+                    // Inject game dialog.tlk as lowest-priority fallback
+                    if let Some(tlk_path) = nwn_game_tlk_path() {
+                        if let Ok(tlk) = nwn_tlk::TlkFile::open(&tlk_path) {
+                            eprintln!("TLK: injected game dialog.tlk as fallback ({} strrefs)", tlk.count());
+                            module.resource_manager.tlks.push(tlk);
+                        }
+                    }
                     let data = std::fs::read(path).ok();
                     eprintln!("TRACE: after preload, RSS={} KB", current_rss_kb_inline());
                     self.viewport.set_module_erf(data);
@@ -5793,12 +5957,27 @@ impl AuroraBorealisApp {
             let _ = std::fs::write(tmp_dir.join("nwscript.nss"), NWSCRIPT_NSS);
         }
         let _ = std::fs::write(tmp_dir.join("_prc_constants.nss"), PRC_CONSTANTS_NSS);
+        if let Some(ref module) = self.module {
+            let nn_dir = std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default()).join("Documents/Neverwinter Nights");
+            let sd_paths = [
+                nn_dir.join("development/sd_ai_inc_spawn.nss"),
+                nn_dir.join("development_ch2/sd_ai_inc_spawn.nss"),
+            ];
+            let sd_content = sd_paths.iter().find_map(|p| std::fs::read_to_string(p).ok())
+                .or_else(|| {
+                    let d = module.get_resource_data("sd_ai_inc_spawn", nwn_gamemodel::resource_types::NSS);
+                    d.map(|b| String::from_utf8_lossy(&b).to_string())
+                });
+            if let Some(c) = sd_content {
+                let _ = std::fs::write(tmp_dir.join("sd_ai_inc_spawn.nss"), format!("#include \"x2_inc_switches\"\n{}", c).as_bytes());
+            }
+        }
         let nss_path = tmp_dir.join(format!("{}.nss", name));
         let ncs_path = tmp_dir.join(format!("{}.ncs", name));
         // Write all NSS files so includes resolve
         if let Some(ref module) = self.module {
             for sn in module.script_names() {
-                if ["nwscript", "prc_inc_spells", "nw_i0_generic", "x0_i0_spawncond", "x3_inc_horse", "x2_inc_compon", "se_respawn_inc", "staticspawn", "shardrecovery", "shardrecovery1", "bosskill", "pc_eviladjust"].contains(&sn) { continue; }
+                if ["nwscript", "prc_inc_spells", "nw_i0_generic", "x0_i0_spawncond", "x3_inc_horse", "x2_inc_compon", "se_respawn_inc", "staticspawn", "shardrecovery", "shardrecovery1", "bosskill", "pc_eviladjust", "nw_o2_coninclude", "sd_ai_inc_spawn"].contains(&sn) { continue; }
                 if let Some(src) = module.get_script_source(sn) {
                     let filtered: Vec<u8> = if sn == "prc_inc_spells" || sn == "nw_i0_generic" {
                         let s = src.lines()
@@ -5834,7 +6013,7 @@ impl AuroraBorealisApp {
             while let Some(iname) = queue.pop() {
                 if seen.contains(&iname) { continue; }
                 if ["nwscript", "nwnx_sql"].contains(&iname.as_str()) { seen.insert(iname); continue; }
-                let prefer_user_include = ["x0_i0_spawncond", "x3_inc_horse", "x2_inc_compon", "prc_inc_spells", "nw_i0_generic", "se_respawn_inc", "staticspawn", "shardrecovery", "shardrecovery1", "bosskill", "pc_eviladjust"];
+                let prefer_user_include = ["x0_i0_spawncond", "x3_inc_horse", "x2_inc_compon", "prc_inc_spells", "nw_i0_generic", "se_respawn_inc", "staticspawn", "shardrecovery", "shardrecovery1", "bosskill", "pc_eviladjust", "prc_inc_leadersh", "nw_o2_coninclude"];
                 let src = if prefer_user_include.contains(&iname.as_str()) && std::fs::read(user_include_dir.join(format!("{}.nss", iname))).is_ok() {
                     let data = if iname == "prc_inc_spells" {
                         let mut content = std::fs::read_to_string(user_include_dir.join("prc_inc_spells.nss")).unwrap();
@@ -5869,6 +6048,10 @@ impl AuroraBorealisApp {
                             .collect::<Vec<_>>()
                             .join("\n");
                         content = format!("#include \"_prc_constants\"\n{}", content);
+                        content.into_bytes()
+                    } else if iname == "prc_inc_leadersh" {
+                        let mut content = std::fs::read_to_string(user_include_dir.join("prc_inc_leadersh.nss")).unwrap();
+                        content = content.replace("GenerateBossTreasure(oCohort);", "GenerateBossTreasure(oCohort, OBJECT_SELF);");
                         content.into_bytes()
                     } else {
                         std::fs::read(user_include_dir.join(format!("{}.nss", iname))).unwrap()
@@ -5933,6 +6116,7 @@ impl AuroraBorealisApp {
             .arg("-i").arg(&include_paths)
             .arg("-n").arg(detect_nwn_install().map(|p| p.to_string_lossy().to_string()).unwrap_or_default())
             .arg("-q")
+            .arg("-w")
             .arg("-r").arg(&ncs_path)
             .arg(&nss_path)
             .output();
@@ -6409,10 +6593,20 @@ impl AuroraBorealisApp {
     }
 
     fn sync_area_sounds(&self) {
-        if !self.sound_enabled { return; }
         self.audio_system.stop_all();
+        if !self.sound_enabled { return; }
         let Some(ref module) = self.module else { return };
         let Some(ref area) = self.current_area else { return };
+        for emitter in &area.sound_emitters {
+            for sound_resref in &emitter.sounds {
+                let sound_id = format!("{}:{}", emitter.tag, sound_resref);
+                if let Some(data) = module.get_resource_data(sound_resref, resource_types::WAV) {
+                    self.audio_system.play_wav(&sound_id, &data, true);
+                } else if let Some(data) = module.get_resource_data(sound_resref, resource_types::BMU) {
+                    self.audio_system.play_wav(&sound_id, &data, true);
+                }
+            }
+        }
     }
 
     fn copy_selected_object(&mut self) {
@@ -7347,9 +7541,23 @@ fn cmd_compile_all(args: &[String]) {
         let _ = std::fs::write(tmp_dir.join("nwscript.nss"), NWSCRIPT_NSS);
     }
     let _ = std::fs::write(tmp_dir.join("_prc_constants.nss"), PRC_CONSTANTS_NSS);
+    // Write fixed sd_ai_inc_spawn.nss if found anywhere
+    let nn_dir = std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default()).join("Documents/Neverwinter Nights");
+    let sd_paths = [
+        nn_dir.join("development/sd_ai_inc_spawn.nss"),
+        nn_dir.join("development_ch2/sd_ai_inc_spawn.nss"),
+    ];
+    let sd_content = sd_paths.iter().find_map(|p| std::fs::read_to_string(p).ok())
+        .or_else(|| {
+            let d = module.get_resource_data("sd_ai_inc_spawn", nwn_gamemodel::resource_types::NSS);
+            d.map(|b| String::from_utf8_lossy(&b).to_string())
+        });
+    if let Some(c) = sd_content {
+        let _ = std::fs::write(tmp_dir.join("sd_ai_inc_spawn.nss"), format!("#include \"x2_inc_switches\"\n{}", c).as_bytes());
+    }
 
     let user_include_dir = std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default()).join("Documents/Neverwinter Nights/include");
-    let skip = ["nwscript", "prc_inc_spells", "nw_i0_generic", "x0_i0_spawncond", "x3_inc_horse", "x2_inc_compon", "se_respawn_inc", "staticspawn", "shardrecovery", "shardrecovery1", "bosskill", "pc_eviladjust"];
+    let skip = ["nwscript", "prc_inc_spells", "nw_i0_generic", "x0_i0_spawncond", "x3_inc_horse", "x2_inc_compon", "se_respawn_inc", "staticspawn", "shardrecovery", "shardrecovery1", "bosskill", "pc_eviladjust", "nw_o2_coninclude", "sd_ai_inc_spawn"];
     let scripts: Vec<(String, String)> = module.script_names().into_iter().filter_map(|name| {
         if skip.contains(&name) { return None; }
         let source = module.get_script_source(name)?;
@@ -7412,7 +7620,7 @@ fn cmd_compile_all(args: &[String]) {
                 }
                 continue;
             }
-            let prefer_user_include = ["x0_i0_spawncond", "x3_inc_horse", "x2_inc_compon", "prc_inc_spells", "nw_i0_generic", "se_respawn_inc", "staticspawn", "shardrecovery", "shardrecovery1", "bosskill", "pc_eviladjust"];
+            let prefer_user_include = ["x0_i0_spawncond", "x3_inc_horse", "x2_inc_compon", "prc_inc_spells", "nw_i0_generic", "se_respawn_inc", "staticspawn", "shardrecovery", "shardrecovery1", "bosskill", "pc_eviladjust", "prc_inc_leadersh", "nw_o2_coninclude"];
             let src = if prefer_user_include.contains(&name.as_str()) && std::fs::read(user_include_dir.join(format!("{}.nss", name))).is_ok() {
             let data = if name == "prc_inc_spells" {
                 let mut content = std::fs::read_to_string(user_include_dir.join("prc_inc_spells.nss")).unwrap();
@@ -7447,6 +7655,10 @@ fn cmd_compile_all(args: &[String]) {
                     .collect::<Vec<_>>()
                     .join("\n");
                 content = format!("#include \"_prc_constants\"\n{}", content);
+                content.into_bytes()
+            } else if name == "prc_inc_leadersh" {
+                let mut content = std::fs::read_to_string(user_include_dir.join("prc_inc_leadersh.nss")).unwrap();
+                content = content.replace("GenerateBossTreasure(oCohort);", "GenerateBossTreasure(oCohort, OBJECT_SELF);");
                 content.into_bytes()
             } else {
                 std::fs::read(user_include_dir.join(format!("{}.nss", name))).unwrap()
@@ -7529,6 +7741,7 @@ fn cmd_compile_all(args: &[String]) {
                     .arg("-i").arg(&inc_paths)
                     .arg("-n").arg(detect_nwn_install().map(|p| p.to_string_lossy().to_string()).unwrap_or_default())
                     .arg("-q")
+                    .arg("-w")
                     .arg("-r").arg(&out_path)
                     .arg(&in_path)
                     .stdin(std::process::Stdio::null())
@@ -7633,10 +7846,11 @@ fn cmd_tlk(args: &[String]) {
 
     if found.is_empty() {
         // Try game dialog.tlk
-        let game_tlk_path = nwn_game_tlk_path();
-        if let Ok(tlk) = nwn_tlk::TlkFile::open(&game_tlk_path) {
-            if let Some(text) = tlk.strref(strref_id) {
-                found = text.to_string();
+        if let Some(game_tlk_path) = nwn_game_tlk_path() {
+            if let Ok(tlk) = nwn_tlk::TlkFile::open(&game_tlk_path) {
+                if let Some(text) = tlk.strref(strref_id) {
+                    found = text.to_string();
+                }
             }
         }
     }

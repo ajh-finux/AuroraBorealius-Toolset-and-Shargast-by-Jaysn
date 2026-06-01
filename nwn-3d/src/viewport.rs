@@ -153,25 +153,56 @@ pub struct ViewportState {
     sprite_instance_dirty: bool,
 }
 
+fn parse_plt_key(name: &str) -> (&str, Option<[u8; 10]>) {
+    if let Some(pos) = name.find('#') {
+        let base = &name[..pos];
+        let hex = &name[pos+1..];
+        if hex.len() == 20 {
+            let layers = [
+                u8::from_str_radix(&hex[0..2], 16).unwrap_or(62),
+                u8::from_str_radix(&hex[2..4], 16).unwrap_or(62),
+                u8::from_str_radix(&hex[4..6], 16).unwrap_or(0),
+                u8::from_str_radix(&hex[6..8], 16).unwrap_or(0),
+                u8::from_str_radix(&hex[8..10], 16).unwrap_or(0),
+                u8::from_str_radix(&hex[10..12], 16).unwrap_or(0),
+                u8::from_str_radix(&hex[12..14], 16).unwrap_or(0),
+                u8::from_str_radix(&hex[14..16], 16).unwrap_or(0),
+                u8::from_str_radix(&hex[16..18], 16).unwrap_or(63),
+                u8::from_str_radix(&hex[18..20], 16).unwrap_or(63),
+            ];
+            return (base, Some(layers));
+        }
+    }
+    (name, None)
+}
+
+fn build_plt_spec(layers: &[u8; 10]) -> nwnrs_types::plt::PltRenderSpec {
+    nwn_tileset::build_plt_spec_from_layers(layers)
+}
+
 fn load_texture(name: &str, module_erf: Option<&nwn_erf::ErfFile>, hak_index: Option<&nwn_tileset::HakIndex>, mod_path: Option<&Path>, _hak_names: &[String]) -> Option<(u32, u32, Vec<u8>)> {
+    let (base_name, plt_layers) = parse_plt_key(name);
+    let plt_spec = plt_layers.as_ref().map(build_plt_spec);
+    let plt_spec_ref = plt_spec.as_ref();
+
     // Try module ERF first
     if let Some(erf) = module_erf {
-        if let Some(data) = nwn_tileset::load_texture_data_from_sources(name, &[erf]).ok().flatten() {
+        if let Some(data) = nwn_tileset::load_texture_data_from_sources_custom(base_name, &[erf], plt_spec_ref).ok().flatten() {
             return Some((data.width, data.height, data.rgba));
         }
     }
     // Try specific hak via HakIndex (fast, no full file reads)
     if let (Some(idx), Some(dir)) = (hak_index, mod_path) {
         for &restype in &[8u16, 3u16, 1u16, 6u16] {
-            if let Some(data) = idx.get_resource_from_path(name, restype, dir) {
-                if let Some(tex) = nwn_tileset::decode_texture_data(restype, &data) {
+            if let Some(data) = idx.get_resource_from_path(base_name, restype, dir) {
+                if let Some(tex) = nwn_tileset::decode_texture_data(restype, &data, plt_spec_ref) {
                     return Some((tex.width, tex.height, tex.rgba));
                 }
             }
         }
     }
     // Fall back to game data
-    match nwn_tileset::load_texture_data(name) {
+    match nwn_tileset::load_texture_data_with_spec(base_name, plt_spec_ref) {
         Ok(Some(data)) => {
             Some((data.width, data.height, data.rgba))
         }
@@ -179,7 +210,7 @@ fn load_texture(name: &str, module_erf: Option<&nwn_erf::ErfFile>, hak_index: Op
             None
         }
         Err(e) => {
-            eprintln!("ERROR: Failed to load texture '{name}': {e}");
+            eprintln!("ERROR: Failed to load texture '{base_name}': {e}");
             None
         }
     }
@@ -452,7 +483,11 @@ impl ViewportState {
         }
         let skipped_count = tex_names.len().saturating_sub(texture_slots.len());
         eprintln!("  Textures: {} unique, {} loaded, {} skipped (cap={} MB)", tex_names.len(), loaded_count, skipped_count, max_texture_bytes / 1024 / 1024);
-
+        for tn in &tex_names {
+            if tn.contains("plt") || tn.contains("p_") || tn.contains("a_") {
+                eprintln!("  TEX_NAME: {}", tn);
+            }
+        }
 
         // Create per-model group resources with instance buffers
         let mut group_resources = Vec::new();
@@ -473,6 +508,9 @@ impl ViewportState {
                 });
             if tex_slot == 0 && model.texture_name.is_some() {
                 eprintln!("  MODEL GROUP SLOT0: tex_name='{:?}' — using fallback", model.texture_name);
+            }
+            if model.texture_name.as_ref().map_or(false, |n| n.contains('#')) {
+                eprintln!("  DEBUG_TEX: slot={} tex_name='{:?}' model='{:?}'", tex_slot, model.texture_name, model.model_name);
             }
 
             let vertex_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -1157,11 +1195,18 @@ impl ViewportState {
             render_pass.set_pipeline(&self.tile_pipeline);
             render_pass.set_bind_group(0, &self.uniform_bind_group, &[]);
             let use_fallback = std::env::var("NWN_NO_TEX").is_ok();
-            for grp in &self.groups {
+            for (gi, grp) in self.groups.iter().enumerate() {
                 let bg = if use_fallback {
                     fb_bg
                 } else {
+                    if grp.texture_slot >= self.texture_slots.len() {
+                        eprintln!("  RENDER: group {} texture_slot {} out of range ({} slots)", gi, grp.texture_slot, self.texture_slots.len());
+                        continue;
+                    }
                     let tex_slot = &self.texture_slots[grp.texture_slot];
+                    if tex_slot.bind_group.is_none() {
+                        eprintln!("  RENDER: group {} slot {} bind_group is None", gi, grp.texture_slot);
+                    }
                     tex_slot.bind_group.as_ref()
                 };
                 let bg = match bg {
@@ -1488,11 +1533,32 @@ impl ViewportState {
     }
 
     fn ensure_textures(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) {
-        for slot in &mut self.texture_slots {
+        for (si, slot) in self.texture_slots.iter_mut().enumerate() {
             if slot.bind_group.is_some() {
                 continue;
             }
+            let has_pending = slot.pending.is_some();
+            eprintln!("  ENSURE_TEX: slot={} bind_group={} has_pending={}", si, slot.bind_group.is_some(), has_pending);
             if let Some((width, height, ref data)) = slot.pending.take() {
+                if data.len() > 16 && (si > 50 || si == 1) && si % 10 == 0 {
+                    let r_sum: u64 = data.chunks_exact(4).map(|p| p[0] as u64).sum();
+                    let g_sum: u64 = data.chunks_exact(4).map(|p| p[1] as u64).sum();
+                    let b_sum: u64 = data.chunks_exact(4).map(|p| p[2] as u64).sum();
+                    let total_pix = data.len() / 4;
+                    eprintln!("  TEX_DATA: slot={} {}x{} first=({},{},{},{}) avg=({},{},{})",
+                        si, width, height,
+                        data[0], data[1], data[2], data[3],
+                        r_sum / total_pix as u64, g_sum / total_pix as u64, b_sum / total_pix as u64);
+                }
+                use std::io::Write;
+                // Save every 20th slot's raw data starting from slot 20 for analysis
+                if si > 0 && si % 20 == 0 && data.len() <= 1024*1024 {
+                    let fname = format!("/tmp/tex_slot_{:04}_{}x{}.rgba", si, width, height);
+                    if let Ok(mut f) = std::fs::File::create(&fname) {
+                        let _ = f.write_all(data);
+                        eprintln!("  TEX_SAVE: {} ({} bytes)", fname, data.len());
+                    }
+                }
                 queue.write_texture(
                     wgpu::TexelCopyTextureInfo {
                         texture: &slot.texture,

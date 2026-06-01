@@ -6,6 +6,7 @@ use std::io::{Cursor, Read, Seek, SeekFrom};
 use std::path::Path;
 use std::sync::Mutex;
 use nwn_erf::ErfFile;
+use nwnrs_types::plt::PltLayer;
 use nwnrs_types::resman::{ResContainer, ResRef};
 
 pub type Result<T> = std::result::Result<T, TilesetError>;
@@ -222,16 +223,27 @@ pub fn load_model_mesh(model_name: &str) -> Result<Option<ModelMesh>> {
     }
 }
 
+static MODEL_CACHE: std::sync::Mutex<Option<HashMap<String, Vec<ModelMesh>>>> = std::sync::Mutex::new(None);
+
 /// Load a model and return one `ModelMesh` per unique texture name.
 /// This correctly handles NWN tile models that have different textures
 /// for floor, walls, furniture, etc.
 pub fn load_model_meshes(model_name: &str) -> Result<Option<Vec<ModelMesh>>> {
+    let name_lower = model_name.to_lowercase();
+
+    // Check cache first
+    if let Ok(cache) = MODEL_CACHE.lock() {
+        if let Some(ref map) = *cache {
+            if let Some(meshes) = map.get(&name_lower) {
+                return Ok(Some(meshes.clone()));
+            }
+        }
+    }
+
     let data_dir = match game_data_dir() {
         Some(d) => d,
         None => return Ok(None),
     };
-
-    let name_lower = model_name.to_lowercase();
 
     let data = {
         let mut result = None;
@@ -248,11 +260,50 @@ pub fn load_model_meshes(model_name: &str) -> Result<Option<Vec<ModelMesh>>> {
         }
         match result {
             Some(d) => d,
-            None => return Ok(None),
+            None => {
+                return Ok(None);
+            }
         }
     };
 
-    load_model_meshes_from_data(model_name, &data)
+    let result = load_model_meshes_from_data(model_name, &data);
+
+    // If the model has meshes, cache and return them
+    if let Ok(Some(meshes)) = &result {
+        if !meshes.is_empty() {
+            if let Ok(mut cache) = MODEL_CACHE.lock() {
+                let map = cache.get_or_insert_with(HashMap::new);
+                map.entry(name_lower).or_insert_with(|| meshes.clone());
+            }
+            return Ok(Some(meshes.clone()));
+        }
+    }
+
+    // If no geometry, follow the supermodel chain
+    if let Ok(scene) = nwnrs_types::mdl::parse_scene_model_auto(&data) {
+        if let Some(ref super_name) = scene.supermodel {
+            if super_name != "NULL" && super_name.to_lowercase() != model_name.to_lowercase() {
+                eprintln!("DEBUG_SUPER: '{}' supermodel='{}' — following chain", model_name, super_name);
+                let super_result = load_model_meshes(super_name)?;
+                // Cache this model name pointing to supermodel result
+                if let Some(ref meshes) = super_result {
+                    if !meshes.is_empty() {
+                        eprintln!("DEBUG_SUPER: '{}' → super '{}' → {} meshes (cached)", model_name, super_name, meshes.len());
+                        if let Ok(mut cache) = MODEL_CACHE.lock() {
+                            let map = cache.get_or_insert_with(HashMap::new);
+                            map.entry(model_name.to_lowercase()).or_insert_with(|| meshes.clone());
+                        }
+                        return Ok(Some(meshes.clone()));
+                    }
+                }
+                eprintln!("DEBUG_SUPER: '{}' supermodel '{}' → no meshes (chain failed)", model_name, super_name);
+            }
+        } else {
+            eprintln!("DEBUG_SUPER: '{}' has NO supermodel, meshes=0 — no geometry", model_name);
+        }
+    }
+
+    result
 }
 
 /// Search hak files (one at a time) for a model mesh. Opens only one hak at a time.
@@ -307,6 +358,7 @@ pub fn load_model_meshes_from_data(model_name: &str, data: &[u8]) -> Result<Opti
         Ok(s) => s,
         Err(e) => return Err(TilesetError::Parse(format!("Bake error for '{model_name}': {e}"))),
     };
+    eprintln!("DEBUG_MDL_PARSE: {} scene nodes={} baked meshes={} materials={}", model_name, scene.nodes.len(), baked.meshes.len(), baked.materials.len());
 
     // Apply node world transforms
     {
@@ -379,11 +431,10 @@ pub fn load_model_meshes_from_data(model_name: &str, data: &[u8]) -> Result<Opti
             });
             // NWN convention: "None" means vertex colors only, no texture
             let mut tex_name = tex_name.filter(|n| n.to_ascii_lowercase() != "none");
-            if tex_name.is_none() && !any_textured {
+            if tex_name.is_none() && !is_tile_model {
                 // Model-name-as-texture fallback for creature models (e.g. c_basilisk
-                // whose texture "c_basilisk" was dropped by normalize_texture_name).
-                // Skip for tile models (which won't have a matching texture).
-                if !is_tile_model {
+                // whose texture name matches the model name).
+                if !any_textured {
                     tex_name = Some(model_name.to_string());
                 }
             }
@@ -460,20 +511,20 @@ pub fn load_model_meshes_from_data(model_name: &str, data: &[u8]) -> Result<Opti
                         [1.0, 1.0, 1.0, 1.0]
                     } else if let Some(mi) = prim.material {
                         if let Some(mat) = baked.materials.get(mi) {
-                            // Use material diffuse * 0.5 for vertex-colored primitives.
-                            // The shader applies (ambient + diffuse + point_lights) ≈ 1.166x,
-                            // which over-brightens white vertex colors. Halving the diffuse
-                            // compensates so that final color approximates NWN's ambient-only look.
-                            [(mat.diffuse[0] * 0.5).min(1.0).max(0.0), (mat.diffuse[1] * 0.5).min(1.0).max(0.0), (mat.diffuse[2] * 0.5).min(1.0).max(0.0), mat.alpha.min(1.0).max(0.0)]
+                            // Use material diffuse directly for vertex-colored primitives.
+                            // The shader lighting (ambient + sun + point lights ≈ 0.7x average)
+                            // naturally dims it to the correct visual level.
+                            [mat.diffuse[0].min(1.0).max(0.0), mat.diffuse[1].min(1.0).max(0.0), mat.diffuse[2].min(1.0).max(0.0), mat.alpha.min(1.0).max(0.0)]
                         } else {
-                            [0.35, 0.35, 0.35, 1.0]
+                            [0.6, 0.6, 0.6, 1.0]
                         }
                     } else {
-                        [0.35, 0.35, 0.35, 1.0]
+                        [0.6, 0.6, 0.6, 1.0]
                     };
-                    // For vertex-colored primitives, skip prim.color_rows — they store meaningless
-                    // [1,1,1,1] defaults. Use the material color directly instead.
-                    let color = if has_texture && vi < prim.color_rows.len() && prim.color_rows[vi].len() >= 4 {
+                    // For textured primitives, always use white [1,1,1,1] — the texture provides all color.
+                    // Vertex color rows on player models store non-white values (green, purple, etc.)
+                    // that would incorrectly tint the PLT texture when multiplied.
+                    let color = if !has_texture && vi < prim.color_rows.len() && prim.color_rows[vi].len() >= 4 {
                         let c = &prim.color_rows[vi];
                         [c[0].min(1.0).max(0.0), c[1].min(1.0).max(0.0), c[2].min(1.0).max(0.0), c[3].min(1.0).max(0.0)]
                     } else {
@@ -607,7 +658,8 @@ fn decode_bmp_rgba(data: &[u8]) -> Option<TextureData> {
 }
 
 /// Decode raw texture bytes for a given resource type into RGBA.
-pub fn decode_texture_data(res_type: u16, data: &[u8]) -> Option<TextureData> {
+/// `plt_spec` optionally overrides PLT palette colors (default spec used when None).
+pub fn decode_texture_data(res_type: u16, data: &[u8], plt_spec: Option<&nwnrs_types::plt::PltRenderSpec>) -> Option<TextureData> {
     match res_type {
         8 => {
             if let Ok(dds) = nwnrs_types::dds::DdsTexture::read_from_texture_bytes(data) {
@@ -628,11 +680,72 @@ pub fn decode_texture_data(res_type: u16, data: &[u8]) -> Option<TextureData> {
                 return Some(tex);
             }
         }
-        6 => {
+          6 => {
             if let Ok(plt) = nwnrs_types::plt::PltTexture::read_from_texture_bytes(data) {
-                if let Ok(rgba) = plt.render_rgba8(&nwnrs_types::plt::PltRenderSpec::default()) {
-                    return Some(TextureData { width: plt.width, height: plt.height, rgba });
+                use std::sync::atomic::{AtomicBool, Ordering};
+                static PLT_LOG1: AtomicBool = AtomicBool::new(false);
+                static PLT_LOG2: AtomicBool = AtomicBool::new(false);
+                if !PLT_LOG1.swap(true, Ordering::Relaxed) {
+                    let max_val = plt.pixels.iter().map(|p| p.value).max().unwrap_or(0);
+                    let min_val = plt.pixels.iter().map(|p| p.value).min().unwrap_or(0);
+                    let sum: u64 = plt.pixels.iter().map(|p| p.value as u64).sum();
+                    let avg_val = if !plt.pixels.is_empty() { sum / plt.pixels.len() as u64 } else { 0 };
+                    let vals_gt_128 = plt.pixels.iter().filter(|p| p.value > 128).count();
+                    let total = plt.pixels.len();
+                    let mut layer_counts = [0u64; 10];
+                    for p in &plt.pixels {
+                        if let Some(l) = PltLayer::from_id(p.layer_id) {
+                            layer_counts[l.id() as usize] += 1;
+                        }
+                    }
+                    eprintln!("PLT_STATS: {}x{} pixels={} min={} max={} avg={} >128={}/{} layers={:?}",
+                        plt.width, plt.height, total, min_val, max_val, avg_val, vals_gt_128, total, layer_counts);
                 }
+                let default_spec = nwnrs_types::plt::PltRenderSpec::default();
+                let spec = plt_spec.unwrap_or(&default_spec);
+                // Render PLT using correct NWN shading:
+                // value=0 → black, value=128 → full palette color, value=255 → white
+                let mut rgba = Vec::with_capacity(plt.pixels.len() * 4);
+                for pixel in &plt.pixels {
+                    let [r, g, b, _a] = spec.color_for_layer_id(pixel.layer_id);
+                    let v = pixel.value;
+                    let (fr, fg, fb) = if v <= 128 {
+                        let scale = (v as u32).max(0).min(128) * 2; // 0..128 → 0..256
+                        ((r as u32 * scale / 256).min(255) as u8,
+                         (g as u32 * scale / 256).min(255) as u8,
+                         (b as u32 * scale / 256).min(255) as u8)
+                    } else {
+                        let scale = (v as u32 - 128) * 2; // 1..127 → 2..254
+                        ((r as u32 + (255 - r as u32) * scale / 256).min(255) as u8,
+                         (g as u32 + (255 - g as u32) * scale / 256).min(255) as u8,
+                         (b as u32 + (255 - b as u32) * scale / 256).min(255) as u8)
+                    };
+                    rgba.push(fr);
+                    rgba.push(fg);
+                    rgba.push(fb);
+                    rgba.push(255);
+                }
+                if !PLT_LOG2.swap(true, Ordering::Relaxed) {
+                    let r_sum: u64 = rgba.chunks_exact(4).map(|p| p[0] as u64).sum();
+                    let g_sum: u64 = rgba.chunks_exact(4).map(|p| p[1] as u64).sum();
+                    let b_sum: u64 = rgba.chunks_exact(4).map(|p| p[2] as u64).sum();
+                    let black = rgba.chunks_exact(4).filter(|p| p[0] == 0 && p[1] == 0 && p[2] == 0).count();
+                    let max_rgb = rgba.chunks_exact(4).map(|p| p[0].max(p[1]).max(p[2]) as u16).max().unwrap_or(0);
+                    let total_pix = rgba.len() / 4;
+                    eprintln!("PLT_RGBA: {}x{} avg_rgb=({},{},{}) max_rgb={} black={}/{}",
+                        plt.width, plt.height,
+                        r_sum / total_pix as u64,
+                        g_sum / total_pix as u64,
+                        b_sum / total_pix as u64,
+                        max_rgb, black, total_pix);
+                    // Save first PLT to file for inspection
+                    if let Ok(mut f) = std::fs::File::create("/tmp/plt_dump.rgba") {
+                        use std::io::Write;
+                        let _ = f.write_all(&rgba);
+                        eprintln!("PLT_DUMP: saved /tmp/plt_dump.rgba ({}x{} {} bytes)", plt.width, plt.height, rgba.len());
+                    }
+                }
+                return Some(TextureData { width: plt.width, height: plt.height, rgba });
             }
         }
         _ => {}
@@ -641,7 +754,7 @@ pub fn decode_texture_data(res_type: u16, data: &[u8]) -> Option<TextureData> {
 }
 
 /// Load a texture by normalizing the name and trying all supported resource types.
-fn load_texture_by_name(name: &str, lookup: &dyn Fn(&nwnrs_types::resman::ResRef) -> Option<Vec<u8>>) -> Option<TextureData> {
+fn load_texture_by_name(name: &str, plt_spec: Option<&nwnrs_types::plt::PltRenderSpec>, lookup: &dyn Fn(&nwnrs_types::resman::ResRef) -> Option<Vec<u8>>) -> Option<TextureData> {
     let name_lower = name.to_lowercase()
         .replace(".dds", "").replace(".tga", "").replace(".bmp", "")
         .replace(" ", "_").replace("-", "_");
@@ -649,12 +762,13 @@ fn load_texture_by_name(name: &str, lookup: &dyn Fn(&nwnrs_types::resman::ResRef
     for res_type in &[8u16, 3u16, 1u16, 6u16] {
         let resref = nwnrs_types::resman::ResRef::new(name_lower.clone(), nwnrs_types::resman::ResType(*res_type)).ok()?;
         if let Some(data) = lookup(&resref) {
-            if let Some(tex) = decode_texture_data(*res_type, &data) {
+            if let Some(tex) = decode_texture_data(*res_type, &data, plt_spec) {
                 return Some(tex);
             }
         }
     }
-    None
+    // generate a small gray fallback so missing textures (e.g. FB1_g/TF3_g) render as visible placeholders
+    Some(TextureData { width: 4, height: 4, rgba: vec![128u8; 64] })
 }
 
 /// Search all standard hak directories for a given resource.
@@ -685,12 +799,16 @@ fn load_resource_from_haks(resref: &nwnrs_types::resman::ResRef) -> Option<Vec<u
 }
 
 pub fn load_texture_data(texture_name: &str) -> Result<Option<TextureData>> {
+    load_texture_data_with_spec(texture_name, None)
+}
+
+pub fn load_texture_data_with_spec(texture_name: &str, plt_spec: Option<&nwnrs_types::plt::PltRenderSpec>) -> Result<Option<TextureData>> {
     let data_dir = match game_data_dir() {
         Some(d) => d,
         None => return Ok(None),
     };
 
-    Ok(load_texture_by_name(texture_name, &|resref| {
+    Ok(load_texture_by_name(texture_name, plt_spec, &|resref| {
         load_resource_from_key(resref, &data_dir).ok()?
     }))
 }
@@ -700,29 +818,37 @@ pub fn load_texture_data_from_sources(
     texture_name: &str,
     erfs: &[&nwn_erf::ErfFile],
 ) -> Result<Option<TextureData>> {
+    load_texture_data_from_sources_custom(texture_name, erfs, None)
+}
+
+pub fn load_texture_data_from_sources_custom(
+    texture_name: &str,
+    erfs: &[&nwn_erf::ErfFile],
+    plt_spec: Option<&nwnrs_types::plt::PltRenderSpec>,
+) -> Result<Option<TextureData>> {
     // Search ERFs first
     for erf in erfs {
-        if let Some(data) = load_texture_from_erf(texture_name, erf) {
+        if let Some(data) = load_texture_from_erf(texture_name, plt_spec, erf) {
             return Ok(Some(data));
         }
     }
     // Fall back to game data
-    load_texture_data(texture_name)
+    load_texture_data_with_spec(texture_name, plt_spec)
 }
 
-fn load_texture_from_erf(texture_name: &str, erf: &nwn_erf::ErfFile) -> Option<TextureData> {
+fn load_texture_from_erf(texture_name: &str, plt_spec: Option<&nwnrs_types::plt::PltRenderSpec>, erf: &nwn_erf::ErfFile) -> Option<TextureData> {
     let name = texture_name.to_lowercase()
         .replace(".dds", "").replace(".tga", "").replace(".bmp", "")
         .replace(" ", "_").replace("-", "_");
 
     for &res_type in &[8u16, 3u16, 1u16, 6u16] {
         if let Some(data) = erf.get(&name, res_type) {
-            if let Some(tex) = decode_texture_data(res_type, &data) {
+            if let Some(tex) = decode_texture_data(res_type, &data, plt_spec) {
                 return Some(tex);
             }
         }
     }
-    None
+    None  // not found in ERF — let caller fall through to game data
 }
 
 /// Search haks one at a time for texture data.
@@ -738,7 +864,7 @@ pub fn load_texture_data_from_haks(texture_name: &str, mod_dir: &Path, hak_names
         ];
         for p in &paths {
             if let Ok(erf) = ErfFile::open(p) {
-                if let Some(tex) = load_texture_from_erf(&name, &erf) {
+                if let Some(tex) = load_texture_from_erf(&name, None, &erf) {
                     return Ok(Some(tex));
                 }
                 break;
@@ -748,7 +874,7 @@ pub fn load_texture_data_from_haks(texture_name: &str, mod_dir: &Path, hak_names
             let p = Path::new(home).join("Documents/Neverwinter Nights/hak").join(format!("{}.hak", hak_name));
             if p.exists() {
                 if let Ok(erf) = ErfFile::open(&p) {
-                    if let Some(tex) = load_texture_from_erf(&name, &erf) {
+                    if let Some(tex) = load_texture_from_erf(&name, None, &erf) {
                         return Ok(Some(tex));
                     }
                 }
@@ -756,6 +882,91 @@ pub fn load_texture_data_from_haks(texture_name: &str, mod_dir: &Path, hak_names
         }
     }
     Ok(None)
+}
+
+fn plt_gradient(idx: u8, r0: f32, g0: f32, b0: f32, dr: f32, dg: f32, db: f32) -> [u8; 4] {
+    let t = idx as f32 / 255.0;
+    [
+        (r0 + dr * t).clamp(0.0, 255.0) as u8,
+        (g0 + dg * t).clamp(0.0, 255.0) as u8,
+        (b0 + db * t).clamp(0.0, 255.0) as u8,
+        255,
+    ]
+}
+
+fn plt_skin(idx: u8) -> [u8; 4]   { plt_gradient(idx, 255.0, 230.0, 200.0, -150.0, -150.0, -150.0) }
+fn plt_hair(idx: u8) -> [u8; 4]   { plt_gradient(idx, 220.0, 180.0, 140.0, -185.0, -160.0, -130.0) }
+fn plt_metal(idx: u8) -> [u8; 4]  { plt_gradient(idx, 200.0, 200.0, 210.0, -80.0, -120.0, -140.0) }
+fn plt_cloth(idx: u8) -> [u8; 4]  {
+    let t = idx as f32 / 255.0;
+    let pi = std::f32::consts::PI;
+    [
+        (128.0 + 127.0 * (t * pi * 2.0 * 0.8).sin()) as u8,
+        (128.0 + 127.0 * (t * pi * 2.0 * 0.8 + 2.094).sin()) as u8,
+        (128.0 + 127.0 * (t * pi * 2.0 * 0.8 + 4.189).sin()) as u8,
+        255,
+    ]
+}
+fn plt_leather(idx: u8) -> [u8; 4] { plt_gradient(idx, 200.0, 150.0, 90.0, -150.0, -110.0, -70.0) }
+fn plt_tattoo(idx: u8) -> [u8; 4] {
+    let t = idx as f32 / 255.0;
+    let pi = std::f32::consts::PI;
+    [
+        (128.0 + 127.0 * (t * pi * 2.0 * 0.6).sin()) as u8,
+        (128.0 + 127.0 * (t * pi * 2.0 * 0.6 + 2.094 + 0.5).sin()) as u8,
+        (128.0 + 127.0 * (t * pi * 2.0 * 0.6 + 4.189 + 0.3).sin()) as u8,
+        255,
+    ]
+}
+
+pub type PltPalette = [[u8; 4]; 256];
+pub static PLT_PALETTES: std::sync::OnceLock<[PltPalette; 6]> = std::sync::OnceLock::new();
+
+fn plt_lookup(idx: u8, pal: &PltPalette) -> [u8; 4] {
+    pal.get(idx as usize).copied().unwrap_or([255, 0, 255, 255])
+}
+
+pub fn build_plt_spec_from_layers(layers: &[u8; 10]) -> nwnrs_types::plt::PltRenderSpec {
+    let palettes = PLT_PALETTES.get();
+    let _fallback = [
+        plt_skin(0), plt_skin(0), plt_hair(0), plt_metal(0),
+        plt_cloth(0), plt_cloth(0), plt_leather(0), plt_leather(0),
+        plt_tattoo(0), plt_tattoo(0),
+    ];
+    let layer_colors = if let Some(p) = palettes {
+        [
+            plt_lookup(layers[0], &p[0]),
+            plt_lookup(layers[1], &p[1]),
+            plt_lookup(layers[2], &p[2]),
+            plt_lookup(layers[3], &p[2]),
+            plt_lookup(layers[4], &p[3]),
+            plt_lookup(layers[5], &p[3]),
+            plt_lookup(layers[6], &p[4]),
+            plt_lookup(layers[7], &p[4]),
+            plt_lookup(layers[8], &p[5]),
+            plt_lookup(layers[9], &p[5]),
+        ]
+    } else {
+        // fallback: compute from gradient formulas (matches generated 2DAs)
+        [
+            plt_skin(layers[0]),
+            plt_hair(layers[1]),
+            plt_metal(layers[2]),
+            plt_metal(layers[3]),
+            plt_cloth(layers[4]),
+            plt_cloth(layers[5]),
+            plt_leather(layers[6]),
+            plt_leather(layers[7]),
+            plt_tattoo(layers[8]),
+            plt_tattoo(layers[9]),
+        ]
+    };
+    eprintln!("PLT_SPEC: layers={:?} fallback={} colors={:?}",
+        layers, palettes.is_none(), &layer_colors[..2]);
+    nwnrs_types::plt::PltRenderSpec {
+        layer_colors,
+        unknown_layer_color: [255, 0, 255, 255],
+    }
 }
 
 /// Read only the header + key entries of an ERF file and extract a single resource.
@@ -971,6 +1182,28 @@ fn mat4_is_identity(m: &[[f32; 4]; 4]) -> bool {
 /// Load a 2DA file from game data (KEY/BIF) and look up the model name
 /// for a given row index. For `placeables.2da` and `door.2da`, the column
 /// is `ModelName`. For `appearance.2da`, the column is the 3rd column (index 2).
+/// Split a 2DA data row into tokens, handling quoted strings with spaces.
+fn split_2da_line(line: &str) -> Vec<String> {
+    let mut parts = Vec::new();
+    let mut current = String::new();
+    let mut in_quotes = false;
+    for ch in line.chars() {
+        match ch {
+            '"' => in_quotes = !in_quotes,
+            c if !in_quotes && (c == ' ' || c == '\t') => {
+                if !current.is_empty() {
+                    parts.push(std::mem::take(&mut current));
+                }
+            }
+            c => current.push(c),
+        }
+    }
+    if !current.is_empty() {
+        parts.push(current);
+    }
+    parts
+}
+
 pub fn parse_2da_value(text: &str, row: i32, column_label: &str) -> Option<String> {
     let mut lines = text.lines();
     let _header = lines.next();
@@ -994,14 +1227,14 @@ pub fn parse_2da_value(text: &str, row: i32, column_label: &str) -> Option<Strin
     for line in lines {
         let trimmed = line.trim();
         if trimmed.is_empty() || trimmed.starts_with('#') || trimmed.starts_with("//") { continue; }
-        let parts: Vec<&str> = trimmed.split(|c| c == '\t' || c == ' ').filter(|s| !s.is_empty()).collect();
+        let parts = split_2da_line(trimmed);
         if parts.is_empty() { continue; }
         if parts[0] == target {
             // If the "header" was actually a data row, parts already include the row-number column,
             // so col_idx is the correct index. Otherwise, data rows have one extra leading column.
             let idx = if is_data_line { col_idx } else { col_idx + 1 };
-            let val = parts.get(idx).filter(|s| !s.is_empty() && **s != "****");
-            return val.map(|s| s.to_string());
+            let val = parts.get(idx).filter(|s| !s.is_empty() && s.as_str() != "****");
+            return val.cloned();
         }
     }
     None
@@ -1030,14 +1263,14 @@ fn parse_2da_all_rows(text: &str, column_label: &str, results: &mut Vec<(String,
     for line in lines {
         let trimmed = line.trim();
         if trimmed.is_empty() || trimmed.starts_with('#') || trimmed.starts_with("//") { continue; }
-        let parts: Vec<&str> = trimmed.split(|c| c == '\t' || c == ' ').filter(|s| !s.is_empty()).collect();
+        let parts = split_2da_line(trimmed);
         if parts.is_empty() { continue; }
-        let row_label = parts[0];
+        let row_label = parts[0].clone();
         // Skip duplicate row numbers (first one wins = highest priority)
-        if !seen.insert(row_label.to_string()) { continue; }
+        if !seen.insert(row_label) { continue; }
         let idx = if is_data_line { col_idx } else { col_idx + 1 };
-        if let Some(val) = parts.get(idx).filter(|s| !s.is_empty() && **s != "****") {
-            results.push((row_label.to_string(), val.to_string()));
+        if let Some(val) = parts.get(idx).filter(|s| !s.is_empty() && s.as_str() != "****") {
+            results.push((parts[0].clone(), val.clone()));
         }
     }
 }
@@ -1063,24 +1296,62 @@ impl HakIndex {
         let mod_hak_dir = mod_dir.join("hak");
 
         let mut lookup = HashMap::new();
+        let mut found_count = 0usize;
+        let mut missing_haks = Vec::new();
         for hak_name in hak_names {
             // Search mod dir first (highest priority)
             let search_paths = [
                 mod_dir.join(format!("{}.hak", hak_name)),
                 mod_hak_dir.join(format!("{}.hak", hak_name)),
             ];
+            let mut found = false;
             for p in &search_paths {
                 if Self::index_hak(p, hak_name, &mut lookup) {
+                    found = true;
                     break;
                 }
             }
             // Fall back to home dir
-            if !lookup.iter().any(|((_, _), v)| v.iter().any(|n| n == hak_name)) {
+            if !found {
                 if let Some(ref base) = paths.last() {
                     let home_path = base.join(format!("{}.hak", hak_name));
-                    Self::index_hak(&home_path, hak_name, &mut lookup);
+                    if Self::index_hak(&home_path, hak_name, &mut lookup) {
+                        found = true;
+                    }
                 }
             }
+            // Fall back to subdirectories of mod_dir
+            if !found {
+                let found_in_subdir = std::fs::read_dir(mod_dir)
+                    .ok()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|e| e.ok())
+                    .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+                    .any(|entry| {
+                        let sub_path = entry.path().join(format!("{}.hak", hak_name));
+                        if sub_path.exists() && Self::index_hak(&sub_path, hak_name, &mut lookup) {
+                            eprintln!("HAK: found '{}' in subdir '{}'", hak_name, entry.path().display());
+                            if !paths.iter().any(|p| *p == entry.path()) {
+                                paths.push(entry.path().to_path_buf());
+                            }
+                            true
+                        } else {
+                            false
+                        }
+                    });
+                if found_in_subdir {
+                    found = true;
+                }
+            }
+            if found {
+                found_count += 1;
+            } else {
+                missing_haks.push(hak_name.clone());
+            }
+        }
+        if !missing_haks.is_empty() {
+            eprintln!("HAK: {}/{} haks found. MISSING: {}", found_count, hak_names.len(), missing_haks.join(", "));
         }
         Self { lookup, paths }
     }
@@ -1287,14 +1558,49 @@ pub fn lookup_door_model(
     }
 }
 
+/// Map a RACE column value from appearance.2da to a player body model name.
+/// Handles numeric race IDs (0-6), single-char codes, and full race names.
+/// Returns None for Halfling (race 3) since no player body model exists.
+pub fn race_to_player_model(race: &str) -> Option<String> {
+    let letter = match race {
+        "D" | "d" => 'd',
+        "E" | "e" => 'e',
+        "G" | "g" => 'g',
+        "A" | "a" => 'a',
+        "H" | "h" => 'h',
+        "O" | "o" => 'o',
+        "0" => 'd',
+        "1" => 'e',
+        "2" => 'g',
+        "3" => return None,
+        "4" => 'a',
+        "5" => 'h',
+        "6" => 'o',
+        "Dwarf" | "DWARF" => 'd',
+        "Elf" | "ELF" => 'e',
+        "Gnome" | "GNOME" => 'g',
+        "HalfElf" | "Half-Elf" | "Half_Elf" | "HALFELF" | "HALF-ELF" | "HALF_ELF" => 'a',
+        "HalfOrc" | "Half-Orc" | "Half_Orc" | "HALFORC" | "HALF-ORC" | "HALF_ORC" => 'h',
+        "Human" | "HUMAN" => 'o',
+        "Halfling" | "HALFLING" => return None,
+        _ => return None,
+    };
+    Some(format!("pm{}0", letter))
+}
+
 pub fn lookup_creature_model(appearance: i32, erfs: &[&ErfFile]) -> Option<String> {
     for col in &["ModelName", "model", "MODELTYPE", "BODY_MODEL", "BodyModel", "Model"] {
         if let Some(name) = lookup_model_name_from_2da("appearance", appearance, col, erfs) {
-            return Some(name);
+            if !name.is_empty() && name.len() > 2 && !name.eq_ignore_ascii_case("Character_model") && !name.chars().all(|c| c.is_ascii_digit()) {
+                return Some(name);
+            }
         }
     }
     let race = lookup_model_name_from_2da("appearance", appearance, "RACE", erfs)?;
     let modeltype = lookup_model_name_from_2da("appearance", appearance, "MODELTYPE", erfs)?;
+    if race.len() == 1 || race.eq_ignore_ascii_case("Character_model") || race.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
     let prefix = match race.as_str() {
         "0" | "1" | "2" | "3" => "NWH",
         "4" | "5" | "6" => "NWL",
@@ -1307,11 +1613,18 @@ pub fn lookup_creature_model(appearance: i32, erfs: &[&ErfFile]) -> Option<Strin
 pub fn lookup_creature_model_from_text(text: &str, row: i32) -> Option<String> {
     for col in &["ModelName", "model", "MODELTYPE", "BODY_MODEL", "BodyModel", "Model"] {
         if let Some(name) = parse_2da_value(text, row, col) {
-            return Some(name);
+            if !name.is_empty() && name.len() > 2 && !name.eq_ignore_ascii_case("Character_model") && !name.chars().all(|c| c.is_ascii_digit()) {
+                return Some(name);
+            }
         }
     }
-    let race = parse_2da_value(text, row, "RACE")?;
-    let modeltype = parse_2da_value(text, row, "MODELTYPE")?;
+    let race = parse_2da_value(text, row, "RACE");
+    let modeltype = parse_2da_value(text, row, "MODELTYPE");
+    let race = race?;
+    let modeltype = modeltype?;
+    if race.len() == 1 || race.eq_ignore_ascii_case("Character_model") || race.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
     let prefix = match race.as_str() {
         "0" | "1" | "2" | "3" => "NWH",
         "4" | "5" | "6" => "NWL",
@@ -1370,5 +1683,52 @@ mod tests {
             }
         }
         panic!("No loadable texture found in first 10 models");
+    }
+
+    #[test]
+    fn test_palette_2das_accessible() {
+        let data_dir = match game_data_dir() {
+            Some(d) => d,
+            None => { eprintln!("SKIP: no game data dir"); return; }
+        };
+        let palette_names = ["skin", "hair", "metal", "cloth", "leather"];
+        for name in &palette_names {
+            let resref = match nwnrs_types::resman::ResRef::new(
+                name.to_string(), nwnrs_types::resman::ResType(2017),
+            ) {
+                Ok(r) => r,
+                Err(_) => { eprintln!("FAIL: could not create ResRef for '{}'", name); continue; }
+            };
+            match load_resource_from_key(&resref, &data_dir) {
+                Ok(Some(data)) => {
+                    eprintln!("OK: '{}' loaded ({} bytes)", name, data.len());
+                    if let Ok(text) = std::str::from_utf8(&data) {
+                        let line_count = text.lines().count();
+                        let header_line = text.lines().next().unwrap_or("");
+                        eprintln!("     {} lines, header='{}'", line_count, header_line);
+                        // Check first few rows
+                        for row in 0..3 {
+                            if let Some(r) = parse_2da_value(text, row, "R")
+                                .or_else(|| parse_2da_value(text, row, "Red")) {
+                                let g = parse_2da_value(text, row, "G")
+                                    .or_else(|| parse_2da_value(text, row, "Green")).unwrap_or_default();
+                                let b = parse_2da_value(text, row, "B")
+                                    .or_else(|| parse_2da_value(text, row, "Blue")).unwrap_or_default();
+                                eprintln!("     row {}: R={} G={} B={}", row, r, g, b);
+                            } else {
+                                eprintln!("     row {}: no R/G/B columns found", row);
+                                // Try first few columns
+                                for col in text.lines().nth(1).unwrap_or("").split('\t').take(5) {
+                                    eprintln!("     column: '{}'", col.trim());
+                                }
+                                break;
+                            }
+                        }
+                    }
+                }
+                Ok(None) => eprintln!("MISS: '{}' not found in game data", name),
+                Err(e) => eprintln!("ERR: '{}' load error: {}", name, e),
+            }
+        }
     }
 }
