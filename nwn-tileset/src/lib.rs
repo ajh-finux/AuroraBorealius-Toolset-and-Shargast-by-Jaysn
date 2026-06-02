@@ -430,6 +430,16 @@ pub fn load_model_meshes_from_data(model_name: &str, data: &[u8]) -> Result<Opti
                 })
             });
             // NWN convention: "None" means vertex colors only, no texture
+            use std::sync::atomic::{AtomicBool, Ordering};
+            static TEX_DEBUG: AtomicBool = AtomicBool::new(false);
+            if !TEX_DEBUG.swap(true, Ordering::Relaxed) {
+                eprintln!("TEX_DEBUG '{}' mesh='{}' prim_texs={:?} mat_idx={:?} mat_texs={:?} resolved={:?}",
+                    model_name, mesh.name,
+                    prim.texture_names,
+                    prim.material,
+                    prim.material.and_then(|mi| baked.materials.get(mi)).map(|mat| format!("{:?}", mat.textures)),
+                    tex_name);
+            }
             let mut tex_name = tex_name.filter(|n| n.to_ascii_lowercase() != "none");
             if tex_name.is_none() && !is_tile_model {
                 // Model-name-as-texture fallback for creature models (e.g. c_basilisk
@@ -455,7 +465,7 @@ pub fn load_model_meshes_from_data(model_name: &str, data: &[u8]) -> Result<Opti
                     uvs: Vec::new(),
                     colors: Vec::new(),
                     indices: Vec::new(),
-                    texture_name: tex_name,
+                    texture_name: tex_name.clone(),
                 });
                 groups.len() - 1
             });
@@ -521,15 +531,19 @@ pub fn load_model_meshes_from_data(model_name: &str, data: &[u8]) -> Result<Opti
                     } else {
                         [0.6, 0.6, 0.6, 1.0]
                     };
-                    // For textured primitives, always use white [1,1,1,1] — the texture provides all color.
-                    // Vertex color rows on player models store non-white values (green, purple, etc.)
-                    // that would incorrectly tint the PLT texture when multiplied.
                     let color = if !has_texture && vi < prim.color_rows.len() && prim.color_rows[vi].len() >= 4 {
                         let c = &prim.color_rows[vi];
-                        [c[0].min(1.0).max(0.0), c[1].min(1.0).max(0.0), c[2].min(1.0).max(0.0), c[3].min(1.0).max(0.0)]
+                        if c[0] > 0.99 && c[1] > 0.99 && c[2] > 0.99 {
+                            default_color
+                        } else {
+                            [c[0].min(1.0).max(0.0), c[1].min(1.0).max(0.0), c[2].min(1.0).max(0.0), c[3].min(1.0).max(0.0)]
+                        }
                     } else {
                         default_color
                     };
+                    if group.positions.len() < 10 {
+                        eprintln!("COLOR_DEBUG: '{}' has_tex={} tex={:?} color_rows={:?} default={:?} final={:?}", model_name, has_texture, tex_name, prim.color_rows.get(vi), default_color, color);
+                    }
                     group.colors.push(color);
 
                     group.indices.push(group.positions.len() as u32 - 1);
@@ -539,18 +553,25 @@ pub fn load_model_meshes_from_data(model_name: &str, data: &[u8]) -> Result<Opti
     }
 
     // Convert groups to ModelMesh with auto-generated normals
-    let result: Vec<ModelMesh> = groups.into_iter().filter(|g| !g.positions.is_empty()).map(|g| {
+    let mut result: Vec<ModelMesh> = Vec::new();
+    for g in groups {
+        if g.positions.is_empty() { continue; }
+        let vert_count = g.positions.len();
+        let tex_name = g.texture_name.clone();
         let normals = compute_normals(&g.positions, &g.indices);
-        ModelMesh {
+        result.push(ModelMesh {
             positions: g.positions,
             normals,
             indices: g.indices,
             uvs: g.uvs,
             colors: g.colors,
-            texture_name: g.texture_name,
+            texture_name: tex_name.clone(),
             name: model_name.to_string(),
+        });
+        if !is_tile_model {
+            eprintln!("  MDL_GROUP[{}] tex={:?} verts={}", model_name, tex_name, vert_count);
         }
-    }).collect();
+    }
 
     if result.is_empty() {
         Ok(None)
@@ -745,6 +766,7 @@ pub fn decode_texture_data(res_type: u16, data: &[u8], plt_spec: Option<&nwnrs_t
                         eprintln!("PLT_DUMP: saved /tmp/plt_dump.rgba ({}x{} {} bytes)", plt.width, plt.height, rgba.len());
                     }
                 }
+
                 return Some(TextureData { width: plt.width, height: plt.height, rgba });
             }
         }
@@ -961,8 +983,12 @@ pub fn build_plt_spec_from_layers(layers: &[u8; 10]) -> nwnrs_types::plt::PltRen
             plt_tattoo(layers[9]),
         ]
     };
-    eprintln!("PLT_SPEC: layers={:?} fallback={} colors={:?}",
-        layers, palettes.is_none(), &layer_colors[..2]);
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static PLT_LOG_SPEC: AtomicBool = AtomicBool::new(false);
+    if !PLT_LOG_SPEC.swap(true, Ordering::Relaxed) {
+        eprintln!("PLT_SPEC: layers={:?} fallback={} colors={:?}",
+            layers, palettes.is_none(), &layer_colors[..2]);
+    }
     nwnrs_types::plt::PltRenderSpec {
         layer_colors,
         unknown_layer_color: [255, 0, 255, 255],

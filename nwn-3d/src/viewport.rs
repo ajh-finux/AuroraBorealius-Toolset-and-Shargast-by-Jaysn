@@ -182,6 +182,18 @@ fn build_plt_spec(layers: &[u8; 10]) -> nwnrs_types::plt::PltRenderSpec {
 
 fn load_texture(name: &str, module_erf: Option<&nwn_erf::ErfFile>, hak_index: Option<&nwn_tileset::HakIndex>, mod_path: Option<&Path>, _hak_names: &[String]) -> Option<(u32, u32, Vec<u8>)> {
     let (base_name, plt_layers) = parse_plt_key(name);
+    // DEBUG: trace first 5 PLT texture loads
+    if let Some(layers) = plt_layers {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static PLT_LOAD_CNT: AtomicU32 = AtomicU32::new(0);
+        let n = PLT_LOAD_CNT.fetch_add(1, Ordering::Relaxed);
+        if n < 2 {
+            eprintln!("PLT_LOAD[{}]: name='{}' base='{}' layers={:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+                n, name, base_name,
+                layers[0], layers[1], layers[2], layers[3], layers[4],
+                layers[5], layers[6], layers[7], layers[8], layers[9]);
+        }
+    }
     let plt_spec = plt_layers.as_ref().map(build_plt_spec);
     let plt_spec_ref = plt_spec.as_ref();
 
@@ -202,7 +214,7 @@ fn load_texture(name: &str, module_erf: Option<&nwn_erf::ErfFile>, hak_index: Op
         }
     }
     // Fall back to game data
-    match nwn_tileset::load_texture_data_with_spec(base_name, plt_spec_ref) {
+    let result = match nwn_tileset::load_texture_data_with_spec(base_name, plt_spec_ref) {
         Ok(Some(data)) => {
             Some((data.width, data.height, data.rgba))
         }
@@ -213,7 +225,8 @@ fn load_texture(name: &str, module_erf: Option<&nwn_erf::ErfFile>, hak_index: Op
             eprintln!("ERROR: Failed to load texture '{base_name}': {e}");
             None
         }
-    }
+    };
+    result
 }
 
 impl ViewportState {
@@ -482,7 +495,7 @@ impl ViewportState {
             });
         }
         let skipped_count = tex_names.len().saturating_sub(texture_slots.len());
-        eprintln!("  Textures: {} unique, {} loaded, {} skipped (cap={} MB)", tex_names.len(), loaded_count, skipped_count, max_texture_bytes / 1024 / 1024);
+        eprintln!("  Textures: {} unique, {} loaded, {} skipped (cap={} MB) — tex_slot_map len={}", tex_names.len(), loaded_count, skipped_count, max_texture_bytes / 1024 / 1024, tex_slot_map.len());
 
         // Add a fallback texture slot at index 0 (2x2 white)
         let fb_tex = device.create_texture(&wgpu::TextureDescriptor {
@@ -552,9 +565,13 @@ impl ViewportState {
         // Create per-model group resources (vertex/index/instance buffers) for tile + object models
         let mut group_resources = Vec::new();
         for (midx, model) in instanced.models.iter().enumerate() {
+            let tn = model.texture_name.as_deref().unwrap_or("FALLBACK");
             let tex_slot = model.texture_name.as_ref()
                 .and_then(|n| tex_slot_map.get(n.as_str()).copied())
                 .unwrap_or(0);
+            if tex_slot == 0 && model.model_name.as_deref().map_or(false, |n| n.as_bytes().first() != Some(&b't')) {
+                eprintln!("  MODEL_TEX[{}] model={:?} tex_name={:?} verts={} -> SLOT 0 (fallback!)", midx, model.model_name, tn, model.data.vertices.len());
+            }
             let vertex_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some("nwn3d_inst_vbuf"),
                 contents: bytemuck::cast_slice(&model.data.vertices),

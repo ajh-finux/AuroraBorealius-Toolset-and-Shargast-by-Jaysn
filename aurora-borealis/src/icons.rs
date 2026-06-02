@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use eframe::egui;
 use egui::load::SizedTexture;
 
-const ICON_SIZE: u32 = 12;
+const ICON_SIZE: u32 = 24;
 
 pub struct Icons {
     textures: HashMap<String, egui::TextureHandle>,

@@ -60,8 +60,7 @@ fn vs_main(input: VertexInput) -> VertexOutput {
 @fragment
 fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     let tex_color = textureSample(texture, texture_sampler, input.uv);
-    // DEBUG: output raw texture sample to see if GPU data matches CPU data
-    return tex_color;
+    return tex_color * input.color;
 }
 "#;
 

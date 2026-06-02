@@ -273,6 +273,11 @@ fn nwn_game_tlk_path() -> Option<std::path::PathBuf> {
         if user_path.exists() {
             return Some(user_path);
         }
+        // Check tlk subdirectory (some setups place dialog.tlk here)
+        let tlk_dir_path = std::path::PathBuf::from(&home).join("Documents/Neverwinter Nights/tlk/dialog.tlk");
+        if tlk_dir_path.exists() {
+            return Some(tlk_dir_path);
+        }
         // Steam install (English)
         let steam_path = std::path::PathBuf::from(&home)
             .join(".local/share/Steam/steamapps/common/Neverwinter Nights/lang/en/data/dialog.tlk");
@@ -1220,7 +1225,7 @@ impl AuroraBorealisApp {
 
 impl eframe::App for AuroraBorealisApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        ctx.set_zoom_factor(0.50);
+        ctx.set_zoom_factor(1.5);
         self.check_pending_tasks();
         if self.pending_compile_all.is_some() || self.pending_save.is_some() {
             ctx.request_repaint();
