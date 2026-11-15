@@ -3,8 +3,8 @@
 
 use std::collections::HashMap;
 use std::io::{Cursor, Read, Seek, SeekFrom};
-use std::path::Path;
-use std::sync::Mutex;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, OnceLock};
 use nwn_erf::ErfFile;
 use nwnrs_types::plt::PltLayer;
 use nwnrs_types::resman::{ResContainer, ResRef};
@@ -119,6 +119,53 @@ fn cache_key(resref: &ResRef) -> String {
     format!("{}:{}", resref.res_ref().to_lowercase(), resref.res_type().0)
 }
 
+// Parsed indexes are separate from the existing raw-resource cache. Game
+// archives are expected to remain unchanged during a running editor session.
+struct CachedKeyIndex {
+    bytes: u64,
+    modified: std::time::SystemTime,
+    table: Arc<nwnrs_types::key::KeyTable>,
+}
+static PARSED_KEY_INDEXES: OnceLock<Mutex<HashMap<PathBuf, CachedKeyIndex>>> = OnceLock::new();
+const MAX_PARSED_KEY_INDEXES: usize = 16;
+
+fn cached_key_table(path: &Path) -> Option<Arc<nwnrs_types::key::KeyTable>> {
+    let mut entries = PARSED_KEY_INDEXES.get_or_init(|| Mutex::new(HashMap::new())).lock().ok()?;
+    cached_key_table_in(path, &mut entries)
+}
+
+fn cached_key_table_in(
+    path: &Path,
+    entries: &mut HashMap<PathBuf, CachedKeyIndex>,
+) -> Option<Arc<nwnrs_types::key::KeyTable>> {
+    // Freeze relative paths for the lazy BIF resolver, but preserve symlink
+    // spelling: sibling BIFs resolve against the supplied KEY path's parent,
+    // not the symlink target's directory.
+    let path = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir().ok()?.join(path)
+    };
+    let metadata = std::fs::metadata(&path).ok()?;
+    let modified = metadata.modified().ok()?;
+    if let Some(entry) = entries.get(&path) {
+        if entry.bytes == metadata.len() && entry.modified == modified {
+            return Some(Arc::clone(&entry.table));
+        }
+    }
+    entries.remove(&path);
+    let table = Arc::new(nwnrs_types::key::read_key_table_from_file(&path).ok()?);
+    let after = std::fs::metadata(&path).ok()?;
+    if after.len() != metadata.len() || after.modified().ok()? != modified {
+        return None;
+    }
+    if entries.len() >= MAX_PARSED_KEY_INDEXES { entries.clear(); }
+    entries.insert(path, CachedKeyIndex {
+        bytes: metadata.len(), modified, table: Arc::clone(&table),
+    });
+    Some(table)
+}
+
 pub fn load_resource_from_key(resref: &nwnrs_types::resman::ResRef, data_dir: &Path) -> Result<Option<Vec<u8>>> {
     let ck = cache_key(resref);
     // Check cache first
@@ -143,7 +190,7 @@ fn load_resource_from_key_uncached(resref: &nwnrs_types::resman::ResRef, data_di
     for key_name in key_names {
         let key_path = data_dir.join(key_name);
         if !key_path.exists() { continue; }
-        if let Ok(key_table) = nwnrs_types::key::read_key_table_from_file(&key_path) {
+        if let Some(key_table) = cached_key_table(&key_path) {
             if key_table.contains(resref) {
                 if let Ok(res) = key_table.demand(resref) {
                     if let Ok(data) = res.read_all(nwnrs_types::resman::CachePolicy::Bypass) {
@@ -1755,6 +1802,104 @@ mod tests {
                 Ok(None) => eprintln!("MISS: '{}' not found in game data", name),
                 Err(e) => eprintln!("ERR: '{}' load error: {}", name, e),
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod key_index_cache_tests {
+    use super::*;
+    struct Fixture(PathBuf);
+    impl Fixture {
+        fn new() -> Self {
+            static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let p = std::env::temp_dir().join(format!("aurora-key-cache-{}-{}", std::process::id(), NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)));
+            std::fs::create_dir(&p).unwrap();
+            Self(p)
+        }
+        fn key(&self, name: &str) -> PathBuf {
+            let mut bytes = vec![0; 64];
+            bytes[..8].copy_from_slice(b"KEY V1  ");
+            bytes[16..20].copy_from_slice(&64u32.to_le_bytes());
+            bytes[20..24].copy_from_slice(&64u32.to_le_bytes());
+            let p = self.0.join(name);
+            std::fs::write(&p, bytes).unwrap();
+            p
+        }
+    }
+    impl Drop for Fixture { fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); } }
+    #[test]
+    fn unchanged_index_is_reused_and_paths_are_distinct() {
+        let f = Fixture::new();
+        let a = f.key("a.key"); let b = f.key("b.key");
+        let mut cache = HashMap::new();
+        let first = cached_key_table_in(&a, &mut cache).unwrap();
+        assert!(Arc::ptr_eq(&first, &cached_key_table_in(&a, &mut cache).unwrap()));
+        assert!(!Arc::ptr_eq(&first, &cached_key_table_in(&b, &mut cache).unwrap()));
+    }
+    #[test]
+    fn changed_or_malformed_index_is_not_reused() {
+        let f = Fixture::new(); let p = f.key("a.key"); let mut cache = HashMap::new();
+        let first = cached_key_table_in(&p, &mut cache).unwrap();
+        use std::io::Write;
+        std::fs::OpenOptions::new().append(true).open(&p).unwrap().write_all(&[0]).unwrap();
+        assert!(!Arc::ptr_eq(&first, &cached_key_table_in(&p, &mut cache).unwrap()));
+        std::fs::write(&p, b"invalid").unwrap();
+        assert!(cached_key_table_in(&p, &mut cache).is_none());
+        assert!(cache.is_empty());
+        f.key("a.key");
+        assert!(cached_key_table_in(&p, &mut cache).is_some());
+    }
+    // A KEY file symlink does not relocate its sibling BIF files. Exercise
+    // actual lazy resource reads, not just index identity.
+    #[cfg(unix)]
+    #[test]
+    fn symlink_key_preserves_sibling_bif_resolution() {
+        use nwnrs_types::key::{write_key_and_bif, KeyBifEntry, KeyBifVersion};
+        use nwnrs_types::exo::ExoResFileCompressionType;
+        use nwnrs_types::compressedbuf::Algorithm;
+        let f = Fixture::new();
+        let original = f.0.join("original");
+        let alias = f.0.join("alias");
+        let rr = ResRef::new("alpha".to_string(), nwnrs_types::resman::ResType(2025)).unwrap();
+        for (dir, payload) in [(&original, b"original".as_slice()), (&alias, b"alias___".as_slice())] {
+            std::fs::create_dir(dir).unwrap();
+            write_key_and_bif(
+                KeyBifVersion::V1, ExoResFileCompressionType::None, Algorithm::None,
+                dir, "chitin", "",
+                &[KeyBifEntry {
+                    directory: String::new(), name: "data".into(),
+                    recorded_filename: None, drives: 7, bif_oid: None,
+                    entries: vec![rr.clone()],
+                }], 2026, 1, None,
+                |_, io| {
+                    io.write_all(payload)?;
+                    Ok((payload.len(), nwnrs_types::checksums::secure_hash(payload)))
+                },
+            ).unwrap();
+        }
+        // Preserve the alias archive; replace only its generated index.
+        std::fs::remove_file(alias.join("chitin.key")).unwrap();
+        std::os::unix::fs::symlink(original.join("chitin.key"), alias.join("chitin.key")).unwrap();
+        let read = |key: &nwnrs_types::key::KeyTable| {
+            key.demand(&rr).unwrap().read_all(nwnrs_types::resman::CachePolicy::Bypass).unwrap()
+        };
+        let mut cache = HashMap::new();
+        let path = alias.join("chitin.key");
+        let baseline = nwnrs_types::key::read_key_table_from_file(&path).unwrap();
+        assert_eq!(read(&baseline), b"alias___");
+        let cached = cached_key_table_in(&path, &mut cache).unwrap();
+        assert_eq!(read(&cached), read(&baseline));
+        assert!(Arc::ptr_eq(&cached, &cached_key_table_in(&path, &mut cache).unwrap()));
+        assert_eq!(read(&cached_key_table_in(&original.join("chitin.key"), &mut cache).unwrap()), b"original");
+    }
+
+    #[test]
+    fn cache_is_bounded() {
+        let f = Fixture::new(); let mut cache = HashMap::new();
+        for i in 0..(MAX_PARSED_KEY_INDEXES + 2) {
+            assert!(cached_key_table_in(&f.key(&format!("{}.key", i)), &mut cache).is_some());
+            assert!(cache.len() <= MAX_PARSED_KEY_INDEXES);
         }
     }
 }
